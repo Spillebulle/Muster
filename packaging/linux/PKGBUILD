@@ -1,0 +1,68 @@
+# Maintainer: Spillebulle <spillebulle@gmail.com>
+#
+# Arch package, built from the release binary rather than from source.
+#
+# `-bin` because that is what Arch calls a package of somebody else's compiled
+# artefact, and calling it `muster` would claim a from-source build that this is
+# not. A source PKGBUILD would be a better citizen and is a reasonable thing to
+# add later; it needs the release tarball to be a source tarball, which the
+# workflow does not currently produce.
+#
+# The workflow fills in pkgver and the checksum before running makepkg, so the
+# placeholders below are what a local rehearsal edits. See
+# `.github/workflows/release.yml`.
+
+pkgname=muster-bin
+pkgver=0.0.1
+pkgrel=1
+pkgdesc="Network scanner for the network this machine is on"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Spillebulle/muster"
+license=('GPL-3.0-or-later')
+provides=('muster')
+conflicts=('muster')
+options=('!strip' '!debug')
+
+# Opened at runtime by winit and wgpu rather than recorded in the ELF, so
+# namcap's automatic scan will not find them. Every one of them is the window:
+# the scan itself needs nothing but libc, and `muster scan` runs on a machine
+# with no display server. See the longer note in `build-packages.sh`.
+depends=('libx11' 'libxcursor' 'libxrandr' 'libxi' 'libxkbcommon'
+         'wayland' 'vulkan-icd-loader' 'gcc-libs')
+
+# Filled in by the workflow: the archive built for this architecture.
+source_x86_64=("muster-${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("muster-${pkgver}-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    local stage="${srcdir}/muster-${pkgver}-${CARCH}-unknown-linux-gnu"
+    # The tarball's directory is named after the Rust target triple, which is
+    # not $CARCH for aarch64 on every host; find it rather than spell it.
+    [ -d "$stage" ] || stage=$(find "$srcdir" -maxdepth 1 -type d -name 'muster-*' | head -1)
+
+    install -Dm755 "${stage}/muster" "${pkgdir}/usr/bin/muster"
+    install -Dm644 "${stage}/packaging/io.github.spillebulle.muster.desktop" \
+        "${pkgdir}/usr/share/applications/io.github.spillebulle.muster.desktop"
+    install -Dm644 "${stage}/packaging/io.github.spillebulle.muster.metainfo.xml" \
+        "${pkgdir}/usr/share/metainfo/io.github.spillebulle.muster.metainfo.xml"
+    # No MIME types and no thumbnailer: Muster opens no documents. No
+    # scriptlet either, unlike the .deb and the .rpm — pacman ships alpm hooks
+    # that rebuild `mimeinfo.cache` whenever a package touches
+    # share/applications, so declaring the desktop entry is the whole of the
+    # work.
+    #
+    # And no `setcap`, for the reason `build-packages.sh` gives at length: the
+    # privileged engine is not built yet, so there is nothing to grant it for.
+    for size in 16 32 48 64 128 256; do
+        install -Dm644 "${stage}/icons/muster-${size}.png" \
+            "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/io.github.spillebulle.muster.png"
+    done
+    install -Dm644 "${stage}/LICENSE" \
+        "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    install -Dm644 "${stage}/README.md" \
+        "${pkgdir}/usr/share/doc/muster/README.md"
+    install -Dm644 "${stage}/CHANGELOG.md" \
+        "${pkgdir}/usr/share/doc/muster/CHANGELOG.md"
+}

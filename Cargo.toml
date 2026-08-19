@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/muster-net", "crates/muster-app", "crates/muster-desktop"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.90"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Spillebulle/muster"
+authors = ["Muster contributors"]
+
+[workspace.dependencies]
+muster-net = { path = "crates/muster-net" }
+muster-app = { path = "crates/muster-app" }
+
+log = "0.4"
+env_logger = "0.11"
+
+# Debug builds keep our own crates cheap to recompile while dependencies are
+# built optimised. The engine is the thing being evaluated by hand here, and an
+# unoptimised packet loop measures the debug build rather than the design.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

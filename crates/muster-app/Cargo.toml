@@ -1,0 +1,114 @@
+[package]
+name = "muster-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+muster-net = { workspace = true }
+log = { workspace = true }
+
+# egui + wgpu through winit, which is `CLAUDE.md`'s stack. It arrives via
+# `eframe` rather than by wiring winit and wgpu by hand as Umber does, and the
+# difference is that Umber has a reason to: it draws a canvas with its own wgpu
+# pipelines and needs the surface. Muster draws widgets and nothing else, so the
+# host would be a few hundred lines of scaffolding reproducing what `eframe`
+# already is. Same three crates underneath either way.
+#
+# `default-features = false` drops the glow (OpenGL) backend, which would
+# otherwise be compiled beside wgpu and never used.
+# Pinned to 0.32 rather than the newest. 0.36 restructured the application
+# trait (`ui` in place of `update`) and moved the panel types, and the family's
+# other app is on 0.35; there is nothing in the newer releases Muster needs, and
+# one interface language across the family is worth more than a version number.
+#
+# `default-features = false` is here to drop **glow**, the OpenGL backend, which
+# eframe's defaults compile beside wgpu and Muster never uses. Everything else
+# eframe's default set carries has to be asked for again by name, and two of
+# those groups are load-bearing:
+#
+# * `wayland` and `x11` are how the window opens on Linux at all. Without them
+#   this builds and then fails to find a display server at run time, which is
+#   the worst shape a missing feature can take because the build is green.
+# * `accesskit` is the screen reader bridge. A dense table of figures is exactly
+#   the interface that needs it.
+eframe = { version = "0.32", default-features = false, features = [
+    "wgpu",
+    "default_fonts",
+    "wayland",
+    "x11",
+    "accesskit",
+] }
+egui = "0.32"
+
+# The wgpu **backends**, which are the other half of what `default-features =
+# false` above turned off: eframe's default set reaches them through
+# `egui-wgpu/default` → `wgpu/default`, and dropping it leaves wgpu compiled
+# with no backend for any platform. That is not a build error — it is a panic on
+# the first frame saying "no wgpu backend feature that is implemented for the
+# target platform was enabled", which is how this was found.
+#
+# Naming wgpu directly is what puts the backends back: Cargo unifies features
+# across the graph, so eframe's own copy gets them. Default features are Dx12
+# and Vulkan on Windows, Vulkan and GL on Linux, Metal on macOS — each already
+# gated by target, so this is one line rather than a per-platform table.
+wgpu = "25"
+
+# The update check (`update/`). It asks GitHub what the newest release is and,
+# where the installation is not a package manager's, fetches one of its assets
+# and swaps the binary.
+#
+# `ureq` with **rustls and no default features**. rustls rather than native-tls
+# because native-tls is OpenSSL on Linux, and an OpenSSL C build would have to
+# be satisfied on both aarch64 cross-builds and inside the Flatpak sandbox,
+# where there is no system OpenSSL to link against. Roots come from
+# `webpki-roots`, compiled in, for the same reason: the AppImage and the Flatpak
+# cannot rely on the host's certificate store being where they expect it.
+# `default-features = false` drops `gzip`, which only matters for a response
+# body measured in kilobytes and would otherwise put a second copy of the
+# decompressor in the binary.
+#
+# `serde`/`serde_json` read the release JSON. `zip`, `tar` and `flate2` open the
+# release archive far enough to lift one file out of it, and `zip`'s codec list
+# is cut to the one the workflow's archives actually use.
+ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+tar = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+# Where this platform keeps a user's settings. Two booleans live there; see
+# `prefs.rs` for why that is a `key = value` file and not a format.
+directories = "6"
+
+# The installer's half of the update: `OpenProcess`/`WaitForSingleObject` wait
+# for Muster to close, and `ShellExecuteExW` with the `runas` verb is what
+# raises the one consent prompt an MSI install shows. `Win32_System_Registry`
+# is where windows-sys 0.61 gates `SHELLEXECUTEINFOW`, even though nothing here
+# touches the registry. See `update/installwin.rs`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# `examples/make-art.rs` only. They write `assets/icons/` and the README's
+# banners, which happens by hand and never at run time, so they are development
+# dependencies and none of this reaches the shipped binary.
+#
+# `skrifa` rather than the `ab_glyph` already under egui, and the difference is
+# the whole reason the wordmark looks right: Archivo is a **variable** font, and
+# `ab_glyph` does not apply variation axes, so it answers a request for weight
+# 900 with the Regular master and no error. `skrifa` applies them.
+# `ab_glyph_rasterizer` then turns the outlines it produces into coverage — the
+# same rasteriser egui uses, addressed directly. `png` writes the files.
+[dev-dependencies]
+png = "0.18"
+skrifa = "0.32"
+ab_glyph_rasterizer = "0.1"

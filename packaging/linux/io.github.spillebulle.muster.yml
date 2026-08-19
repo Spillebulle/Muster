@@ -1,0 +1,82 @@
+# Flatpak manifest.
+#
+# Built from the release binary rather than from source. A Flathub submission
+# would have to build from source, which is their rule and a reasonable one, so
+# this manifest is for the bundle attached to a GitHub release and not for
+# Flathub. Getting onto Flathub is a separate submission and worth doing; this
+# is not a substitute for it and should not be described as one.
+#
+# The tarball is staged as `muster-linux.tar.gz` by the workflow so that nothing
+# here has to know the version. See `.github/workflows/release.yml`.
+
+app-id: io.github.spillebulle.muster
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: muster
+
+finish-args:
+  # The GPU, for the window. wgpu finds no adapter without it.
+  - --device=dri
+  # Both display protocols: Wayland where there is one, X11 where there is not.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+
+  # --- the network, which is the decision this manifest exists to record ----
+  #
+  # `CLAUDE.md` asks for this one to be written down when the manifest is
+  # authored, so: **Muster gets `--share=network`, and it is not optional.**
+  #
+  # Umber's manifest deliberately withholds it, and the reasoning there does not
+  # transfer. A painting application with no network loses an update check it
+  # does not need, because Flatpak updates it. A network scanner with no network
+  # loses *the application*: without this the sandbox has a namespace of its own
+  # and Muster would sweep it, find nothing, and report an empty network. That
+  # is the exact failure `CLAUDE.md` calls the worst this application can
+  # produce, because it looks like an answer.
+  #
+  # What this permission does **not** buy is the privileged engine. A Flatpak
+  # sandbox has no mechanism to grant `CAP_NET_RAW`, so this build is
+  # unprivileged for good, the same as the AppImage, and it says so on the
+  # screen where it matters rather than only here.
+  #
+  # It also does not widen what leaves the machine. Muster makes exactly one
+  # outbound request on its own behalf, the update check, and inside a Flatpak
+  # even that is switched off: `update::Updates::check_unavailable` reports that
+  # this copy is managed, because it is, and `flatpak update` is the command
+  # that updates it.
+  - --share=network
+
+  # No `--filesystem` at all. Muster opens no documents and saves none, so
+  # there is nothing outside the sandbox for it to read. When a saved scan
+  # becomes a file, it goes through the portal rather than through a permission
+  # added here.
+
+modules:
+  - name: muster
+    buildsystem: simple
+    sources:
+      - type: archive
+        path: muster-linux.tar.gz
+        strip-components: 1
+    build-commands:
+      - install -Dm755 muster /app/bin/muster
+
+      # Everything is already named for the application ID in `packaging/`, so
+      # these are plain copies. They were renames here once, with the desktop
+      # file's Icon key rewritten in passing, and the AppStream `launchable` was
+      # left pointing at the old name — which `appstreamcli compose` follows to
+      # find the icon, so it reported `gui-app-without-icon` and threw the
+      # component away. One name everywhere is what fixed it.
+      - install -Dm644 packaging/io.github.spillebulle.muster.desktop
+        /app/share/applications/io.github.spillebulle.muster.desktop
+      - install -Dm644 packaging/io.github.spillebulle.muster.metainfo.xml
+        /app/share/metainfo/io.github.spillebulle.muster.metainfo.xml
+
+      - for s in 16 32 48 64 128 256; do
+        install -Dm644 "icons/muster-$s.png"
+        "/app/share/icons/hicolor/${s}x${s}/apps/io.github.spillebulle.muster.png";
+        done
+
+      - install -Dm644 LICENSE /app/share/licenses/muster/LICENSE
