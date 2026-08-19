@@ -22,7 +22,7 @@ use muster_net::survey::{Reading, Survey};
 use muster_net::{Prefix, discover, identify};
 use std::io::{IsTerminal, Write};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -394,7 +394,12 @@ fn print_sweep(s: &discover::Sweep, names: &[identify::Identity], took: Duration
 #[cfg(windows)]
 #[must_use]
 pub fn ctrl_c(flag: Arc<AtomicBool>) -> bool {
+    // Imported here rather than at the top of the file: this is the only thing
+    // in the binary that orders an atomic, and it is Windows-only, so a
+    // top-level import is an unused one on Linux — which `-D warnings` makes a
+    // build failure rather than a note.
     use std::sync::OnceLock;
+    use std::sync::atomic::Ordering;
 
     // The console handler is a bare `extern "system" fn`, so what it acts on
     // has to be reachable without a capture. A shared flag is that, and it
