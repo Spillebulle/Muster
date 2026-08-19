@@ -121,6 +121,9 @@ Muster identifies services. It does not authenticate to them, does not try
 credentials, and carries nothing intended to make anything crash. Reading a
 banner and asking a device its name is the whole of the interaction.
 
+How the scan is put together, and why an unanswered probe is never reported as
+a closed port, is in [`docs/architecture.md`](docs/architecture.md).
+
 ## What is not there yet
 
 - **The fast port scan.** The stateless SYN scan needs raw packet access, which
