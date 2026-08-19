@@ -3,6 +3,18 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.3
+
+Changed
+
+- **Muster has a mark.** The icon, the banner and the installer now carry a hub
+  with three devices joined to it, knocked out of the accent square. It is
+  drawn from the palette rather than stored as a picture, so it cannot drift
+  from the colour the interface is painted in.
+- At 16 px the mark is the plain square, without the glyph. There is not enough
+  room there to draw four separate shapes with gaps between them, and a glyph
+  drawn anyway is a dark blob that says less than the square alone.
+
 ## 0.0.2
 
 Fixed

@@ -138,13 +138,120 @@ fn inside(x: f32, y: f32, side: f32, radius: f32) -> bool {
     dx * dx + dy * dy <= radius * radius
 }
 
+// ---------------------------------------------------------------------------
+// The glyph
+// ---------------------------------------------------------------------------
+
+/// Where the full glyph gives way to the compact one.
+///
+/// The arms are the first thing to go. At 32 px an arm is two pixels wide with
+/// a pixel of accent either side of it, which is not a line joining two things,
+/// it is a smudge between them.
+const COMPACT_BELOW: u32 = 40;
+
+/// Where the glyph is dropped altogether and the mark is the bare square.
+///
+/// **This is the honest limit, not a shortcut.** Below it there are not enough
+/// pixels to draw four separate discs with gaps between them: at 16 px the hub
+/// would be under two pixels across and the gaps under one, and the result is a
+/// dark blob in a cyan square, which says less than the square alone does. So
+/// the 16 px icon and the 15 px mark in the top bar carry no glyph. That is
+/// what optical sizing means, and every icon set that survives a taskbar does
+/// it; drawing the same geometry at every size and calling it consistent is how
+/// an icon ends up illegible exactly where it is seen most.
+const PLAIN_BELOW: u32 = 24;
+
+/// The satellites' distance from the centre, as a fraction of the side.
+const ORBIT: f32 = 0.275;
+
+/// Draws the network glyph into a mark of `side` pixels, in `ink`.
+///
+/// A hub with three satellites joined to it: devices on a network, which is the
+/// most direct thing this application does. Three rather than four because
+/// three is the fewest that reads as a network rather than as a pair, and it
+/// leaves the most air between them at the sizes where air is scarce.
+fn glyph(image: &mut Image, side: u32, ink: Color32) {
+    if side < PLAIN_BELOW {
+        return;
+    }
+    let compact = side < COMPACT_BELOW;
+
+    let s = side as f32;
+    let c = s / 2.0;
+    // The compact form is heavier everywhere and drops the arms: fewer, fatter
+    // shapes are what survive when a pixel is a large fraction of the drawing.
+    // The compact form's numbers are not the full form's scaled up. They are
+    // chosen so that the gap between the hub and a satellite is about 0.06 of
+    // the side: the first attempt kept the orbit near the full form's and made
+    // the discs fatter, which left a **0.6 px** gap at 32 px, so the four
+    // shapes fused into the blob the arms were removed to avoid. Discs that
+    // touch are one disc.
+    let hub = s * if compact { 0.135 } else { 0.115 };
+    let node = s * if compact { 0.105 } else { 0.090 };
+    let arm = s * if compact { 0.0 } else { 0.062 };
+    let orbit = s * if compact { 0.300 } else { ORBIT };
+
+    // Twelve, four and eight o'clock, so the group sits square in the frame.
+    let satellites: [(f32, f32); 3] = std::array::from_fn(|k| {
+        let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::TAU / 3.0;
+        (orbit * a.cos(), orbit * a.sin())
+    });
+
+    for py in 0..side as i32 {
+        for px in 0..side as i32 {
+            let mut hits = 0;
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    let x = px as f32 + (sx as f32 + 0.5) / SAMPLES as f32 - c;
+                    let y = py as f32 + (sy as f32 + 0.5) / SAMPLES as f32 - c;
+                    if in_glyph(x, y, hub, node, arm, &satellites) {
+                        hits += 1;
+                    }
+                }
+            }
+            if hits > 0 {
+                image.blend(px, py, ink, hits as f32 / (SAMPLES * SAMPLES) as f32);
+            }
+        }
+    }
+}
+
+/// Is `(x, y)`, measured from the mark's centre, inside the glyph?
+fn in_glyph(x: f32, y: f32, hub: f32, node: f32, arm: f32, satellites: &[(f32, f32); 3]) -> bool {
+    if disc(x, y, hub) {
+        return true;
+    }
+    satellites
+        .iter()
+        .any(|&(nx, ny)| disc(x - nx, y - ny, node) || (arm > 0.0 && segment(x, y, nx, ny, arm)))
+}
+
+fn disc(x: f32, y: f32, r: f32) -> bool {
+    x * x + y * y <= r * r
+}
+
+/// Within `w` of the segment from the centre to `(x1, y1)`.
+fn segment(x: f32, y: f32, x1: f32, y1: f32, w: f32) -> bool {
+    let len2 = x1 * x1 + y1 * y1;
+    let t = if len2 <= 0.0 {
+        0.0
+    } else {
+        ((x * x1 + y * y1) / len2).clamp(0.0, 1.0)
+    };
+    let (ex, ey) = (x - t * x1, y - t * y1);
+    ex * ex + ey * ey <= (w / 2.0) * (w / 2.0)
+}
+
 /// The mark alone, on transparent, at `side` pixels square.
 ///
-/// This is the app icon at every size and the favicon: §17.4 again, the icon
-/// set is the mark and nothing else.
+/// This is the app icon at every size and the favicon. The glyph is knocked out
+/// of the square in the ink that belongs on an accent fill, so the mark stays
+/// one solid shape rather than becoming a cut-out with the background showing
+/// through it.
 pub fn mark(side: u32, palette: Palette) -> Image {
     let mut image = Image::new(side, side);
     rounded_square(&mut image, 0.0, 0.0, side as f32, palette.accent);
+    glyph(&mut image, side, palette.accent_ink);
     image
 }
 
@@ -183,15 +290,80 @@ mod tests {
         assert_eq!(alpha_at(&image, 0, 32), 255);
     }
 
+    fn rgb_at(image: &Image, x: u32, y: u32) -> [u8; 3] {
+        let i = ((y * image.width + x) * 4) as usize;
+        [image.pixels[i], image.pixels[i + 1], image.pixels[i + 2]]
+    }
+
     #[test]
     fn the_mark_carries_the_accent_and_no_other_colour() {
-        let accent = Palette::dark().accent;
-        let image = mark(32, Palette::dark());
-        let i = ((16 * 32 + 16) * 4) as usize;
+        let p = Palette::dark();
+        let image = mark(256, p);
+        // Low centre, which is inside the square and clear of the glyph.
         assert_eq!(
-            &image.pixels[i..i + 3],
-            &[accent.r(), accent.g(), accent.b()],
+            rgb_at(&image, 128, 230),
+            [p.accent.r(), p.accent.g(), p.accent.b()],
             "the mark is the accent, not a stored hex"
+        );
+    }
+
+    #[test]
+    fn the_glyph_is_knocked_out_in_the_ink_for_an_accent_fill() {
+        let p = Palette::dark();
+        let image = mark(256, p);
+        // The hub sits on the centre.
+        assert_eq!(
+            rgb_at(&image, 128, 128),
+            [p.accent_ink.r(), p.accent_ink.g(), p.accent_ink.b()],
+            "the glyph is drawn in accent_ink, never in a colour of its own"
+        );
+    }
+
+    #[test]
+    fn a_small_mark_drops_the_glyph_rather_than_smudging_it() {
+        // Optical sizing, and the rule the thresholds exist for: below 24 px
+        // there is no room to draw four discs with gaps between them, so the
+        // mark is the bare square. A glyph drawn there is a dark blob that says
+        // less than the square alone.
+        let p = Palette::dark();
+        let ink = [p.accent_ink.r(), p.accent_ink.g(), p.accent_ink.b()];
+        let has_ink = |side: u32| {
+            let image = mark(side, p);
+            image
+                .pixels
+                .chunks_exact(4)
+                .any(|px| px[3] > 200 && [px[0], px[1], px[2]] == ink)
+        };
+        assert!(!has_ink(16), "16 px must carry no glyph");
+        assert!(!has_ink(PLAIN_BELOW - 1), "below the threshold, no glyph");
+        assert!(has_ink(PLAIN_BELOW), "at the threshold, the glyph appears");
+        assert!(has_ink(256), "and it is there at every size above");
+    }
+
+    #[test]
+    fn the_compact_form_drops_the_arms_and_keeps_the_discs_apart() {
+        let p = Palette::dark();
+        let accent = [p.accent.r(), p.accent.g(), p.accent.b()];
+
+        // Two thirds of the way from the centre to the satellite at twelve
+        // o'clock: on the arm in the full form, and between two discs in the
+        // compact one.
+        let probe = |side: u32| {
+            let image = mark(side, p);
+            let c = side as f32 / 2.0;
+            let y = (c - ORBIT * side as f32 * 0.66).round() as u32;
+            rgb_at(&image, side / 2, y)
+        };
+
+        assert_eq!(
+            probe(32),
+            accent,
+            "the compact form has no arms, so this point is still the fill"
+        );
+        assert_ne!(
+            probe(64),
+            accent,
+            "the full form joins the hub to its satellites"
         );
     }
 

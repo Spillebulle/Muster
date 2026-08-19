@@ -29,7 +29,7 @@
 //!   too much.
 
 use ab_glyph_rasterizer::{Point, Rasterizer, point};
-use muster_app::art::{Image, mark, rounded_square};
+use muster_app::art::{Image, mark};
 use muster_app::theme::Palette;
 use skrifa::instance::{Location, Size};
 use skrifa::outline::{DrawSettings, OutlinePen};
@@ -190,7 +190,7 @@ fn banner(width: u32, height: u32, palette: Palette) -> Image {
     let x = ((width as f32 - total) / 2.0).round();
     let y = ((height as f32 - side) / 2.0).round();
 
-    rounded_square(&mut image, x, y, side, palette.accent);
+    stamp(&mut image, x, y, side, palette);
     // The baseline sits one cap height below the mark's top, which is what puts
     // the letters' flat tops on the square's.
     font.draw(WORDMARK, x + side + gap, y + side, |px, py, coverage| {
@@ -239,7 +239,7 @@ fn installer_banner() -> Image {
     let x = BANNER_SPLIT as f32 + (block_w - total) / 2.0;
     let y = (h as f32 - side) / 2.0;
 
-    rounded_square(&mut image, x, y, side, ink.accent);
+    stamp(&mut image, x, y, side, ink);
     font.draw(WORDMARK, x + side + gap, y + side, |px, py, coverage| {
         image.blend(px, py, ink.text_strong, coverage)
     });
@@ -265,12 +265,12 @@ fn installer_dialog() -> Image {
     let group_h = SIDEBAR_MARK + SIDEBAR_GAP + word_h;
     let top = (h as f32 - group_h) / 2.0;
 
-    rounded_square(
+    stamp(
         &mut image,
         (column - SIDEBAR_MARK) / 2.0,
         top,
         SIDEBAR_MARK,
-        ink.accent,
+        ink,
     );
 
     let baseline = top + SIDEBAR_MARK + SIDEBAR_GAP + word_h;
@@ -280,6 +280,25 @@ fn installer_dialog() -> Image {
     });
 
     image
+}
+
+/// Stamps the mark, glyph and all, at `(x, y)`.
+///
+/// Through [`mark`] rather than by drawing a square here, so the banner and the
+/// installer carry exactly the icon set's artwork. The first version of this
+/// file drew a bare rounded square, which was right when the mark had no glyph
+/// in it and became a second, plainer logo the moment it did.
+fn stamp(image: &mut Image, x: f32, y: f32, side: f32, palette: Palette) {
+    let m = mark(side.round() as u32, palette);
+    let (ox, oy) = (x.round() as i32, y.round() as i32);
+    for py in 0..m.height as i32 {
+        for px in 0..m.width as i32 {
+            let i = ((py as usize) * (m.width as usize) + px as usize) * 4;
+            let p = &m.pixels[i..i + 4];
+            let colour = egui::Color32::from_rgb(p[0], p[1], p[2]);
+            image.blend(ox + px, oy + py, colour, p[3] as f32 / 255.0);
+        }
+    }
 }
 
 /// Archivo instanced at one size and weight.
