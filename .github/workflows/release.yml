@@ -1,0 +1,332 @@
+name: Release
+
+# Cutting a release is pushing a tag; everything below follows from that, so
+# there is no button to press and no step that can be done in the wrong order.
+# `tools/release.ps1` (or `tools/release.sh`) is what pushes it, after checking
+# the tree and running the same gates CI runs.
+#
+# `workflow_dispatch` builds and packages everything but publishes nothing,
+# which is how a change to this file gets rehearsed without spending a tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+permissions:
+  contents: write
+
+jobs:
+  # --- the binaries ---------------------------------------------------------
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,  arch: amd64 }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, arch: arm64 }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    arch: x64   }
+          - { os: windows-11-arm,   target: aarch64-pc-windows-msvc,   arch: arm64 }
+          # No macOS. `CLAUDE.md` settles that it is not a target, and the
+          # rule that comes with this matrix is that `ci.yml` covers every
+          # runner in it — so a row added here is a row added there in the same
+          # commit, or the gate has a hole exactly the shape of the new target.
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Ubuntu 22.04 rather than latest, deliberately: a binary built against an
+      # older glibc runs on newer distributions, and one built against a newer
+      # glibc does not run on older ones. The oldest supported runner is
+      # therefore the widest compatible build.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libx11-dev libxrandr-dev libxi-dev \
+            mesa-vulkan-drivers vulkan-tools
+
+      # The same gates CI runs on every push. Repeated because a tag can point
+      # at a commit CI never saw, and a release built from an untested tree is
+      # exactly what a release process exists to prevent.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        shell: bash
+        run: |
+          set -eu
+          cargo build --release -p muster-desktop
+
+      - name: Stage
+        shell: bash
+        run: |
+          set -eu
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          stage="muster-${version}-${{ matrix.target }}"
+          mkdir -p "staging/$stage"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/muster.exe "staging/$stage/"
+          else
+            cp target/release/muster "staging/$stage/"
+          fi
+          cp README.md CHANGELOG.md LICENSE "staging/$stage/"
+          # Carried so the Arch package can install the same desktop entry,
+          # metadata and icons the .deb and .rpm do, without a second checkout.
+          cp -r packaging "staging/$stage/"
+          cp -r assets/icons "staging/$stage/icons"
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            (cd staging && 7z a "../dist/${stage}.zip" "$stage" > /dev/null)
+          else
+            tar czf "dist/${stage}.tar.gz" -C staging "$stage"
+          fi
+
+      # --- Windows installer (WiX 5, per-architecture MSI) ------------------
+      - name: Build MSI
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -eu
+          dotnet tool install --global wix --version 5.0.2
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          # Util supplies WixShellExec, which is what the exit dialog's
+          # "Start Muster" checkbox runs. Pinned to the same version as the
+          # toolset: a custom action from a mismatched extension is a binary
+          # that may not be there under the name the .wxs asks for.
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+
+          # WiX's licence page wants RTF. The conversion is a script rather
+          # than a few lines here because the escaping behaved differently in
+          # YAML and in a developer's shell, which is the worst way for a build
+          # step to be wrong; it is now the same code in both places and can be
+          # run locally.
+          mkdir -p wixassets
+          cp assets/icons/muster.ico wixassets/muster.ico
+          # The installer's own artwork. Generated from `theme::Palette` by
+          # `muster-app`'s `examples/make-art.rs` and committed, like the icons,
+          # rather than drawn here.
+          cp packaging/windows/banner.bmp packaging/windows/dialog.bmp wixassets/
+          sh packaging/windows/make-licence-rtf.sh LICENSE wixassets/licence.rtf
+
+          # `-pdbtype none`: WiX otherwise drops a .wixpdb beside the installer,
+          # and the artefact upload takes everything in dist/ — so the release
+          # would carry debug symbols nobody asked for.
+          wix build packaging/windows/muster.wxs \
+            -arch ${{ matrix.arch }} \
+            -ext WixToolset.UI.wixext \
+            -ext WixToolset.Util.wixext \
+            -pdbtype none \
+            -d Version="$VERSION" \
+            -d BinDir="target/release" \
+            -d DocDir="." \
+            -d AssetDir="wixassets" \
+            -o "dist/muster-${VERSION}-${{ matrix.arch }}.msi"
+
+      # --- Windows setup executable -----------------------------------------
+      #
+      # `muster.exe` with the MSI concatenated onto it and a footer saying how
+      # long the package is, so a first install shows Muster's own window rather
+      # than Windows Installer's. `update::payload` has the format;
+      # `make-setup` is the one writer of it and checks its work twice, which
+      # is one more time than it used to and for a reason worth keeping.
+      #
+      # It reads the package back out of the bytes before writing them, and it
+      # then asks the **written file** `payload::carried_by` — the predicate the
+      # running binary uses to decide, on a double-click, that it is an
+      # installer rather than Muster. Those are different questions. 0.0.8
+      # shipped a setup executable whose format was perfect and which opened the
+      # application instead of installing, because dispatch went by a
+      # command-line flag nothing passes; only the second check would have
+      # caught it.
+      #
+      # After the MSI, obviously: it is the payload.
+      - name: Build setup executable
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo run --release -p muster-app --example make-setup --             "target/release/muster.exe"             "dist/muster-${VERSION}-${{ matrix.arch }}.msi"             "dist/muster-setup-${VERSION}-${{ matrix.arch }}.exe"
+
+      # --- Linux packages ---------------------------------------------------
+      - name: Build Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y rpm file desktop-file-utils
+          chmod +x packaging/linux/build-packages.sh
+          packaging/linux/build-packages.sh \
+            "$VERSION" target/release/muster "${{ matrix.arch }}" dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # --- Flatpak --------------------------------------------------------------
+  #
+  # A job of its own because the runtime and SDK are a gigabyte of download
+  # that the build matrix has no use for.
+  #
+  # This produces the bundle attached to the release. It is **not** a Flathub
+  # submission: Flathub builds from source on its own infrastructure and that is
+  # a separate piece of work.
+  flatpak:
+    name: build Flatpak
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: x86_64-unknown-linux-gnu
+          path: dist
+
+      # flatpak-builder from apt, on the runner whose version is new enough.
+      #
+      # Two ways to get this wrong, both of which this job has now made:
+      #
+      #   - Ubuntu 22.04 ships flatpak-builder 1.2, which only knows how to run
+      #     `appstream-compose`. The 24.08 SDK dropped that tool for
+      #     `appstreamcli`, so the build died at `execvp appstream-compose: No
+      #     such file or directory`. 24.04 ships 1.4.2, and `strings` on that
+      #     binary shows `Running appstreamcli compose` — it picks whichever
+      #     the SDK actually has.
+      #   - Reaching for `org.flatpak.Builder` instead. It runs the builder
+      #     inside a sandbox of its own, and `--user` then means *that*
+      #     sandbox's installation rather than the host's, so a runtime
+      #     installed here is invisible to it: `Unable to find sdk
+      #     org.freedesktop.Sdk version 24.08`, with the install log showing it
+      #     had just been installed.
+      - name: Install flatpak
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak-builder --version
+          flatpak remote-add --if-not-exists --user \
+            flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub \
+            org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
+
+      - name: Build
+        run: |
+          set -eu
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          # Staged under a fixed name so the manifest need not know the version.
+          cp "dist/muster-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            packaging/linux/muster-linux.tar.gz
+          mkdir -p out
+          cd packaging/linux
+          flatpak-builder --user --disable-rofiles-fuse --force-clean \
+            --repo=repo build-dir io.github.spillebulle.muster.yml
+          flatpak build-bundle repo \
+            "../../out/muster-${version}-x86_64.flatpak" \
+            io.github.spillebulle.muster \
+            --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: out/*
+          if-no-files-found: error
+
+  # --- Arch package ---------------------------------------------------------
+  #
+  # A job of its own because makepkg needs an Arch userland, which no runner
+  # image provides; a container is the cheapest way to get one.
+  arch:
+    name: build Arch package
+    needs: build
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: x86_64-unknown-linux-gnu
+          path: dist
+
+      - name: Build
+        run: |
+          set -eu
+          pacman -Sy --noconfirm --needed git
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+
+          # makepkg refuses to run as root, and a container is root by default.
+          useradd -m builder
+          work=/home/builder/build
+          install -d -o builder "$work"
+          cp packaging/linux/PKGBUILD "$work/"
+          cp "dist/muster-${version}-x86_64-unknown-linux-gnu.tar.gz" "$work/"
+          sed -i "s/^pkgver=.*/pkgver=${version}/" "$work/PKGBUILD"
+          chown -R builder "$work"
+
+          su builder -c "cd $work && makepkg --noconfirm --nodeps"
+          mkdir -p out
+          cp "$work"/*.pkg.tar.zst out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: out/*
+          if-no-files-found: error
+
+  # --- publish ---------------------------------------------------------------
+  publish:
+    name: publish
+    needs: [build, arch, flatpak]
+    runs-on: ubuntu-latest
+    # A manual run builds and packages but must not publish: there is no tag to
+    # attach a release to, and inventing one would be a release nobody asked
+    # for. This is what makes `workflow_dispatch` safe to use as a rehearsal.
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # The notes come out of CHANGELOG.md rather than being written here, so
+      # what GitHub shows and what the repository says cannot drift apart.
+      # `crates/muster-desktop/tests/release.rs` fails CI if the section for this
+      # version is missing, empty, or not the newest.
+      - name: Release notes
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$version" != "$manifest" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml's ${manifest}" >&2
+            exit 1
+          fi
+          sh tools/release-notes.sh "$version" > notes.md
+          echo '--- notes to be published ---'
+          cat notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la artifacts
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Muster $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            artifacts/*

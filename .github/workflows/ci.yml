@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Run it again without a commit. `release.yml` has had this from the start as
+  # its rehearsal; this one needed it for the opposite reason — a run that never
+  # finishes. During a GitHub Actions outage the run for a commit was left
+  # queued for hours and could be neither cancelled nor re-run ("cannot cancel a
+  # completed run" and "already running", about the same run). `release.sh`
+  # waits for CI on the exact commit it is about to tag, so a wedged run is a
+  # release that cannot be cut at all, and the only way out was a commit whose
+  # sole purpose was to push something.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # The packaging files are only exercised when a release is built, which is
+  # the worst moment to discover a typo in one: the tag is already pushed. They
+  # cost seconds to parse, so they are parsed on every push instead. An XML
+  # comment containing two hyphens in a row broke the first MSI build this way.
+  packaging:
+    name: packaging files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Parse
+        run: |
+          python3 - <<'PY'
+          import sys, xml.dom.minidom, yaml
+          bad = False
+          for f in ['packaging/windows/muster.wxs',
+                    'packaging/io.github.spillebulle.muster.metainfo.xml']:
+              try:
+                  xml.dom.minidom.parse(f)
+              except Exception as e:
+                  bad = True
+                  print(f'{f}: {e}')
+          for f in ['.github/workflows/ci.yml',
+                    '.github/workflows/release.yml',
+                    'packaging/linux/io.github.spillebulle.muster.yml']:
+              try:
+                  yaml.safe_load(open(f, encoding='utf-8'))
+              except Exception as e:
+                  bad = True
+                  print(f'{f}: {e}')
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Shell syntax
+        run: |
+          for f in packaging/linux/build-packages.sh tools/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: Desktop entry
+        run: |
+          sudo apt-get update && sudo apt-get install -y desktop-file-utils
+          desktop-file-validate packaging/io.github.spillebulle.muster.desktop
+
+      # The application id has to be the same name in the AppStream file, the
+      # desktop entry, the icons and all three packaging scripts. Nothing but
+      # the Flatpak build notices when it is not, and that is the slowest place
+      # to find out — see the header of the script.
+      - name: Metadata consistency
+        run: sh packaging/check.sh
+
+  # **Every runner the release builds on**, and there is no macOS row in
+  # either: `CLAUDE.md` settles that it is not a target. `release.ps1` will not push a tag
+  # until this workflow is green on that commit, which only means anything if
+  # the two cover the same machines. They did not: the release also builds on
+  # `ubuntu-22.04-arm` and `windows-11-arm`, and v0.0.5 was tagged on a green CI
+  # and then failed on the ARM Windows job — the one platform nothing had run
+  # on. The rule is that adding a target to `release.yml`'s matrix means adding
+  # its runner here, or the gate has a hole in exactly the shape of the new
+  # target.
+  #
+  # `ubuntu-22.04` rather than `ubuntu-latest`, matching the release: a binary
+  # built against an old glibc runs on newer distributions and not the other way
+  # round, so that is the machine whose answer matters.
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-22.04-arm
+          - windows-latest
+          - windows-11-arm
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libx11-dev libxrandr-dev libxi-dev \
+            mesa-vulkan-drivers vulkan-tools
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Test
+        # The GPU tests skip themselves when no adapter is available, so this
+        # stays meaningful on runners without one rather than failing.
+        run: cargo test --workspace

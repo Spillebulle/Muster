@@ -1,0 +1,21 @@
+[package]
+name = "muster-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "muster"
+path = "src/main.rs"
+
+[dependencies]
+muster-net = { workspace = true }
+muster-app = { workspace = true }
+env_logger = { workspace = true }
+
+# `SetConsoleCtrlHandler`, so that Ctrl-C stops a sweep and prints what it
+# found rather than killing the process and losing it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

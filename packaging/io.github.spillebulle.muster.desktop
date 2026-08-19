@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Muster
+GenericName=Network scanner
+Comment=See what is on the network this machine is on
+Exec=muster
+Icon=io.github.spillebulle.muster
+Terminal=false
+Categories=Network;System;Monitor;
+Keywords=network;scan;lan;devices;ports;discovery;
+StartupNotify=true
+StartupWMClass=muster

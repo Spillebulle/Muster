@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata. Software centres on Linux read this rather than the
+  .desktop file, and AppImage tooling embeds it. Kept deliberately short: every
+  claim here is one a user can check by running the thing, so anything Muster
+  does not actually do must not appear.
+-->
+<component type="desktop-application">
+  <id>io.github.spillebulle.muster</id>
+  <launchable type="desktop-id">io.github.spillebulle.muster.desktop</launchable>
+
+  <name>Muster</name>
+  <summary>Network scanner for the network this machine is on</summary>
+
+  <!-- AppStream 1.0 reads this element; `developer_name` is the older spelling
+       and is kept beside it so both generations of tooling find an author. -->
+  <developer id="io.github.spillebulle">
+    <name>Muster contributors</name>
+  </developer>
+  <developer_name>Muster contributors</developer_name>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <description>
+    <p>
+      Muster answers three questions about the network you are on: what is
+      here, what is it, and what is it offering. It reads the interfaces,
+      routes, resolvers and neighbour table from the operating system without
+      sending a packet, sweeps the local prefix for devices, and asks the ones
+      that answer what they are.
+    </p>
+    <p>
+      Devices are named from reverse DNS, mDNS and NetBIOS, and their hardware
+      vendor comes from the IEEE registry compiled into the binary. A randomised
+      hardware address is reported as randomised rather than as an unknown
+      vendor. Every probe is rate limited, and anything the scan could not do is
+      named rather than passed over in silence.
+    </p>
+    <p>
+      All of it runs as an ordinary user, with no administrator rights and no
+      driver. Nothing about your network leaves the machine.
+    </p>
+    <p>This is an early release. Notable limits:</p>
+    <ul>
+      <li>The port scan opens a connection per port, which is correct but slow. The faster SYN scan needs raw packet access and is not built yet.</li>
+      <li>The sweep covers IPv4. An IPv6 prefix is not swept address by address, and the scan says so.</li>
+      <li>Scans are not saved, and there is no continuous monitoring.</li>
+    </ul>
+  </description>
+
+  <categories>
+    <category>Network</category>
+    <category>System</category>
+    <category>Monitor</category>
+  </categories>
+
+  <url type="homepage">https://github.com/Spillebulle/muster</url>
+  <url type="bugtracker">https://github.com/Spillebulle/muster/issues</url>
+
+  <provides>
+    <binary>muster</binary>
+  </provides>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.0.1" date="2026-08-19">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

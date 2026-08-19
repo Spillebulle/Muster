@@ -1,0 +1,17 @@
+# Build output. Large and rebuildable; also worth excluding from OneDrive's
+# sync, which otherwise uploads a few gigabytes on every `cargo build`.
+/target/
+/dist/
+
+# Editor and OS
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Scan captures used as test fixtures live in `crates/muster-net/tests/data`
+# and are checked in deliberately. Anything captured ad hoc does not.
+*.pcap
+*.pcapng
+!crates/muster-net/tests/data/*.pcap

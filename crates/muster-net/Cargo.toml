@@ -1,0 +1,32 @@
+[package]
+name = "muster-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+log = { workspace = true }
+
+# The OS readings on Linux: `getifaddrs` for the interface list, and the
+# netlink socket for routes and neighbours. Everything else on this platform is
+# `/proc` and `/etc`, which is plain file reading and needs no crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The OS readings on Windows, all of them out of the IP Helper API. None of
+# these calls needs elevation, which is what makes the unprivileged engine as
+# capable as `CLAUDE.md` claims:
+#
+#   GetAdaptersAddresses  interfaces, MACs, addresses, prefixes, DNS servers,
+#                         and the DHCP server the lease came from
+#   GetIpForwardTable2    the routing table, and so the default gateway
+#   GetIpNetTable2        the neighbour (ARP/NDP) table
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+] }
