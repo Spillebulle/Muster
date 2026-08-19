@@ -17,6 +17,21 @@
 
   The UpgradeCode must never change: it is what tells Windows that 0.0.2 is the
   same product as 0.0.1 and should replace it rather than install alongside it.
+
+  **Every GUID in this file is Muster's alone, and copying one from a sibling
+  application is the bug this paragraph exists to prevent.** 0.0.1 shipped with
+  Umber's UpgradeCode and Umber's two component GUIDs, because this file was
+  ported from `../Umber/packaging/windows/umber.wxs` and the identity came with
+  it. Windows then believed Muster and Umber were one product: installing
+  Muster on a machine with Umber 0.1.4 failed with "A newer version of Muster
+  is already installed", which is a confusing message and the *lucky* direction.
+  Had Muster carried the higher version, `MajorUpgrade` would have uninstalled
+  Umber and put Muster in its place. Shared component GUIDs are the same hazard
+  one level down: MSI reference-counts by them, so removing one product can take
+  another's files with it.
+
+  `installer.rs` pins the UpgradeCode below in Rust and fails the build if this
+  file stops carrying it, which is what catches the next paste.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
@@ -24,7 +39,7 @@
   <Package Name="Muster"
            Manufacturer="Muster contributors"
            Version="$(var.Version)"
-           UpgradeCode="f3fbcac2-a3ac-4cf2-99fc-1dfa05429952"
+           UpgradeCode="434874ef-1ff3-4579-8978-cbd8ac1e9654"
            Scope="perMachine"
            Compressed="yes">
 
@@ -176,7 +191,7 @@
     <StandardDirectory Id="ProgramMenuFolder" />
 
     <ComponentGroup Id="StartMenu" Directory="ProgramMenuFolder">
-      <Component Id="StartMenuShortcut" Guid="95c43486-778e-4975-9cb5-112e6ba93260">
+      <Component Id="StartMenuShortcut" Guid="dbec9cf7-f410-4fd2-819d-0cb0511b54a7">
         <Shortcut Id="MusterShortcut"
                   Name="Muster"
                   Description="Scan the network with Muster"
@@ -216,7 +231,7 @@
     </Feature>
 
     <ComponentGroup Id="Files" Directory="INSTALLFOLDER">
-      <Component Id="Executable" Guid="aaa698ce-4d5d-41c6-8f1e-5098c7fffb1b">
+      <Component Id="Executable" Guid="abfd9685-beb8-4418-829b-90f3421873c6">
         <File Id="MusterExe" Source="$(var.BinDir)\muster.exe" KeyPath="yes" />
       </Component>
       <!--

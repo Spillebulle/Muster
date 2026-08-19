@@ -3,6 +3,17 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.2
+
+Fixed
+
+- **The Windows installer would not install on a machine with Umber on it**, and
+  reported "A newer version of Muster is already installed" instead. Muster's
+  package carried Umber's identity, so Windows believed the two were one
+  product. Muster now has its own, and a test fails the build if it ever stops
+  having one. If you already have Muster 0.0.1, this release installs over it
+  normally.
+
 ## 0.0.1
 
 First release. Muster tells you what is on the network you are on, and it runs
