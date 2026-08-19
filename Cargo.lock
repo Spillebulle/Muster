@@ -1928,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "muster-app"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "ab_glyph_rasterizer",
  "directories",
@@ -1950,7 +1950,7 @@ dependencies = [
 
 [[package]]
 name = "muster-desktop"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "env_logger",
  "muster-app",
@@ -1960,7 +1960,7 @@ dependencies = [
 
 [[package]]
 name = "muster-net"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "libc",
  "log",

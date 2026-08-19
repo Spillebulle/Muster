@@ -618,6 +618,61 @@ mod tests {
     /// **The folder is the package's**, and this is what stops the two drifting:
     /// renaming it in the `.wxs` without changing it here would leave a
     /// successful install unable to find what it had just installed.
+    /// Muster's own MSI identity.
+    ///
+    /// Pinned here so that a `.wxs` copied from a sibling application fails the
+    /// build instead of shipping. 0.0.1 went out carrying Umber's UpgradeCode,
+    /// which made Windows treat the two as one product: the install refused
+    /// with "A newer version of Muster is already installed", and in the other
+    /// version order it would have uninstalled Umber to make room. See the
+    /// comment at the head of `packaging/windows/muster.wxs`.
+    const UPGRADE_CODE: &str = "434874ef-1ff3-4579-8978-cbd8ac1e9654";
+
+    fn wxs() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packaging/windows/muster.wxs"),
+        )
+        .expect("the packaging file")
+    }
+
+    #[test]
+    fn the_package_carries_musters_own_upgrade_code() {
+        let wxs = wxs();
+        assert!(
+            wxs.contains(&format!("UpgradeCode=\"{UPGRADE_CODE}\"")),
+            "muster.wxs does not carry Muster's UpgradeCode {UPGRADE_CODE}.
+             If this file was copied from another application, its identity came              with it, and Windows will treat the two as the same product."
+        );
+    }
+
+    #[test]
+    fn no_guid_in_the_package_is_used_twice() {
+        // Component GUIDs are what MSI reference-counts installed files by. Two
+        // components sharing one means uninstalling either can take the other's
+        // files, which is a defect nothing reports at build time.
+        let wxs = wxs();
+        let mut guids: Vec<&str> = wxs
+            .split(['"', '\''])
+            .filter(|token| {
+                token.len() == 36
+                    && token.chars().enumerate().all(|(i, c)| match i {
+                        8 | 13 | 18 | 23 => c == '-',
+                        _ => c.is_ascii_hexdigit(),
+                    })
+            })
+            .collect();
+        let before = guids.len();
+        assert!(before >= 3, "expected the package to carry GUIDs");
+        guids.sort_unstable();
+        guids.dedup();
+        assert_eq!(
+            guids.len(),
+            before,
+            "muster.wxs uses the same GUID for two different things"
+        );
+    }
+
     #[test]
     fn the_install_folder_is_the_one_the_package_uses() {
         let wxs = std::fs::read_to_string(
