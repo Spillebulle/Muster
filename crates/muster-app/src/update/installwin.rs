@@ -19,8 +19,9 @@
 //! over a number nobody has.
 
 use super::installer::{Command, Job, Step, installed_path, stage_helper};
-use crate::theme::{Mode, Palette, metrics, text};
-use egui::{Align, Layout, RichText, Sense, Stroke, vec2};
+use crate::app::{Kind, button};
+use crate::theme::{self, Mode, Palette, metrics, text};
+use egui::{Align, Layout, RichText, Sense, vec2};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Duration;
@@ -139,7 +140,7 @@ pub fn show(mut job: Job) -> Result<(), Box<dyn std::error::Error>> {
                 true => Mode::Dark,
                 false => Mode::Light,
             };
-            crate::app::apply(&cc.egui_ctx, Palette::of(window.mode));
+            crate::app::apply_for(&cc.egui_ctx, Palette::of(window.mode), window.mode);
             Ok(Box::new(window))
         }),
     )?;
@@ -362,7 +363,7 @@ impl eframe::App for Installer {
                     ui.add_space(metrics::S3 - ui.spacing().item_spacing.x);
                     ui.label(
                         RichText::new(heading)
-                            .size(text::HEADING)
+                            .font(theme::strong(text::HEADING))
                             .color(p.text_strong),
                     );
                 });
@@ -395,16 +396,16 @@ impl eframe::App for Installer {
                             // whichever action the window exists for.
                             match &self.step {
                                 Step::Ready => {
-                                    if button(ui, p, "Install", true).clicked() {
+                                    if button(ui, p, "Install", Kind::Primary, true).clicked() {
                                         self.started = true;
                                         self.begin();
                                     }
-                                    if button(ui, p, "Cancel", false).clicked() {
+                                    if button(ui, p, "Cancel", Kind::Ghost, true).clicked() {
                                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                                     }
                                 }
                                 Step::Installed | Step::Failed(_) => {
-                                    let close = button(ui, p, "Close", true);
+                                    let close = button(ui, p, "Close", Kind::Primary, true);
                                     if close.clicked() {
                                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                                     }
@@ -427,48 +428,17 @@ impl eframe::App for Installer {
 /// the case it was written for: `msiexec` reports nothing at all, so `None`
 /// paints the track and nothing in it.
 fn progress(ui: &mut egui::Ui, p: Palette, fraction: Option<f32>) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
-    ui.painter().rect_filled(rect, 2.0, p.control);
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), metrics::RAIL), Sense::hover());
+    ui.painter().rect_filled(rect, metrics::RAIL / 2.0, p.rail);
     if let Some(f) = fraction {
         let filled = egui::Rect::from_min_size(
             rect.left_top(),
             vec2(rect.width() * f.clamp(0.0, 1.0), rect.height()),
         );
-        ui.painter().rect_filled(filled, 2.0, p.accent);
+        ui.painter()
+            .rect_filled(filled, metrics::RAIL / 2.0, p.accent);
     }
-}
-
-/// A button, drawn rather than egui's, and `primary` is the accent-filled one.
-fn button(ui: &mut egui::Ui, p: Palette, label: &str, primary: bool) -> egui::Response {
-    let ink = if primary { p.accent_ink } else { p.text };
-    let galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        egui::FontId::proportional(text::CONTROL),
-        ink,
-    );
-    let size = vec2(galley.size().x + metrics::S4 * 2.0, metrics::BUTTON);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-
-    let fill = match (primary, response.hovered()) {
-        (true, _) => p.accent,
-        (false, true) => p.control_hover,
-        (false, false) => p.control,
-    };
-    ui.painter().rect_filled(rect, metrics::RADIUS, fill);
-    if !primary {
-        ui.painter().rect_stroke(
-            rect,
-            metrics::RADIUS,
-            Stroke::new(metrics::HAIRLINE, p.line),
-            egui::StrokeKind::Inside,
-        );
-    }
-    let at = egui::pos2(
-        rect.center().x - galley.size().x / 2.0,
-        rect.center().y - galley.size().y / 2.0,
-    );
-    ui.painter().galley(at, galley, ink);
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 // ---------------------------------------------------------------------------

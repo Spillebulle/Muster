@@ -19,7 +19,7 @@
 //! and nowhere else.
 
 use crate::prefs::{self, Prefs, Theme};
-use crate::theme::{Palette, metrics, text};
+use crate::theme::{self, Palette, metrics, text};
 use crate::themelib::CustomTheme;
 use crate::update::Updates;
 use egui::{Align, Color32, Layout, Rect, RichText, Sense, Stroke, pos2, vec2};
@@ -162,7 +162,7 @@ fn rail(ui: &mut egui::Ui, p: Palette, state: &mut State) {
             ui.add_space(metrics::PAD_PANEL);
             ui.label(
                 RichText::new("Settings")
-                    .size(text::PAGE)
+                    .font(theme::strong(text::PAGE))
                     .color(p.text_strong),
             );
         });
@@ -181,7 +181,7 @@ fn pane_header(ui: &mut egui::Ui, p: Palette, state: &mut State) {
         ui.vertical(|ui| {
             ui.label(
                 RichText::new(state.pane.label())
-                    .size(text::PAGE)
+                    .font(theme::strong(text::PAGE))
                     .color(p.text_strong),
             );
             ui.label(
@@ -211,7 +211,15 @@ fn footer(ui: &mut egui::Ui, p: Palette, prefs: &mut Prefs) {
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(metrics::PAD_PANEL);
-            if crate::app::button(ui, p, "Restore all settings", false).clicked() {
+            if crate::app::button(
+                ui,
+                p,
+                "Restore all settings",
+                crate::app::Kind::Outlined,
+                true,
+            )
+            .clicked()
+            {
                 // Everything except what the user has already been *asked*.
                 // Re-showing the update notice because somebody reset their
                 // colours would be a dialog they have to answer twice.

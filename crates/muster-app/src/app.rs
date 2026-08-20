@@ -12,7 +12,7 @@
 //! place ([`nav_row`]) rather than at each call site.
 
 use crate::scan::State;
-use crate::theme::{Mode, Palette, metrics, text};
+use crate::theme::{self, Mode, Palette, metrics, text};
 use crate::update::{Exit, Updates};
 use crate::{deviceicon, dhcpcheck, ports, prefs, settings, updatedlg};
 use egui::{Align, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
@@ -141,7 +141,7 @@ impl App {
             pinged: None,
             updates,
         };
-        apply(&cc.egui_ctx, Palette::of(app.mode));
+        apply_for(&cc.egui_ctx, Palette::of(app.mode), app.mode);
         app
     }
 
@@ -163,7 +163,7 @@ impl App {
         mode: Mode,
     ) -> Self {
         install_fonts(&cc.egui_ctx);
-        apply(&cc.egui_ctx, Palette::of(mode));
+        apply_for(&cc.egui_ctx, Palette::of(mode), mode);
 
         let target = survey.default_targets().first().copied();
         let mut updates = Updates::default();
@@ -423,7 +423,7 @@ impl eframe::App for App {
             // records a *choice*, and what that choice means depends on what
             // the desktop is doing.
             self.mode = self.theme_mode();
-            apply(ctx, self.palette());
+            apply_for(ctx, self.palette(), self.mode);
             self.updates.check_on_startup = self.prefs.check_on_startup;
             self.updates.notice_seen = self.prefs.notice_seen;
             prefs::save(&self.prefs);
@@ -431,7 +431,7 @@ impl eframe::App for App {
 
         // Last, so it draws over everything: the first-run notice, or the
         // update dialog when there is one.
-        updatedlg::show(ctx, p, &mut self.updates);
+        updatedlg::show(ctx, p, self.mode, &mut self.updates);
     }
 }
 
@@ -471,17 +471,20 @@ fn top_bar(ctx: &egui::Context, p: Palette, app: &mut App) {
                 ui.add_space(metrics::S2);
                 ui.label(
                     RichText::new("Muster")
-                        .size(text::HEADING)
+                        .font(theme::strong(text::HEADING))
                         .color(p.text_strong),
                 );
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // §6.1 puts a settings gear at the right of the 34 px bar.
+                    // §6.1: the 34 px bar is the mark, the name and a
+                    // right-aligned gear. The scan control used to sit here
+                    // too, and it belongs in the options strip with the range
+                    // it acts on — a control in one strip acting on a field in
+                    // another is how a reader loses the connection between
+                    // them.
                     if gear_button(ui, p).clicked() {
                         app.settings.open();
                     }
-                    ui.add_space(metrics::S2);
-                    scan_control(ui, p, app);
                 });
             });
         });
@@ -491,7 +494,7 @@ fn top_bar(ctx: &egui::Context, p: Palette, app: &mut App) {
 /// at the next probe, so the control never has to be disabled mid-run.
 fn scan_control(ui: &mut egui::Ui, p: Palette, app: &mut App) {
     if app.scan.is_running() {
-        if button(ui, p, "Stop", false).clicked() {
+        if button(ui, p, "Stop", Kind::Secondary, true).clicked() {
             app.scan.cancel();
         }
         return;
@@ -502,7 +505,7 @@ fn scan_control(ui: &mut egui::Ui, p: Palette, app: &mut App) {
         State::Finished(_) => "Scan again",
         _ => "Scan",
     };
-    let response = button(ui, p, label, can);
+    let response = button(ui, p, label, Kind::Primary, can);
     if !can {
         // A control that cannot act says why rather than being mysteriously
         // dead. `CLAUDE.md`: nothing claims what the app cannot do.
@@ -516,36 +519,102 @@ fn scan_control(ui: &mut egui::Ui, p: Palette, app: &mut App) {
     }
 }
 
-/// A painted button. Not egui's, because the design's controls are drawn to §7
-/// and a stock control is the one thing the style guide refuses outright.
-pub(crate) fn button(ui: &mut egui::Ui, p: Palette, label: &str, enabled: bool) -> egui::Response {
-    let galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        FontId::proportional(text::CONTROL),
-        if enabled { p.text } else { p.text_dim },
-    );
-    let size = vec2(galley.size().x + metrics::S3 * 2.0, metrics::BUTTON);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+/// Which of §7.6's kinds a button is.
+///
+/// One table, one drawing. There were three `button` functions in this crate
+/// with two different signatures and two different paddings, and neither could
+/// express what the other did: the window's could not draw a primary, and the
+/// dialogs' could not draw a disabled one. A button that cannot say "no" and a
+/// button that cannot say "this is the one" are the same defect from opposite
+/// ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// The one thing to do on this view. At most one visible.
+    Primary,
+    /// Everything else. A fill and **no border**.
+    Secondary,
+    /// On `dock`, or inside a well, where a filled button would vanish.
+    Outlined,
+    /// Cancel and tertiary. No fill, no border.
+    Ghost,
+}
 
-    let fill = if !enabled {
-        p.control
-    } else if response.hovered() {
-        p.control_hover
-    } else {
-        p.control
+/// A button, drawn to §7.6.
+///
+/// 26 px tall, radius 5, 11.5 px text, 12 px of padding either side. Disabled
+/// is 45 % opacity across the whole control rather than dim text on a
+/// full-strength fill, and the caller is expected to say why in a tooltip.
+pub(crate) fn button(
+    ui: &mut egui::Ui,
+    p: Palette,
+    label: &str,
+    kind: Kind,
+    enabled: bool,
+) -> egui::Response {
+    let font = match kind {
+        // The primary is the one place §4 puts weight on a control.
+        Kind::Primary => theme::strong(text::CONTROL),
+        _ => FontId::proportional(text::CONTROL),
     };
-    ui.painter().rect_filled(rect, metrics::RADIUS, fill);
-    ui.painter().rect_stroke(
-        rect,
-        metrics::RADIUS,
-        Stroke::new(metrics::HAIRLINE, p.line),
-        egui::StrokeKind::Inside,
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font, Color32::PLACEHOLDER);
+    let size = vec2(galley.size().x + metrics::PAD_PANEL * 2.0, metrics::BUTTON);
+    let (rect, response) = ui.allocate_exact_size(
+        size,
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
     );
-    let at = pos2(
-        rect.center().x - galley.size().x / 2.0,
-        rect.center().y - galley.size().y / 2.0,
+
+    let hovered = enabled && response.hovered();
+    let (fill, border, ink) = match kind {
+        Kind::Primary => (Some(p.accent), None, p.accent_ink),
+        Kind::Secondary => (
+            Some(if hovered { p.control_hover } else { p.control }),
+            None,
+            p.text,
+        ),
+        Kind::Outlined => (
+            None,
+            Some(if hovered { p.line_dashed } else { p.line }),
+            p.text,
+        ),
+        Kind::Ghost => (
+            None,
+            None,
+            if hovered { p.text_strong } else { p.text_muted },
+        ),
+    };
+
+    // 45 % opacity on the *whole* control, which is what makes a disabled
+    // button read as unavailable rather than as merely quiet.
+    let dim = |c: Color32| {
+        if enabled { c } else { c.gamma_multiply(0.45) }
+    };
+
+    if let Some(fill) = fill {
+        ui.painter().rect_filled(rect, metrics::RADIUS, dim(fill));
+    }
+    if let Some(border) = border {
+        ui.painter().rect_stroke(
+            rect,
+            metrics::RADIUS,
+            Stroke::new(metrics::HAIRLINE, dim(border)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    ui.painter().galley(
+        pos2(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        dim(ink),
     );
-    ui.painter().galley(at, galley, p.text);
+
     if enabled {
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
@@ -626,11 +695,11 @@ fn status_bar(ctx: &egui::Context, p: Palette, app: &App) {
             ui.horizontal_centered(|ui| {
                 let message = match &app.scan {
                     State::Idle => match app.target {
-                        Some(t) => format!("Ready — {t} ({} addresses)", t.host_count()),
+                        Some(t) => format!("Ready · {t} · {} addresses", t.host_count()),
                         None => "No local network to sweep".into(),
                     },
                     State::Running { phase, found, .. } => {
-                        format!("{} — {found} found", phase.label())
+                        format!("{} · {found} found", phase.label())
                     }
                     State::Finished(o) => {
                         let mut s = format!(
@@ -642,10 +711,10 @@ fn status_bar(ctx: &egui::Context, p: Palette, app: &App) {
                         // A partial sweep never presents its count as the
                         // answer, in the one place the count is shown.
                         if o.sweep.cancelled {
-                            s.push_str(" — stopped early, not the whole network");
+                            s.push_str(" · stopped early, not the whole network");
                         }
                         for missed in &o.sweep.not_done {
-                            s.push_str(&format!(" — {missed}"));
+                            s.push_str(&format!(" · {missed}"));
                         }
                         s
                     }
@@ -667,14 +736,17 @@ fn status_bar(ctx: &egui::Context, p: Palette, app: &App) {
 /// [`Option`] is honoured rather than defaulted: `None` paints the track and
 /// nothing in it.
 fn progress(ui: &mut egui::Ui, p: Palette, fraction: Option<f32>) {
-    let (rect, _) = ui.allocate_exact_size(vec2(120.0, 4.0), Sense::hover());
-    ui.painter().rect_filled(rect, 2.0, p.control);
+    // §7.10 and §7.18: a 3 px rail in `rail`, filled in `accent`. It was 4 px
+    // on `control`, which is the button's surface rather than the rail's.
+    let (rect, _) = ui.allocate_exact_size(vec2(120.0, metrics::RAIL), Sense::hover());
+    ui.painter().rect_filled(rect, metrics::RAIL / 2.0, p.rail);
     if let Some(f) = fraction {
         let filled = Rect::from_min_size(
             rect.left_top(),
             vec2(rect.width() * f.clamp(0.0, 1.0), rect.height()),
         );
-        ui.painter().rect_filled(filled, 2.0, p.accent);
+        ui.painter()
+            .rect_filled(filled, metrics::RAIL / 2.0, p.accent);
     }
 }
 
@@ -696,12 +768,14 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
     devices_toolbar(ui, p, app);
 
     if devices.is_empty() {
-        let note = match &app.scan {
-            State::Running { .. } => "Sweeping. Devices appear here as they answer.",
-            State::Finished(_) => "Nothing answered on this network.",
-            State::Idle => "No scan yet. Press Scan.",
+        let (message, action) = match &app.scan {
+            State::Running { .. } => ("Sweeping. Devices appear here as they answer.", None),
+            State::Finished(_) => ("Nothing answered on this network.", Some("Scan again")),
+            State::Idle => ("Nothing scanned yet.", Some("Scan")),
         };
-        empty_state(ui, p, note);
+        if empty_state(ui, p, message, action) {
+            app.start_scan();
+        }
         return;
     }
 
@@ -730,8 +804,7 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
                 }
             }
             if shown == 0 {
-                ui.add_space(metrics::S4);
-                empty_state(ui, p, "Nothing here matches that.");
+                empty_state(ui, p, "Nothing here matches that.", None);
             }
             ui.add_space(metrics::S2);
         });
@@ -741,6 +814,15 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
 /// and the kind's name is in the row's tooltip rather than in a column of its
 /// own, because a word per row would cost more width than the icon saves.
 const COL_KIND: f32 = 26.0;
+
+/// The corner radius of a selected table row.
+///
+/// **Square, where `nav_row`'s is rounded, and that is deliberate rather than
+/// an oversight.** A sidebar holds a handful of separated items and a rounded
+/// fill reads as one of them; a table row is one of forty touching its
+/// neighbours top and bottom, and rounding each one leaves pale notches down
+/// both edges of the column. Named so the two call sites disagree on purpose.
+const TABLE_SELECTION_RADIUS: f32 = 0.0;
 
 /// The size the app mark is rasterised at before being scaled into the top bar.
 ///
@@ -755,10 +837,10 @@ const COL_MAC: f32 = 150.0;
 const COL_TIME: f32 = 64.0;
 
 fn table_header(ui: &mut egui::Ui, p: Palette) {
-    let (rect, _) = ui.allocate_exact_size(
-        vec2(ui.available_width(), metrics::ROW_PLAIN),
-        Sense::hover(),
-    );
+    // §7.16: a table header is a 26 px row in `text_dim`. It was 20 px in
+    // `placeholder`, which is the eyebrow's colour and a different rank.
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), metrics::ROW), Sense::hover());
     let mut x = rect.left() + metrics::PAD_PANEL;
     for (label, width) in [
         // The icon column's heading is deliberately empty: "Kind" over a column
@@ -776,11 +858,13 @@ fn table_header(ui: &mut egui::Ui, p: Palette) {
             egui::Align2::LEFT_CENTER,
             label,
             FontId::proportional(text::TINY),
-            p.placeholder,
+            p.text_dim,
         );
         x += width;
     }
-    hairline_across(ui, p, rect.bottom());
+    // `line`, not `line_soft`: this is the edge of a strip, and `line_soft`
+    // belongs between rows inside a list.
+    hairline_strip(ui, p, rect.bottom());
 }
 
 /// One device.
@@ -803,14 +887,16 @@ fn device_row(
     // mark, and never an accent background. The rule the whole design language
     // exists to protect, drawn the same way `nav_row` draws it.
     if selected {
-        ui.painter().rect_filled(rect, 0.0, p.control);
+        ui.painter()
+            .rect_filled(rect, TABLE_SELECTION_RADIUS, p.control);
         ui.painter().rect_filled(
             Rect::from_min_size(rect.left_top(), vec2(metrics::NAV_MARK_W, rect.height())),
-            0.0,
+            TABLE_SELECTION_RADIUS,
             p.accent,
         );
     } else if response.hovered() {
-        ui.painter().rect_filled(rect, 0.0, p.control_hover);
+        ui.painter()
+            .rect_filled(rect, TABLE_SELECTION_RADIUS, p.control_hover);
     }
 
     let figure = FontId::monospace(text::TINY);
@@ -917,7 +1003,7 @@ fn device_row(
         // face.
         if let Some(guess) = guess {
             tip.push_str(&format!(
-                "{} — {}\n",
+                "{}, because {}\n",
                 guess.kind.label(),
                 guess.clue.reason()
             ));
@@ -961,9 +1047,9 @@ fn network_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
             if !s.has(muster_net::survey::Reading::Routes) {
                 // The rule that matters most in this whole view: a reading that
                 // failed is said to have failed, never drawn as an absence.
-                fact(ui, p, "", "could not be read");
+                note(ui, p, "", "could not be read");
             } else if s.gateways.is_empty() {
-                fact(ui, p, "", "none — no default route");
+                note(ui, p, "", "none, there is no default route");
             } else {
                 for g in &s.gateways {
                     fact(ui, p, "", &g.address.to_string());
@@ -972,7 +1058,7 @@ fn network_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
 
             section(ui, p, "DNS");
             if s.resolvers.is_empty() {
-                fact(ui, p, "", "none configured");
+                note(ui, p, "", "none configured");
             }
             for r in &s.resolvers {
                 fact(ui, p, "", &r.to_string());
@@ -980,7 +1066,7 @@ fn network_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
 
             section(ui, p, "DHCP");
             if s.dhcp_servers.is_empty() {
-                fact(ui, p, "", "no lease recorded");
+                note(ui, p, "", "no lease recorded");
             }
             for d in &s.dhcp_servers {
                 fact(ui, p, "", &d.to_string());
@@ -990,7 +1076,7 @@ fn network_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
             if !s.gaps.is_empty() {
                 section(ui, p, "Could not read");
                 for gap in &s.gaps {
-                    fact(ui, p, &gap.reading.to_string(), &gap.because);
+                    note(ui, p, &gap.reading.to_string(), &gap.because);
                 }
             }
             ui.add_space(metrics::S4);
@@ -1004,7 +1090,7 @@ fn about_view(ui: &mut egui::Ui, p: Palette, updates: &mut Updates) {
         ui.vertical(|ui| {
             ui.label(
                 RichText::new("Muster")
-                    .size(text::HEADING)
+                    .font(theme::strong(text::HEADING))
                     .color(p.text_strong),
             );
             ui.label(
@@ -1063,13 +1149,13 @@ fn updates_section(ui: &mut egui::Ui, p: Palette, updates: &mut Updates) {
 
     ui.horizontal(|ui| {
         let busy = matches!(updates.status(), crate::update::Status::Checking);
-        if button(ui, p, "Check now", !busy).clicked() && !busy {
+        if button(ui, p, "Check now", Kind::Secondary, !busy).clicked() && !busy {
             updates.check();
         }
         // A result the user asked for is shown where they asked for it, so the
         // offer opens from here rather than being thrown up as a modal.
         if matches!(updates.status(), crate::update::Status::Available(_))
-            && button(ui, p, "What is in it", true).clicked()
+            && button(ui, p, "What is in it", Kind::Secondary, true).clicked()
         {
             updates.open_offer();
         }
@@ -1100,25 +1186,51 @@ fn section(ui: &mut egui::Ui, p: Palette, title: &str) {
     ui.add_space(metrics::S1);
 }
 
+/// One `key  value` line, where the value is a **figure**.
+///
+/// §4: figures are monospaced and tabular so columns line up and a value does
+/// not jitter as it changes. Addresses, hardware addresses and counts are
+/// figures.
 fn fact(ui: &mut egui::Ui, p: Palette, key: &str, value: &str) {
+    fact_of(ui, p, key, value, true)
+}
+
+/// One `key  value` line, where the value is a **sentence**.
+///
+/// The other half of the same rule, and the half that was missing: every value
+/// went through `monospace()`, so "could not be read" and "none configured"
+/// came out set as though they were numbers.
+fn note(ui: &mut egui::Ui, p: Palette, key: &str, value: &str) {
+    fact_of(ui, p, key, value, false)
+}
+
+fn fact_of(ui: &mut egui::Ui, p: Palette, key: &str, value: &str, figure: bool) {
     ui.horizontal(|ui| {
         ui.add_space(metrics::PAD_PANEL);
         if !key.is_empty() {
             ui.label(RichText::new(key).size(text::SMALL).color(p.text_dim));
         }
-        ui.label(
-            RichText::new(value)
-                .size(text::SMALL)
-                .color(p.text)
-                .monospace(),
-        );
+        let body = RichText::new(value).size(text::SMALL).color(p.text);
+        ui.label(if figure { body.monospace() } else { body });
     });
 }
 
-fn empty_state(ui: &mut egui::Ui, p: Palette, note: &str) {
-    ui.centered_and_justified(|ui| {
-        ui.label(RichText::new(note).size(text::BODY).color(p.text_dim));
+/// §7.19's empty state: what is not here, and the way out of it.
+///
+/// `action` is drawn as a secondary button under the sentence and returns true
+/// when it was pressed. An empty state that only describes the emptiness makes
+/// the reader hunt for the control in another strip.
+fn empty_state(ui: &mut egui::Ui, p: Palette, message: &str, action: Option<&str>) -> bool {
+    let mut pressed = false;
+    ui.vertical_centered(|ui| {
+        ui.add_space(metrics::S4 * 2.0);
+        ui.label(RichText::new(message).size(text::BODY).color(p.text_dim));
+        if let Some(action) = action {
+            ui.add_space(metrics::S3);
+            pressed = button(ui, p, action, Kind::Secondary, true).clicked();
+        }
     });
+    pressed
 }
 
 // ── hairlines ───────────────────────────────────────────────────────────────
@@ -1126,6 +1238,23 @@ fn empty_state(ui: &mut egui::Ui, p: Palette, note: &str) {
 // Every strip and panel edge is one, and they are painted rather than left to
 // egui's separators so that the colour is the token and the width is exactly
 // one pixel.
+
+/// The edge of a strip: `line`, one step stronger than a row's.
+///
+/// §5 keeps three weights of edge apart and they are not interchangeable:
+/// `line` bounds a strip or a panel, `line_soft` separates rows inside a list,
+/// and `line_popover` edges a thing that floats.
+fn hairline_strip(ui: &mut egui::Ui, p: Palette, y: f32) {
+    let rect = ui.max_rect();
+    ui.painter().rect_filled(
+        Rect::from_min_size(
+            pos2(rect.left(), y - metrics::HAIRLINE),
+            vec2(rect.width(), metrics::HAIRLINE),
+        ),
+        0.0,
+        p.line,
+    );
+}
 
 fn hairline_across(ui: &egui::Ui, p: Palette, y: f32) {
     let rect = ui.max_rect();
@@ -1169,38 +1298,68 @@ fn hairline_right(ui: &egui::Ui, p: Palette) {
 /// everything else does. egui's own monospace stays for figures.
 pub(crate) fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "archivo".into(),
-        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
-            "../assets/Archivo.ttf"
-        ))),
-    );
+
+    // **Two static instances, not the variable font.** `Archivo.ttf` is
+    // variable and its default instance is SemiBold; `ab_glyph`, which egui
+    // rasterises with, does not apply variation axes, so registering it drew
+    // the entire interface at 600. These two are cut from it at 400 and 600 by
+    // `tools/make-fonts.py`, which is the only reason §4's "two weights only"
+    // is expressible here at all.
+    for (name, bytes) in [
+        (
+            "archivo",
+            include_bytes!("../assets/Archivo-Regular.ttf").as_slice(),
+        ),
+        (
+            theme::STRONG,
+            include_bytes!("../assets/Archivo-SemiBold.ttf").as_slice(),
+        ),
+    ] {
+        fonts.font_data.insert(
+            name.into(),
+            std::sync::Arc::new(egui::FontData::from_static(bytes)),
+        );
+    }
+
     fonts
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
         .insert(0, "archivo".into());
+    // A family of its own rather than a fallback, so asking for weight is
+    // asking by name and nothing gets it by accident.
+    fonts.families.insert(
+        egui::FontFamily::Name(theme::STRONG.into()),
+        vec![theme::STRONG.to_string()],
+    );
     ctx.set_fonts(fonts);
 }
 
 /// Pushes the palette into egui's own visuals, for the few things it draws
 /// itself: scroll bars, tooltips, the window ground.
-pub(crate) fn apply(ctx: &egui::Context, p: Palette) {
-    let mut visuals = egui::Visuals::dark();
+/// Apply `p`, told which ladder it is so egui's own defaults start from the
+/// right side.
+///
+/// **`Visuals::dark()` was used for both themes**, so in Paper every scroll
+/// bar, tooltip, text selection and modal dim was still derived from the dark
+/// defaults. §3.1: a theme is a table, never a code path.
+pub(crate) fn apply_for(ctx: &egui::Context, p: Palette, mode: Mode) {
+    let mut visuals = match mode {
+        Mode::Dark => egui::Visuals::dark(),
+        Mode::Light => egui::Visuals::light(),
+    };
     visuals.panel_fill = p.window;
     visuals.window_fill = p.popover;
     visuals.extreme_bg_color = p.field;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(metrics::HAIRLINE, p.line);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(metrics::HAIRLINE, p.text);
     visuals.window_stroke = Stroke::new(metrics::HAIRLINE, p.line_popover);
-    // Shadows only under things that float; a panel is not one.
-    visuals.window_shadow = egui::epaint::Shadow {
-        offset: [0, 8],
-        blur: 32,
-        spread: 0,
-        color: Color32::from_black_alpha(153),
-    };
-    visuals.popup_shadow = visuals.window_shadow;
+    // Shadows only under things that float; a panel is not one. The geometry
+    // is §5's table, and it differs per kind: a menu is not a dialog.
+    visuals.window_shadow = theme::shadow::floating(mode);
+    visuals.popup_shadow = theme::shadow::menu(mode);
+    visuals.selection.bg_fill = p.accent_ring;
+    visuals.selection.stroke = Stroke::new(metrics::HAIRLINE, p.text_strong);
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
@@ -1254,19 +1413,15 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
         .default_width(DETAIL_WIDTH)
         .frame(
             egui::Frame::NONE
-                // Opaque, and stated: a floating thing over a dense table has
-                // to be readable, and `popover` is the surface §5 puts menus
-                // and floating panels on.
-                .fill(p.popover.to_opaque())
+                // §5's floating panel: `chrome`, radius 10, and the middle of
+                // the three shadows. It was `popover`, which is the surface a
+                // *menu* sits on — near enough to look right and wrong by the
+                // table that decides it.
+                .fill(p.chrome.to_opaque())
                 .stroke(Stroke::new(metrics::HAIRLINE, p.line_popover))
                 .corner_radius(metrics::RADIUS_MODAL)
                 .inner_margin(egui::Margin::same(metrics::PAD_PANEL as i8))
-                .shadow(egui::epaint::Shadow {
-                    offset: [0, 16],
-                    blur: 48,
-                    spread: 0,
-                    color: Color32::from_black_alpha(178),
-                }),
+                .shadow(theme::shadow::floating(mode)),
         )
         .show(ctx, |ui| {
             ui.set_width(DETAIL_WIDTH);
@@ -1276,7 +1431,7 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(&title)
-                        .size(text::HEADING)
+                        .font(theme::strong(text::HEADING))
                         .color(p.text_strong),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1296,7 +1451,7 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
                     Rect::from_center_size(icon.center(), Vec2::splat(metrics::ROW - 4.0)),
                     kind,
                     deviceicon::colour(kind, mode, p.text_dim),
-                    p.popover,
+                    p.chrome,
                 );
                 ui.add_space(metrics::S1);
                 // The claim and its reason, together. An icon with no way to
@@ -1384,7 +1539,7 @@ fn ping_section(
 ) {
     ui.horizontal(|ui| {
         let waiting = app.ping.as_ref().is_some_and(|(a, _)| *a == address);
-        if button(ui, p, "Ping", !waiting).clicked() && !waiting {
+        if button(ui, p, "Ping", Kind::Secondary, !waiting).clicked() && !waiting {
             app.start_ping(address);
         }
         ui.add_space(metrics::S2);
@@ -1463,7 +1618,7 @@ fn copy_button(ui: &mut egui::Ui, p: Palette, value: &str) -> egui::Response {
         Stroke::new(1.2_f32, ink),
         egui::StrokeKind::Inside,
     );
-    ui.painter().rect_filled(front, 2.0, p.popover);
+    ui.painter().rect_filled(front, 2.0, p.chrome);
     ui.painter().rect_stroke(
         front,
         2.0,
@@ -1507,7 +1662,7 @@ fn ports_section(ui: &mut egui::Ui, p: Palette, app: &mut App, address: std::net
                     .color(p.text_dim),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if button(ui, p, "Stop", true).clicked() {
+                if button(ui, p, "Stop", Kind::Secondary, true).clicked() {
                     app.ports.cancel();
                 }
             });
@@ -1570,7 +1725,7 @@ fn ports_section(ui: &mut egui::Ui, p: Palette, app: &mut App, address: std::net
             }
 
             ui.add_space(metrics::S2);
-            if button(ui, p, "Scan again", true).clicked() {
+            if button(ui, p, "Scan again", Kind::Secondary, true).clicked() {
                 app.ports = ports::State::start(address, muster_net::portscan::Ports::common());
             }
         }
@@ -1581,7 +1736,7 @@ fn ports_section(ui: &mut egui::Ui, p: Palette, app: &mut App, address: std::net
                     .color(p.text_dim),
             );
             ui.add_space(metrics::S2);
-            if button(ui, p, "Scan ports", true).clicked() {
+            if button(ui, p, "Scan ports", Kind::Primary, true).clicked() {
                 app.ports = ports::State::start(address, muster_net::portscan::Ports::common());
             }
         }
@@ -1620,7 +1775,7 @@ fn dhcp_check(ui: &mut egui::Ui, p: Palette, app: &mut App) {
             Some(_) => "Check again",
             None => "Check for another DHCP server",
         };
-        let response = button(ui, p, label, can);
+        let response = button(ui, p, label, Kind::Secondary, can);
         if !can {
             response.clone().on_hover_text(
                 "No interface with a hardware address to ask from. Run \
@@ -1673,56 +1828,79 @@ fn dhcp_check(ui: &mut egui::Ui, p: Palette, app: &mut App) {
 /// §7.2's options strip. It carries the two things a scan needs from the user
 /// and nothing else: the range to sweep, and a filter over what came back.
 fn devices_toolbar(ui: &mut egui::Ui, p: Palette, app: &mut App) {
-    ui.horizontal(|ui| {
-        ui.add_space(metrics::PAD_PANEL);
+    // §7.2: an options strip is `chrome`, 36 px, with a hairline under it. It
+    // was drawn straight onto the window with no ground of its own, so the
+    // fields floated in the table's own surface.
+    let strip = Rect::from_min_size(
+        ui.max_rect().left_top(),
+        vec2(ui.available_width(), metrics::OPTIONS_STRIP),
+    );
+    ui.painter().rect_filled(strip, 0.0, p.chrome);
+    ui.painter().rect_filled(
+        Rect::from_min_size(
+            pos2(strip.left(), strip.bottom() - metrics::HAIRLINE),
+            vec2(strip.width(), metrics::HAIRLINE),
+        ),
+        0.0,
+        p.line,
+    );
 
-        ui.label(RichText::new("Range").size(text::TINY).color(p.text_dim));
-        let target = field(ui, p, &mut app.target_text, 150.0, "192.168.1.0/24");
-
-        // Parsed on every keystroke so the field can say whether it is usable
-        // before the button is pressed, rather than failing after it.
-        //
-        // **The default is still the local prefix.** Typing here is how
-        // `CLAUDE.md`'s "scanning outside the local prefix is a deliberate act"
-        // is expressed: an empty field means this machine's own network, and
-        // anything else is something somebody chose to write.
-        let typed: Option<Prefix> = match app.target_text.trim() {
-            "" => app.survey.default_targets().first().copied(),
-            text => text.parse().ok(),
-        };
-        let unparsed = !app.target_text.trim().is_empty() && typed.is_none();
-        if unparsed {
-            target.on_hover_text(
-                "Not an address and prefix length. Try something like 192.168.1.0/24.",
-            );
-        }
-        app.target = typed;
-
-        // Off the link is worth saying once, plainly, without moralising.
-        if let Some(prefix) = typed
-            && !app.on_link(prefix)
-        {
-            ui.label(
-                RichText::new("not this machine's network")
-                    .size(text::TINY)
-                    .color(p.caution),
-            )
-            .on_hover_text(
-                "Muster will sweep it if you ask. Scanning a network you are \
-                 not responsible for is your decision.",
-            );
-        }
-
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
+        ui.horizontal_centered(|ui| {
             ui.add_space(metrics::PAD_PANEL);
-            if !app.search.is_empty() && button(ui, p, "Clear", false).clicked() {
-                app.search.clear();
+
+            ui.label(RichText::new("Range").size(text::TINY).color(p.text_dim));
+            let target = field(ui, p, &mut app.target_text, 150.0, "192.168.1.0/24");
+
+            // Parsed on every keystroke so the field can say whether it is usable
+            // before the button is pressed, rather than failing after it.
+            //
+            // **The default is still the local prefix.** Typing here is how
+            // `CLAUDE.md`'s "scanning outside the local prefix is a deliberate act"
+            // is expressed: an empty field means this machine's own network, and
+            // anything else is something somebody chose to write.
+            let typed: Option<Prefix> = match app.target_text.trim() {
+                "" => app.survey.default_targets().first().copied(),
+                text => text.parse().ok(),
+            };
+            let unparsed = !app.target_text.trim().is_empty() && typed.is_none();
+            if unparsed {
+                target.on_hover_text(
+                    "Not an address and prefix length. Try something like 192.168.1.0/24.",
+                );
             }
-            field(ui, p, &mut app.search, 200.0, "Search");
-            ui.label(RichText::new("Filter").size(text::TINY).color(p.text_dim));
+            app.target = typed;
+
+            // Off the link is worth saying once, plainly, without moralising.
+            if let Some(prefix) = typed
+                && !app.on_link(prefix)
+            {
+                ui.label(
+                    RichText::new("not this machine's network")
+                        .size(text::TINY)
+                        .color(p.caution),
+                )
+                .on_hover_text(
+                    "Muster will sweep it if you ask. Scanning a network you are \
+                 not responsible for is your decision.",
+                );
+            }
+
+            ui.add_space(metrics::S3);
+            // The one thing to do on this view, beside the range it acts on.
+            scan_control(ui, p, app);
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(metrics::PAD_PANEL);
+                if !app.search.is_empty() && button(ui, p, "Clear", Kind::Ghost, true).clicked() {
+                    app.search.clear();
+                }
+                field(ui, p, &mut app.search, 200.0, "Search");
+                ui.label(RichText::new("Filter").size(text::TINY).color(p.text_dim));
+            });
         });
     });
-    ui.add_space(metrics::S1);
+    ui.add_space(metrics::S2);
 }
 
 /// A text field, drawn to §7.11 rather than egui's own.
@@ -1734,13 +1912,9 @@ pub(crate) fn field(
     placeholder: &str,
 ) -> egui::Response {
     let (rect, _) = ui.allocate_exact_size(vec2(width, metrics::FIELD), Sense::hover());
-    ui.painter().rect_filled(rect, metrics::RADIUS, p.field);
-    ui.painter().rect_stroke(
-        rect,
-        metrics::RADIUS,
-        Stroke::new(metrics::HAIRLINE, p.line),
-        egui::StrokeKind::Inside,
-    );
+    // §7.11: radius 6, which is the tool radius rather than the button's 5.
+    ui.painter()
+        .rect_filled(rect, metrics::RADIUS_TOOL, p.field);
 
     let inner = rect.shrink2(vec2(metrics::S2, 0.0));
     let mut child = ui.new_child(
@@ -1748,14 +1922,30 @@ pub(crate) fn field(
             .max_rect(inner)
             .layout(Layout::left_to_right(Align::Center)),
     );
-    child.add(
+    let response = child.add(
         egui::TextEdit::singleline(text_of)
             .desired_width(inner.width())
             .frame(false)
             .hint_text(RichText::new(placeholder).color(p.placeholder))
             .font(FontId::proportional(text::CONTROL))
             .text_color(p.text),
-    )
+    );
+    // The edge last, so the focus ring sits over the fill rather than under
+    // the text. Two pixels of `accent_ring` when it has the keyboard, a
+    // hairline otherwise: §7.11, and the one focus indication in the
+    // application.
+    let (edge, width) = if response.has_focus() {
+        (p.accent_ring, 2.0)
+    } else {
+        (p.line, metrics::HAIRLINE)
+    };
+    ui.painter().rect_stroke(
+        rect,
+        metrics::RADIUS_TOOL,
+        Stroke::new(width, edge),
+        egui::StrokeKind::Inside,
+    );
+    response
 }
 
 /// Does `text` match this device?
