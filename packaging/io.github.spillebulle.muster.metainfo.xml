@@ -65,6 +65,11 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.0.8" date="2026-08-20">
+      <description>
+        <p>A pass over every screen against the house design language: two type weights, one button table, a corrected light theme.</p>
+      </description>
+    </release>
     <release version="0.0.7" date="2026-08-20">
       <description>
         <p>A settings page with themes and scale, live scan results, a filter, per-device windows, and much wider device identification.</p>
