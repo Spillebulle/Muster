@@ -100,21 +100,17 @@ impl Transport for Host {
         // byte order — the same layout as the octets, so `from_ne_bytes` of the
         // octets is the conversion and `u32::from(addr)` is not.
         let dest = u32::from_ne_bytes(addr.octets());
+        // Eight rather than six: the API writes a whole word and `len` is the
+        // count it filled in, so a six-byte buffer is a two-byte overrun on a
+        // link whose addresses are longer.
         let mut mac = [0u8; 8];
-        let mut len: u32 = 6;
+        let mut len: u32 = mac.len() as u32;
 
         // A source of zero lets the stack pick the interface from its own
         // routing table, which is what makes this correct on a machine with a
         // VPN up without Muster having to choose.
         let rc = unsafe { SendARP(dest, 0, mac.as_mut_ptr().cast(), &mut len) };
-        if rc != NO_ERROR || len != 6 {
-            // Every failure here is "nothing answered": the call reports an
-            // unreachable host and an empty cache the same way, and neither is
-            // a mechanism failure worth surfacing as an error.
-            return Ok(None);
-        }
-        let found = MacAddr::new(mac[..6].try_into().expect("6 bytes"));
-        Ok((!found.is_zero()).then_some(found))
+        arp_result(rc, len, &mac)
     }
 
     fn ping(&self, addr: IpAddr, timeout: Duration) -> io::Result<Option<Duration>> {
@@ -122,7 +118,12 @@ impl Transport for Host {
             // v6 echo goes through `Icmp6SendEcho2`, which takes sockaddrs and
             // a source address rather than a bare word. It is not written yet,
             // and saying so is better than reporting every v6 host as silent.
-            // Nothing reaches here today: a v6 prefix is never enumerated.
+            //
+            // This *is* reached. An earlier note here claimed a v6 prefix is
+            // never enumerated, which was wrong: `Prefix::hosts` gates on the
+            // size of a prefix and not on its family, so a /112 or longer is
+            // walked address by address, and the window has a field a user can
+            // type one into. The error is what reaches `Sweep::not_done`.
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "IPv6 echo is not implemented",
@@ -176,6 +177,72 @@ impl Transport for Host {
 /// Silences the unused-import warning on the handle type in builds where the
 /// echo path is compiled but nothing names `HANDLE` directly.
 const _: Option<HANDLE> = None;
+
+/// The `SendARP` return codes that mean **nothing answered**, as opposed to
+/// the mechanism failing.
+///
+/// This distinction is the whole of the function below, and getting it wrong is
+/// the worst failure `CLAUDE.md` names. `discover::probe_one` treats `Ok(None)`
+/// on an on-link sweep as proof the address is empty and stops probing it,
+/// while an `Err` settles nothing and is carried into `Sweep::not_done`. So a
+/// blanket `rc != NO_ERROR => Ok(None)` reported an invalid parameter, an
+/// interface with no layer 2 under it, a denied handle and resource exhaustion
+/// under 254 concurrent calls as "no device here" — for every address in the
+/// prefix, producing "0 devices found" presented as a complete sweep.
+///
+/// The default is therefore `Err`, and only these are silence:
+///
+/// * `ERROR_GEN_FAILURE` — the ordinary answer for an address that did not
+///   reply. It is what an empty address on a working wire returns.
+/// * `ERROR_BAD_NET_NAME` — the stack has no path to the destination.
+/// * `ERROR_NOT_FOUND` — no entry resulted from the request.
+/// * `ERROR_HOST_UNREACHABLE` — the stack gave up resolving at layer 2, which
+///   is the same event as silence and is reported by some drivers instead.
+/// * `ERROR_TIMEOUT` — the request expired, which is silence with a clock on
+///   it.
+mod arp_rc {
+    pub const GEN_FAILURE: u32 = 31;
+    pub const BAD_NET_NAME: u32 = 67;
+    pub const NOT_FOUND: u32 = 1168;
+    pub const HOST_UNREACHABLE: u32 = 1232;
+    pub const TIMEOUT: u32 = 1460;
+}
+
+/// Reads what `SendARP` filled in. A free function so that the one judgement
+/// in this file that is not a syscall has a test.
+fn arp_result(rc: u32, len: u32, mac: &[u8; 8]) -> io::Result<Option<MacAddr>> {
+    if rc != NO_ERROR {
+        return match rc {
+            arp_rc::GEN_FAILURE
+            | arp_rc::BAD_NET_NAME
+            | arp_rc::NOT_FOUND
+            | arp_rc::HOST_UNREACHABLE
+            | arp_rc::TIMEOUT => Ok(None),
+            other => Err(io::Error::from_raw_os_error(other as i32)),
+        };
+    }
+    match len {
+        // An Ethernet or Wi-Fi address, which is every link a sweep runs on.
+        6 => {
+            let found = MacAddr::new(mac[..6].try_into().expect("6 bytes"));
+            // An all-zero address is the API saying nothing answered rather
+            // than a device whose hardware address is zero.
+            Ok((!found.is_zero()).then_some(found))
+        }
+        // A success that resolved nothing. Silence, and the address is settled.
+        0 => Ok(None),
+        // A success on a link whose hardware address is not six bytes:
+        // Infiniband, a tunnel with a link layer of its own, and loopback
+        // report other lengths. Muster has no way to hold one, and calling an
+        // address that *did* answer empty is the lie this function exists to
+        // avoid, so it is an error and the sweep says the prefix was not fully
+        // looked at.
+        other => Err(io::Error::other(format!(
+            "the hardware address for this link is {other} bytes, and Muster \
+             reads six"
+        ))),
+    }
+}
 
 /// `IfType` values worth telling apart, from `ipifcons.h`. Written out rather
 /// than imported because the names move between `windows-sys` releases and
@@ -441,6 +508,57 @@ unsafe fn from_pcwstr(p: *const u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule this file gets held to: `Ok(None)` is proof an address is
+    /// empty, so only the codes that really mean silence may become one.
+    #[test]
+    fn only_a_genuine_no_answer_settles_an_address() {
+        let zero = [0u8; 8];
+        for rc in [
+            arp_rc::GEN_FAILURE,
+            arp_rc::BAD_NET_NAME,
+            arp_rc::NOT_FOUND,
+            arp_rc::HOST_UNREACHABLE,
+            arp_rc::TIMEOUT,
+        ] {
+            assert!(
+                matches!(arp_result(rc, 0, &zero), Ok(None)),
+                "{rc} is silence"
+            );
+        }
+    }
+
+    /// And the other half, which is the defect: a broken mechanism reported as
+    /// an empty address turns one failure into a whole empty network.
+    #[test]
+    fn a_broken_mechanism_is_an_error_and_never_an_empty_address() {
+        // ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED (an interface with no
+        // layer 2 under it, such as a VPN), ERROR_ACCESS_DENIED, and
+        // ERROR_NO_SYSTEM_RESOURCES under 254 calls at once.
+        for rc in [87u32, 50, 5, 1450, 1] {
+            let e = arp_result(rc, 0, &[0u8; 8]).expect_err("{rc} must not settle an address");
+            assert_eq!(e.raw_os_error(), Some(rc as i32));
+        }
+    }
+
+    #[test]
+    fn a_six_byte_answer_is_the_hardware_address() {
+        let mac = [0x3c, 0x22, 0xfb, 0xaa, 0xbb, 0xcc, 0, 0];
+        assert_eq!(
+            arp_result(NO_ERROR, 6, &mac).unwrap(),
+            Some("3c:22:fb:aa:bb:cc".parse().unwrap())
+        );
+    }
+
+    /// A success that resolved nothing, and a success on a link Muster cannot
+    /// name. The first is silence; the second answered and cannot be held, so
+    /// it is a gap rather than an empty address.
+    #[test]
+    fn a_success_with_no_usable_address_is_silence_or_a_gap_but_never_a_device() {
+        assert_eq!(arp_result(NO_ERROR, 0, &[0u8; 8]).unwrap(), None);
+        assert_eq!(arp_result(NO_ERROR, 6, &[0u8; 8]).unwrap(), None);
+        assert!(arp_result(NO_ERROR, 8, &[1u8; 8]).is_err());
+    }
 
     /// The state mapping is a pure function and is the one thing in this file
     /// that can be checked without a machine. The distinction that matters is

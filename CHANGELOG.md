@@ -3,6 +3,56 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.7
+
+Added
+
+- **A settings page.** Theme, interface scale, how hard a scan knocks and which
+  ports it tries. Settings apply as you change them, so there is nothing to
+  confirm and nothing to lose, and Restore all is the way back.
+- **Themes from files.** Muster reads the same `.umbertheme` files as the rest
+  of the family, so a theme made in a sibling application opens here. Dark,
+  Light, or follow the desktop.
+- **Devices appear as they answer**, instead of after the whole range has been
+  swept. A large range now fills as it goes.
+- **A filter and a range field** above the table. The filter matches everything
+  a row shows, so "epson" and "printer" find things, not just addresses. Leave
+  the range empty and Muster sweeps the network this machine is on.
+- **A window for each device**, in place of the panel that used to take a
+  quarter of the table. It carries what Muster thinks the device is and why, a
+  button to ask it again, its ports, and a copy control on every field.
+- **Far more devices get a kind and an icon.** Printers, phones, televisions,
+  speakers, cameras, network gear, storage and smart home devices are all
+  recognised by many more makers than before. Phones especially: Muster could
+  not identify a single handset by its hardware before this release.
+
+Fixed
+
+- **A scan of a network that filters ARP between clients reported it as empty
+  and finished.** Guest Wi-Fi and any access point with client isolation do
+  exactly that. Muster now says so rather than handing back nothing as though
+  it were an answer.
+- **On Windows, several kinds of ARP failure were reported as "no device
+  here"** for every address, so a whole network could come back empty and
+  apparently complete. Only a genuine silence counts as silence now.
+- **Scanning a range off this link gave different answers on Windows and
+  Linux**, because Windows resolved the next hop's hardware address and read it
+  as the target's.
+- **Stop now takes effect at the next probe** rather than the next address. It
+  could previously send around a thousand more packets after being asked to
+  stop.
+- **A sweep on Linux read the system's ARP table tens of thousands of times a
+  second.** It reads it once every few milliseconds now, which is a large
+  saving on a big range.
+- **Ctrl-C stops a scan on Linux** and prints what was found, as it already did
+  on Windows.
+- **A device with a long list of services was identified on Linux and not on
+  Windows.**
+- The port scan's notes are notes now, rather than amber warnings that made a
+  successful scan look like a failure.
+- The window no longer sits at "Sweeping" for ever if a scan fails.
+- The mark in the top left is the real one.
+
 ## 0.0.6
 
 Fixed

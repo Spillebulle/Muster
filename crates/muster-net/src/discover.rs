@@ -33,8 +33,10 @@
 use crate::mac::MacAddr;
 use crate::prefix::Prefix;
 use crate::rate::Bucket;
+use std::collections::BTreeSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -177,24 +179,36 @@ pub struct Options {
     /// Knock on [`KNOCK_PORTS`] for addresses that answered nothing else.
     /// This is what finds a Windows machine on a public network profile.
     pub knock: bool,
-    /// Treat silence from ARP as proof that nothing is at the address, and stop
-    /// probing it.
+    /// **The prefix is on this machine's own link**, which the caller knows
+    /// and the sweep does not. It decides two things, and they are one flag
+    /// because they are the same fact.
     ///
-    /// **Only true when the prefix is on the machine's own link**, which the
-    /// caller knows and the sweep does not. There it is not an optimisation but
-    /// the more correct answer: ARP is answered by a device's network stack
-    /// below any firewall it has, and a host that did not answer could not use
-    /// the network at all. Everything after it — a ping and four connections —
-    /// is then spent proving something already known, at four seconds an empty
-    /// address, which on a mostly empty /24 is the entire cost of the sweep.
+    /// *Whether ARP is asked at all.* Off-link it is not, and this is a
+    /// correctness rule rather than a saving. `SendARP` on Windows resolves
+    /// through the routing table, so for a destination one hop away the stack
+    /// answers with the **next hop's** hardware address: an off-link sweep
+    /// that asked would report all 254 addresses present, every one of them
+    /// wearing the gateway's MAC. Linux's provoke-and-read-the-cache cannot
+    /// invent that, so asking off-link also made the two platforms answer the
+    /// same scan differently.
+    ///
+    /// *Whether silence from ARP settles an address.* On-link it does, and
+    /// that is not an optimisation but the more correct answer: ARP is
+    /// answered by a device's network stack below any firewall it has, and a
+    /// host that did not answer could not use the network at all. Everything
+    /// after it — a ping and four connections — is then spent proving
+    /// something already known, at four seconds an empty address, which on a
+    /// mostly empty /24 is the entire cost of the sweep.
     ///
     /// Off the link it must be false: an address one hop away is *supposed* to
     /// have no ARP reply, and taking that as absence finds nothing anywhere.
     ///
-    /// The one thing this gives up is a host whose stack answers nothing at all
-    /// yet still has open ports. That configuration cannot reach its own
-    /// gateway, so it is a lab curiosity rather than a device on somebody's
-    /// network.
+    /// The one thing the shortcut gives up is a host whose stack answers
+    /// nothing at all yet still has open ports. That configuration cannot
+    /// reach its own gateway, so it is a lab curiosity rather than a device on
+    /// somebody's network — but a *link* that filters ARP between its clients
+    /// is not, and [`Sweep::not_done`] says so when a whole prefix comes back
+    /// silent. See [`ARP_SILENCE_SHARE`].
     pub arp_authoritative: bool,
 }
 
@@ -222,6 +236,39 @@ impl Options {
             arp_authoritative: true,
             ..Self::default()
         }
+    }
+}
+
+/// The share of a prefix that has to be settled by ARP silence alone, with
+/// nothing found anywhere, before the sweep stops believing the shortcut.
+///
+/// Nine in ten rather than all of them, because a link that filters ARP
+/// between clients still lets the *gateway* answer sometimes, and one lucky
+/// reply must not turn the caveat off for the other 253.
+const ARP_SILENCE_SHARE: (u64, u64) = (9, 10);
+
+/// One found host, in the high half of the packed tally.
+const FOUND_STEP: u64 = 1 << 32;
+/// The low half, which holds the addresses probed.
+const PROBED_MASK: u64 = u32::MAX as u64;
+
+/// What the workers have to tell the sweep that a [`Found`] cannot carry.
+///
+/// Shared by every worker, so it is behind its own locks rather than folded
+/// into the result: a mechanism fails at an address, and the sweep reports it
+/// once for the prefix.
+#[derive(Default)]
+struct Notes {
+    /// One line per distinct reason, not per address. A broken ARP fails 254
+    /// times over and the user has to be told once.
+    gaps: Mutex<BTreeSet<String>>,
+    /// Addresses settled by ARP silence and nothing else.
+    arp_silent: AtomicU64,
+}
+
+impl Notes {
+    fn gap(&self, line: String) {
+        self.gaps.lock().expect("sweep notes poisoned").insert(line);
     }
 }
 
@@ -294,7 +341,11 @@ pub fn sweep<T: Transport>(
     let addresses: Vec<IpAddr> = hosts.collect();
     result.total = addresses.len() as u64;
 
-    if !caps.arp {
+    // Only claimed as a gap where the sweep would have used it. Off-link ARP
+    // is not asked for at all, see `Options::arp_authoritative`, so calling it
+    // missing there would be a caveat about a technique that could not have
+    // helped, which is its own kind of dishonesty.
+    if !caps.arp && opts.arp_authoritative {
         result.not_done.push(
             "could not send ARP requests, so devices that ignore ping and \
              refuse nothing were missed"
@@ -306,15 +357,28 @@ pub fn sweep<T: Transport>(
     }
 
     let next = AtomicU64::new(0);
-    let probed = AtomicU64::new(0);
-    let found_count = AtomicU64::new(0);
+    // `probed` in the low half of a word and `found` in the high half. Two
+    // counters read separately let a worker report a pair that never existed,
+    // and let a slow worker deliver a lower count after a fast one, so both the
+    // bar and the device count could tick backwards on screen.
+    let tally = AtomicU64::new(0);
+    // The highest pair anyone has reported, and the lock that makes reporting
+    // it monotone. Packing the two counters into one word stops a caller ever
+    // seeing a pair that did not exist; on its own it does not stop two workers
+    // taking 10 and 11 and then reaching the callback in the other order, which
+    // is the tick backwards a user actually sees. Only holding something across
+    // the compare *and* the call fixes that, and the call is a line of text or
+    // a channel send: 254 probes contending on it over several seconds is
+    // nothing beside the packet each of them just waited for.
+    let shown = Mutex::new(0u64);
+    let notes = Notes::default();
     let workers = opts.workers.clamp(1, 512).min(addresses.len().max(1));
     let mut found: Vec<Found> = Vec::new();
 
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
-            let (next, probed, found_count) = (&next, &probed, &found_count);
+            let (next, tally, shown, notes) = (&next, &tally, &shown, &notes);
             let addresses = &addresses;
             handles.push(scope.spawn(move || {
                 let mut mine = Vec::new();
@@ -327,26 +391,28 @@ pub fn sweep<T: Transport>(
                         break;
                     };
 
-                    let hit = probe_one(address, transport, rate, &caps, opts);
-                    let done = probed.fetch_add(1, Ordering::Relaxed) + 1;
-                    let hits = match &hit {
-                        Some(_) => found_count.fetch_add(1, Ordering::Relaxed) + 1,
-                        None => found_count.load(Ordering::Relaxed),
-                    };
-                    // Reported **before** it is kept, so a caller can put the
-                    // device on screen the moment it answers rather than when
-                    // the whole prefix has been walked. A /24 takes seconds and
-                    // a /16 takes a great deal longer; either way, a table that
-                    // fills as it goes is the difference between watching a
-                    // scan and waiting for one.
-                    progress(
-                        Progress {
-                            probed: done,
-                            total: addresses.len() as u64,
-                            found: hits,
-                        },
-                        hit.as_ref(),
-                    );
+                    let hit = probe_one(address, transport, rate, &caps, opts, cancel, notes);
+                    let step = if hit.is_some() { 1 + FOUND_STEP } else { 1 };
+                    let ours = tally.fetch_add(step, Ordering::Relaxed) + step;
+                    {
+                        let mut pair = shown.lock().unwrap_or_else(|e| e.into_inner());
+                        *pair = (*pair).max(ours);
+                        // Reported **before** it is kept, so a caller can put
+                        // the device on screen the moment it answers rather
+                        // than when the whole prefix has been walked. A /24
+                        // takes seconds and a /16 takes a great deal longer;
+                        // either way, a table that fills as it goes is the
+                        // difference between watching a scan and waiting for
+                        // one.
+                        progress(
+                            Progress {
+                                probed: *pair & PROBED_MASK,
+                                total: addresses.len() as u64,
+                                found: *pair >> 32,
+                            },
+                            hit.as_ref(),
+                        );
+                    }
                     if let Some(f) = hit {
                         mine.push(f);
                     }
@@ -361,84 +427,181 @@ pub fn sweep<T: Transport>(
 
     found.sort_by_key(|f| f.address);
     result.found = found;
-    result.probed = probed.load(Ordering::Relaxed);
+    result.probed = tally.load(Ordering::Relaxed) & PROBED_MASK;
     result.cancelled = cancel.load(Ordering::Relaxed);
+    result.not_done.extend(
+        notes
+            .gaps
+            .lock()
+            .expect("sweep notes poisoned")
+            .iter()
+            .cloned(),
+    );
+
+    // The shortcut's blind spot, and the reason it is checked rather than
+    // trusted: `arp_authoritative` assumes a host that did not answer ARP could
+    // not use the network. That holds for a *host* and not for a *link*. Guest
+    // Wi-Fi and any access point with client isolation filter ARP between
+    // clients, and there every address is settled by silence, the ping and the
+    // knock are skipped, and the sweep hands back an empty network as a
+    // finished answer. That is the failure `CLAUDE.md` calls the worst this
+    // application can produce, because it looks like a result.
+    //
+    // Re-probing the whole prefix without the shortcut was the other option and
+    // was not taken: it doubles the length of a sweep that has already found
+    // nothing, with nothing on screen to say why it is still going, and it
+    // still could not tell an isolated link from an empty one. Saying what was
+    // assumed is the answer a user can act on.
+    let arp_silent = notes.arp_silent.load(Ordering::Relaxed);
+    if opts.arp_authoritative
+        && result.found.is_empty()
+        && result.probed > 0
+        // A sweep stopped after three addresses says so already, and a second
+        // caveat drawn from three data points would be a guess wearing the
+        // same face as a finding.
+        && !result.cancelled
+        && arp_silent * ARP_SILENCE_SHARE.1 >= result.probed * ARP_SILENCE_SHARE.0
+    {
+        result.not_done.push(
+            "nothing answered ARP anywhere in this network, and every address \
+             was settled by that silence alone; on a link that filters ARP \
+             between its clients, as guest Wi-Fi and client isolation do, \
+             finding nothing is not the same as there being nothing"
+                .into(),
+        );
+    }
     result
 }
 
-/// Probes one address with everything available, cheapest and most conclusive
-/// first.
-///
-/// ARP leads because it is the strongest evidence on a local wire — answered
-/// below any firewall — and because it yields the hardware address, which is
-/// what the whole device list is keyed on. The knock is last and only for
-/// silence, so a host that answered already costs four fewer probes.
 /// Probe one address, once.
 ///
-/// The single-host form of the sweep, for asking again about a device that is
-/// already on screen. It runs the same three probes in the same order and
-/// returns the same [`Found`], so what a re-check says and what the sweep said
-/// cannot disagree about what counts as an answer.
+/// The single-host form of the sweep, with everything available tried cheapest
+/// and most conclusive first. ARP leads *on-link*, because there it is the
+/// strongest evidence there is — answered below any firewall — and because it
+/// yields the hardware address the whole device list is keyed on; off-link it
+/// is not asked at all. The knock is last and only for silence, so a host that
+/// answered already costs four fewer probes.
+///
+/// This is what a re-check of a device already on screen calls. It runs the
+/// same probes in the same order and returns the same [`Found`], so what a
+/// re-check says and what the sweep said cannot disagree about what counts as
+/// an answer.
 pub fn probe<T: Transport>(
     address: IpAddr,
     transport: &T,
     rate: &Bucket,
     opts: Options,
 ) -> Option<Found> {
-    probe_one(address, transport, rate, &transport.capabilities(), opts)
+    // One address asked once is never cancelled and has nowhere to put a gap:
+    // the caller is a re-check of a device already on screen, and what it wants
+    // to know is whether the thing still answers.
+    probe_one(
+        address,
+        transport,
+        rate,
+        &transport.capabilities(),
+        opts,
+        &AtomicBool::new(false),
+        &Notes::default(),
+    )
 }
 
+/// The probes for one address.
+///
+/// `cancel` is read before **every** probe rather than once per address, which
+/// is `CLAUDE.md`'s rule that cancelling takes effect at the next packet. One
+/// check per address is one check per six probes and up to two and a half
+/// seconds of waiting, and with 254 workers that was a thousand more packets
+/// on the wire after the user pressed Stop.
+#[allow(clippy::too_many_arguments)]
 fn probe_one<T: Transport>(
     address: IpAddr,
     transport: &T,
     rate: &Bucket,
     caps: &Capabilities,
     opts: Options,
+    cancel: &AtomicBool,
+    notes: &Notes,
 ) -> Option<Found> {
     let mut evidence = Vec::new();
     let mut mac = None;
     let mut rtt = None;
 
-    if caps.arp
-        && let IpAddr::V4(v4) = address
-    {
-        rate.wait();
-        let answered = transport.arp(v4, opts.arp_timeout);
-        match answered {
-            // An all-zero reply is the API's way of saying nothing answered,
-            // and it is not a device.
-            Ok(Some(hw)) if !hw.is_zero() => {
-                mac = Some(hw);
-                evidence.push(Evidence::Arp(hw));
+    // A labelled block rather than early returns, so that giving up part way
+    // through still hands back whatever has already answered. A device found by
+    // ARP and then cancelled before its ping is still a device.
+    'probes: {
+        // ARP is asked only on-link. Off the link the answer is the gateway's
+        // hardware address rather than the destination's, which is a device
+        // invented at every address. See `Options::arp_authoritative`.
+        if caps.arp
+            && opts.arp_authoritative
+            && let IpAddr::V4(v4) = address
+        {
+            if !rate.wait_unless(cancel) {
+                break 'probes;
             }
-            // On-link silence settles it. See `Options::arp_authoritative`.
-            Ok(_) if opts.arp_authoritative => return None,
-            // An *error* is the mechanism failing, not the address answering,
-            // so it never settles anything: fall through and probe properly.
-            _ => {}
-        }
-    }
-
-    if caps.icmp {
-        rate.wait();
-        if let Ok(Some(t)) = transport.ping(address, opts.ping_timeout) {
-            evidence.push(Evidence::Ping);
-            rtt = Some(t);
-        }
-    }
-
-    if evidence.is_empty() && opts.knock && caps.tcp {
-        for &port in KNOCK_PORTS {
-            rate.wait();
-            match transport.tcp(address, port, opts.tcp_timeout) {
-                Outcome::Open => evidence.push(Evidence::TcpOpen(port)),
-                // A refusal proves the host. Knocking further would only find
-                // more ports, which is phase three's job.
-                Outcome::Refused => {
-                    evidence.push(Evidence::TcpRefused(port));
-                    break;
+            match transport.arp(v4, opts.arp_timeout) {
+                // An all-zero reply is the API's way of saying nothing
+                // answered, and it is not a device.
+                Ok(Some(hw)) if !hw.is_zero() => {
+                    mac = Some(hw);
+                    evidence.push(Evidence::Arp(hw));
                 }
-                Outcome::NoAnswer => {}
+                // On-link silence settles it. See `Options::arp_authoritative`,
+                // and note that the sweep counts how often this happens: a
+                // whole prefix settled this way is a filtered link as readily
+                // as an empty one.
+                Ok(_) => {
+                    notes.arp_silent.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                // An *error* is the mechanism failing, not the address
+                // answering, so it never settles anything: fall through, probe
+                // properly, and make sure the sweep says it happened.
+                Err(e) => notes.gap(format!(
+                    "hardware address lookups failed ({e}), so devices that \
+                     ignore ping and refuse nothing may have been missed"
+                )),
+            }
+        }
+
+        if caps.icmp {
+            if !rate.wait_unless(cancel) {
+                break 'probes;
+            }
+            match transport.ping(address, opts.ping_timeout) {
+                Ok(Some(t)) => {
+                    evidence.push(Evidence::Ping);
+                    rtt = Some(t);
+                }
+                // Silence, which proves nothing and needs no note.
+                Ok(None) => {}
+                // The transport could not send at all. This is where an IPv6
+                // sweep lands today, because neither platform has written the
+                // v6 echo: `Capabilities` has no family axis, so nothing above
+                // knows the difference between "pinged and heard nothing" and
+                // "never pinged". Recording it is what stops a /112 of silent
+                // hosts reading as a network with nothing on it.
+                Err(e) => notes.gap(format!("could not send an ICMP echo ({e})")),
+            }
+        }
+
+        if evidence.is_empty() && opts.knock && caps.tcp {
+            for &port in KNOCK_PORTS {
+                if !rate.wait_unless(cancel) {
+                    break 'probes;
+                }
+                match transport.tcp(address, port, opts.tcp_timeout) {
+                    Outcome::Open => evidence.push(Evidence::TcpOpen(port)),
+                    // A refusal proves the host. Knocking further would only
+                    // find more ports, which is phase three's job.
+                    Outcome::Refused => {
+                        evidence.push(Evidence::TcpRefused(port));
+                        break;
+                    }
+                    Outcome::NoAnswer => {}
+                }
             }
         }
     }
@@ -455,7 +618,8 @@ fn probe_one<T: Transport>(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
+    use std::sync::Arc;
+    use std::time::Instant;
 
     /// A network held in a map. Every test in this module runs against it, and
     /// no test in this crate opens a socket.
@@ -499,6 +663,15 @@ mod tests {
         }
         fn ping(&self, addr: IpAddr, _: Duration) -> io::Result<Option<Duration>> {
             self.note(format!("ping {addr}"));
+            // Both real platforms answer a v6 address this way, so the fake
+            // does too: a fake that is kinder than the transport it stands in
+            // for is a test that passes for the wrong reason.
+            if addr.is_ipv6() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "IPv6 echo is not implemented",
+                ));
+            }
             Ok(self
                 .pings
                 .contains(&addr)
@@ -538,7 +711,7 @@ mod tests {
         fake.arp
             .insert(v4("192.168.1.1"), "3c:22:fb:aa:bb:cc".parse().unwrap());
 
-        let s = run("192.168.1.0/24", &fake, Options::default());
+        let s = run("192.168.1.0/24", &fake, Options::on_link());
         assert_eq!(s.found.len(), 1);
         assert_eq!(s.found[0].address, ip("192.168.1.1"));
         assert_eq!(s.found[0].mac, Some("3c:22:fb:aa:bb:cc".parse().unwrap()));
@@ -576,12 +749,12 @@ mod tests {
         );
     }
 
-    /// Once something has answered, the knock is wasted probes.
+    /// Once something has answered, the knock is wasted probes. Off-link,
+    /// where the ping is the only thing that can answer first.
     #[test]
     fn a_host_that_answered_is_not_knocked_on() {
         let mut fake = Fake::new();
-        fake.arp
-            .insert(v4("192.168.1.5"), "3c:22:fb:aa:bb:cc".parse().unwrap());
+        fake.pings.push(ip("192.168.1.5"));
 
         run("192.168.1.0/28", &fake, Options::default());
         assert_eq!(fake.count("tcp 192.168.1.5:"), 0, "it already answered");
@@ -653,6 +826,34 @@ mod tests {
         assert!(fake.count("tcp") > 0);
     }
 
+    /// And off the link it is not *asked*, which is the stronger rule.
+    ///
+    /// `SendARP` resolves through the routing table, so one hop away the stack
+    /// answers with the gateway's hardware address rather than the
+    /// destination's. A sweep that took that would report every address in the
+    /// prefix as a device, all of them wearing the same MAC, and it would do so
+    /// only on Windows: Linux reads the cache and cannot invent it. The two
+    /// platforms have to answer the same scan the same way.
+    #[test]
+    fn arp_is_not_asked_off_link_at_all() {
+        let mut fake = Fake::new();
+        fake.arp
+            .insert(v4("192.168.1.3"), "3c:22:fb:aa:bb:cc".parse().unwrap());
+
+        let s = run("192.168.1.0/29", &fake, Options::default());
+        assert_eq!(fake.count("arp"), 0, "not one request went out");
+        assert!(
+            s.found.is_empty(),
+            "and no hardware address was invented: {:?}",
+            s.found
+        );
+        assert!(
+            s.not_done.is_empty(),
+            "nor is a technique that does not apply reported as missing: {:?}",
+            s.not_done
+        );
+    }
+
     /// The mechanism failing is not the address answering. A broken ARP must
     /// fall through to the other probes rather than concluding an empty
     /// network — the same rule as everywhere else in this crate.
@@ -684,6 +885,90 @@ mod tests {
         );
         assert_eq!(s.found.len(), 1, "the pinging host survives a broken ARP");
         assert_eq!(s.found[0].address, ip("192.168.1.2"));
+
+        // And it is *said*. Falling through quietly still leaves a sweep that
+        // found one device on a wire where it could not look for hardware
+        // addresses at all, and presents that as the answer.
+        assert!(
+            !s.is_complete(),
+            "a broken mechanism is an incomplete sweep"
+        );
+        assert_eq!(s.not_done.len(), 1, "{:?}", s.not_done);
+        assert!(
+            s.not_done[0].contains("hardware address lookups failed"),
+            "{:?}",
+            s.not_done
+        );
+    }
+
+    /// The same rule one layer along: a transport that cannot ping the family
+    /// being swept says so rather than letting every address read as silent.
+    ///
+    /// This is where an IPv6 sweep lands today. `Prefix::hosts` gates on the
+    /// *size* of a prefix and not on its family, so a /126 is enumerated
+    /// happily, and neither platform has written the v6 echo. `Capabilities`
+    /// has no family axis to express that, so the error itself is what reaches
+    /// the result.
+    #[test]
+    fn a_family_the_transport_cannot_ping_is_a_stated_gap() {
+        let fake = Fake::new();
+        let s = run("2001:db8::/126", &fake, Options::default());
+
+        assert!(s.found.is_empty());
+        assert_eq!(s.probed, 4, "the addresses were walked");
+        assert_eq!(fake.count("arp"), 0, "there is no ARP for IPv6");
+        assert!(
+            !s.is_complete(),
+            "so this is not a network with nothing on it"
+        );
+        assert_eq!(s.not_done.len(), 1, "{:?}", s.not_done);
+        assert!(
+            s.not_done[0].contains("could not send an ICMP echo"),
+            "{:?}",
+            s.not_done
+        );
+        assert!(
+            s.not_done[0].contains("IPv6 echo is not implemented"),
+            "and it carries the transport's own reason: {:?}",
+            s.not_done
+        );
+    }
+
+    /// The shortcut assumes a host that ignored ARP could not use the network.
+    /// True of a host, false of a *link*: guest Wi-Fi and client isolation
+    /// filter ARP between clients, and there the sweep settles all 254
+    /// addresses on silence, skips everything else and hands back an empty
+    /// network as a finished answer.
+    #[test]
+    fn a_link_that_filters_arp_is_not_reported_as_an_empty_network() {
+        let fake = Fake::new();
+        let s = run("192.168.1.0/24", &fake, Options::on_link());
+
+        assert!(s.found.is_empty());
+        assert_eq!(s.probed, 254);
+        assert_eq!(fake.count("ping"), 0, "the shortcut did take effect");
+        assert!(
+            !s.is_complete(),
+            "but nothing found by ARP alone is not an answer"
+        );
+        assert!(
+            s.not_done.iter().any(|l| l.contains("filters ARP")),
+            "{:?}",
+            s.not_done
+        );
+    }
+
+    /// And the caveat is not a permanent fixture: one device answering means
+    /// ARP crosses this link, and the shortcut is then exactly what it claims.
+    #[test]
+    fn one_answer_is_enough_to_trust_the_shortcut() {
+        let mut fake = Fake::new();
+        fake.arp
+            .insert(v4("192.168.1.1"), "3c:22:fb:aa:bb:cc".parse().unwrap());
+
+        let s = run("192.168.1.0/24", &fake, Options::on_link());
+        assert_eq!(s.found.len(), 1);
+        assert!(s.is_complete(), "{:?}", s.not_done);
     }
 
     /// `CLAUDE.md`: never degrade silently. A sweep without ARP finds less and
@@ -698,7 +983,9 @@ mod tests {
         };
         fake.pings.push(ip("192.168.1.9"));
 
-        let s = run("192.168.1.0/24", &fake, Options::default());
+        // On-link, where ARP is the technique the sweep would otherwise lead
+        // with. Off-link it is not asked for at all and is not a gap.
+        let s = run("192.168.1.0/24", &fake, Options::on_link());
         assert_eq!(s.found.len(), 1, "the pinging host is still found");
         assert!(!s.is_complete(), "but the sweep is not complete");
         assert_eq!(s.not_done.len(), 1);
@@ -737,7 +1024,7 @@ mod tests {
             &Bucket::new(1_000_000),
             Options {
                 workers: 1,
-                ..Default::default()
+                ..Options::on_link()
             },
             &cancel,
             &|_, _| {
@@ -780,26 +1067,160 @@ mod tests {
 
     /// Every probe passes the limiter, which is the rule that keeps a sweep
     /// from looking like an attack.
+    ///
+    /// Asserted against the **bucket**, not against the transport. The earlier
+    /// version of this test counted the fake's calls, which is a count of
+    /// probes sent and says nothing at all about whether any of them was
+    /// charged: deleting every `rate.wait()` in `probe_one` left it green. The
+    /// bucket's clock is asked exactly once per charge, so counting the reads
+    /// of the clock counts the charges.
     #[test]
     fn every_probe_is_charged_to_the_rate_limiter() {
-        let fake = Fake::new();
-        let rate = Bucket::new(1_000_000);
-        let opts = Options {
-            workers: 1,
-            ..Default::default()
+        #[derive(Clone)]
+        struct Counting {
+            base: Instant,
+            reads: Arc<AtomicU64>,
+        }
+        impl crate::rate::Clock for Counting {
+            fn now(&self) -> Instant {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.base
+            }
+        }
+
+        let reads = Arc::new(AtomicU64::new(0));
+        let clock = Counting {
+            base: Instant::now(),
+            reads: Arc::clone(&reads),
         };
+        // A burst wide enough that a stopped clock never makes a probe wait,
+        // so the test finishes instantly and still charges for every one.
+        let rate = Bucket::with_clock(1_000, 64, Box::new(clock));
+        let built = reads.swap(0, Ordering::SeqCst);
+        assert_eq!(built, 1, "the bucket reads the clock once to start");
+
+        let fake = Fake::new();
         sweep(
             "192.168.1.0/30".parse().unwrap(),
             &fake,
             &rate,
-            opts,
+            Options {
+                workers: 1,
+                ..Default::default()
+            },
             &AtomicBool::new(false),
             &|_, _| {},
         );
-        // Two addresses, each: one ARP, one ping, then four knocks.
-        assert_eq!(fake.count("arp"), 2);
+
+        // Two addresses, each one ping and then four knocks. No ARP: this
+        // prefix is not on-link.
+        assert_eq!(fake.count("arp"), 0);
         assert_eq!(fake.count("ping"), 2);
         assert_eq!(fake.count("tcp"), 8);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            10,
+            "ten probes went out and ten were charged for"
+        );
+    }
+
+    /// `CLAUDE.md`: cancelling takes effect at the next packet, not at the end
+    /// of a phase. One check per address is one check per six probes, and with
+    /// 254 workers that was a thousand more packets after the user pressed
+    /// Stop.
+    #[test]
+    fn cancelling_takes_effect_at_the_next_probe_and_not_the_next_address() {
+        struct StopsDuringTheFirstPing<'a> {
+            cancel: &'a AtomicBool,
+            probes: AtomicU64,
+        }
+        impl Transport for StopsDuringTheFirstPing<'_> {
+            fn capabilities(&self) -> Capabilities {
+                Capabilities::UNPRIVILEGED
+            }
+            fn arp(&self, _: Ipv4Addr, _: Duration) -> io::Result<Option<MacAddr>> {
+                self.probes.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+            fn ping(&self, _: IpAddr, _: Duration) -> io::Result<Option<Duration>> {
+                self.probes.fetch_add(1, Ordering::SeqCst);
+                // The user presses Stop while this one probe is in flight.
+                self.cancel.store(true, Ordering::SeqCst);
+                Ok(None)
+            }
+            fn tcp(&self, _: IpAddr, _: u16, _: Duration) -> Outcome {
+                self.probes.fetch_add(1, Ordering::SeqCst);
+                Outcome::NoAnswer
+            }
+        }
+
+        let cancel = AtomicBool::new(false);
+        let transport = StopsDuringTheFirstPing {
+            cancel: &cancel,
+            probes: AtomicU64::new(0),
+        };
+        let s = sweep(
+            "192.168.1.0/29".parse().unwrap(),
+            &transport,
+            &Bucket::new(1_000_000),
+            Options {
+                workers: 1,
+                ..Default::default()
+            },
+            &cancel,
+            &|_, _| {},
+        );
+
+        assert_eq!(
+            transport.probes.load(Ordering::SeqCst),
+            1,
+            "the four knocks behind the cancelled ping must not go out"
+        );
+        assert!(s.cancelled);
+        assert!(!s.is_complete());
+    }
+
+    /// A counter read out of two atomics can hand a caller a pair that never
+    /// existed, and a slow worker can deliver a lower count after a fast one.
+    /// Either way the bar ticks backwards, which reads as the scan losing its
+    /// place.
+    #[test]
+    fn progress_never_goes_backwards() {
+        let mut fake = Fake::new();
+        for i in 1..=120 {
+            fake.pings.push(ip(&format!("192.168.1.{i}")));
+        }
+        let worst = Mutex::new((0u64, 0u64));
+        sweep(
+            "192.168.1.0/24".parse().unwrap(),
+            &fake,
+            &Bucket::new(1_000_000),
+            Options {
+                workers: 64,
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+            &|p, _| {
+                let mut worst = worst.lock().unwrap();
+                assert!(
+                    p.probed >= worst.0,
+                    "probed went {} then {}",
+                    worst.0,
+                    p.probed
+                );
+                assert!(
+                    p.found >= worst.1,
+                    "found went {} then {}",
+                    worst.1,
+                    p.found
+                );
+                assert!(p.found <= p.probed, "{p:?} found more than it probed");
+                *worst = (p.probed, p.found);
+            },
+        );
+        let (probed, found) = *worst.lock().unwrap();
+        assert_eq!(probed, 254);
+        assert_eq!(found, 120);
     }
 
     #[test]

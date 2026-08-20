@@ -132,22 +132,38 @@ pub fn parse_node_status(buf: &[u8]) -> Option<NodeStatus> {
     at = at.checked_add(8)?;
     let rdlength = u16::from_be_bytes([*buf.get(at)?, *buf.get(at + 1)?]) as usize;
     at += 2;
-    let end = at.checked_add(rdlength)?;
-    if end > buf.len() {
-        return None;
-    }
+    // Clamped rather than refused. A datagram that was cut short still carries
+    // the names that arrived in it, and a reply whose `rdlength` promises more
+    // than the buffer holds is the ordinary shape of a truncated one; failing
+    // here threw away a hostname that had decoded perfectly well.
+    let end = at.checked_add(rdlength)?.min(buf.len());
 
     let count = *buf.get(at)? as usize;
     at += 1;
 
     let mut status = NodeStatus::default();
+    let mut every_name_read = true;
     for _ in 0..count {
+        // **Bounded by the record, not by the buffer.** `count` is a byte the
+        // sender chose, and nothing makes it agree with `rdlength`: read to the
+        // count alone and a reply claiming two hundred names keeps taking
+        // eighteen byte bites out of whatever follows it in the datagram, which
+        // decodes into names no machine ever claimed. There is no unsoundness
+        // in it, only invented evidence, which on a device list is worse.
+        //
+        // And it *stops* rather than failing. Returning `None` here threw away
+        // a whole reply, hostname and workgroup included, because its tail was
+        // short by a few bytes: the names that decoded were correct and are
+        // kept.
+        let Some(entry_end) = at.checked_add(18).filter(|&e| e <= end) else {
+            every_name_read = false;
+            break;
+        };
         // Fifteen bytes of name, one suffix byte, two of flags.
-        let name_end = at.checked_add(15)?;
-        let raw = buf.get(at..name_end)?;
-        let suffix = *buf.get(name_end)?;
-        let flags = u16::from_be_bytes([*buf.get(name_end + 1)?, *buf.get(name_end + 2)?]);
-        at = name_end + 3;
+        let raw = &buf[at..at + 15];
+        let suffix = buf[at + 15];
+        let flags = u16::from_be_bytes([buf[at + 16], buf[at + 17]]);
+        at = entry_end;
 
         // Names are space-padded to fifteen bytes and are not always valid
         // UTF-8 on a machine with a non-Latin locale.
@@ -162,10 +178,19 @@ pub fn parse_node_status(buf: &[u8]) -> Option<NodeStatus> {
     }
 
     // The statistics block follows, and opens with the six-byte adapter
-    // address. A reply that was truncated before it simply has no MAC, which is
-    // different from having a zero one.
-    if let Some(mac) = buf.get(at..at + 6) {
-        let found = MacAddr::new(mac.try_into().ok()?);
+    // address. It is part of the same record, so it is bounded the same way: a
+    // reply truncated before it simply has no MAC, which is different from
+    // having a zero one.
+    //
+    // Only where every name was read, because `at` is the end of the name list
+    // and nothing else. Stopping part way through leaves it in the middle of a
+    // name, and six bytes of a name read as a perfectly plausible hardware
+    // address, which is a claim about a device made out of nothing.
+    if every_name_read
+        && at.checked_add(6).is_some_and(|e| e <= end)
+        && let Ok(bytes) = <[u8; 6]>::try_from(&buf[at..at + 6])
+    {
+        let found = MacAddr::new(bytes);
         if !found.is_zero() {
             status.mac = Some(found);
         }
@@ -264,6 +289,49 @@ mod tests {
         assert_eq!(s.hostname(), Some("LAPTOP"));
         assert_eq!(s.workgroup(), Some("WORKGROUP"));
         assert_eq!(s.mac, None, "a reply with no statistics block has no MAC");
+    }
+
+    /// The record says how long it is and the name count is a separate byte
+    /// the sender chose. A count larger than the record used to keep reading,
+    /// eighteen bytes at a time, out of whatever followed in the datagram.
+    #[test]
+    fn a_name_count_larger_than_the_record_invents_no_names() {
+        let mut buf = reply(&[("REAL", 0x00, false)], None);
+        // Claim ten names in a record that holds one, and append something for
+        // the loop to run into: an ASCII tail is exactly what decodes into
+        // plausible names.
+        let count_at = buf.len() - 19;
+        assert_eq!(buf[count_at], 1, "the fixture's name count");
+        buf[count_at] = 10;
+        buf.extend_from_slice(&[b'X'; 200]);
+
+        let s = parse_node_status(&buf).expect("the good names survive");
+        assert_eq!(
+            s.names.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+            ["REAL"],
+            "nothing beyond the record is a name"
+        );
+    }
+
+    /// And a record cut short mid-name keeps what decoded rather than throwing
+    /// the reply away. A hostname read correctly is not made wrong by the bytes
+    /// that failed to arrive after it.
+    #[test]
+    fn a_truncated_record_keeps_the_names_that_decoded() {
+        let full = reply(
+            &[("LAPTOP", 0x00, false), ("WORKGROUP", 0x00, true)],
+            Some([1, 2, 3, 4, 5, 6]),
+        );
+        // Cut in the middle of the second name.
+        let cut = full.len() - 46 - 9;
+        let s = parse_node_status(&full[..cut]).expect("the first name survives");
+        assert_eq!(s.hostname(), Some("LAPTOP"));
+        assert_eq!(
+            s.workgroup(),
+            None,
+            "the name that did not arrive is absent"
+        );
+        assert_eq!(s.mac, None);
     }
 
     #[test]

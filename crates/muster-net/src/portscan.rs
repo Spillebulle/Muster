@@ -185,12 +185,22 @@ impl Ports {
     /// actually ask of a home or office network — what is serving, what is
     /// remotely administrable, and what is exposed that should not be. A
     /// thousand ports per host is a different scan and should be asked for.
+    ///
+    /// It also has a second job, and it is the one that was missed. Every port
+    /// `kind`'s table treats as naming a device has to be *in* this list, or
+    /// the clue cannot fire on the scan people actually run: 554, 8009, 8060
+    /// and 1400 named a camera, a Chromecast, a Roku and a Sonos in that table
+    /// while never once being probed, so those four kinds were unreachable in
+    /// practice. `kind::every_port_the_kind_table_names_is_in_the_default_scan`
+    /// is the test that keeps the two lists in step, and it belongs there
+    /// because that is the side with the claim to justify.
     pub fn common() -> Self {
         Self(vec![
-            21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 465, 515, 548, 587, 631,
-            993, 995, 1080, 1433, 1723, 1883, 2049, 3000, 3306, 3389, 4444, 5000, 5060, 5432, 5555,
-            5900, 5901, 6379, 7000, 8000, 8006, 8080, 8081, 8123, 8443, 8888, 9000, 9090, 9100,
-            27017, 32400, 51820,
+            21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 465, 515, 548, 554, 587,
+            631, 993, 995, 1080, 1400, 1433, 1723, 1883, 1935, 2049, 3000, 3306, 3389, 4444, 5000,
+            5001, 5060, 5432, 5555, 5900, 5901, 6379, 7000, 8000, 8006, 8008, 8009, 8060, 8080,
+            8081, 8123, 8291, 8443, 8728, 8729, 8888, 9000, 9090, 9100, 27017, 27036, 32400, 32469,
+            37777, 51820, 62078,
         ])
     }
 
