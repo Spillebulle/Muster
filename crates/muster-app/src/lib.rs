@@ -12,6 +12,9 @@
 
 pub mod app;
 pub mod art;
+pub mod deviceicon;
+pub mod dhcpcheck;
+pub mod ports;
 pub mod prefs;
 pub mod scan;
 pub mod theme;

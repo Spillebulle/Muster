@@ -8,11 +8,13 @@ Muster is a network scanner for the network the machine is actually on: what is
 here, what it is, and what it is offering. One native binary with a window,
 Windows and Linux, installable and self-updating.
 
-**0.0.1 is released.** The survey, the sweep, identification by name and
-vendor, the `connect()` port scan, the window, the text mode, the packaging and
-the updater are all built; the privileged engine (phase three's raw transport,
-ARP, DHCP discovery, LLDP) is not, and neither is IPv6 sweeping. `README.md`'s
-"What is not there yet" is the user-facing list and is kept honest.
+**Released and building out.** The survey, the sweep, identification by name
+and vendor, device-kind inference, the `connect()` port scan, DHCP discovery,
+the window, the text mode, the packaging and the updater are all built. The
+**privileged engine** is not: no raw transport, so no SYN scan, no ARP sweep,
+no passive fingerprinting and no LLDP or CDP. Neither is IPv6 sweeping.
+`README.md`'s "What is not there yet" is the user-facing list and is kept
+honest.
 
 Everything below is still the decided shape rather than a description of code
 where the two differ. Treat the "Decisions" and the invariants under
@@ -87,7 +89,7 @@ see Platform support. `RUST_LOG=muster_net=debug` is the logging switch.
 
 | Crate | Contains | Must not depend on |
 |---|---|---|
-| `muster-net` | interfaces, discovery, port scan, probes, identification, the model of a scan | wgpu, winit, egui |
+| `muster-net` | interfaces, discovery, port scan, probes, identification, device kinds, DHCP, the model of a scan | wgpu, winit, egui |
 | `muster-app` | window, panels, the scan's presentation, `update/`, the installer | — |
 | `muster-desktop` | binary entry point, subcommand dispatch | — |
 
@@ -195,7 +197,7 @@ The devices announce themselves. Ask before probing:
 | SSDP / UPnP | a description URL, and from it manufacturer, model and serial |
 | NetBIOS name service (UDP 137) | Windows names and workgroup |
 | LLMNR | names on modern Windows networks |
-| DHCP | **all** offers, not the first — two offers is a rogue DHCP server, and detecting that is a feature, not an error case |
+| DHCP (`dhcp.rs`) | **all** offers, not the first — two offers is a rogue DHCP server, and detecting that is a feature, not an error case. Built |
 | LLDP / CDP (privileged, passive) | the switch, and the port a device is on |
 | TLS certificates on any open port | subject and SAN, often the best identifier on the network |
 
@@ -222,6 +224,21 @@ wearing a confident face.
   window from a single SYN-ACK give a coarse OS class for free and should be
   taken; nmap-grade active fingerprinting is a much larger probe set and a much
   larger claim. Label which one answered.
+- **What a device *is* comes from ranked clues, never from its name.**
+  `kind.rs` infers a [`Kind`] from four sources in a fixed order: the routing
+  table (the gateway is not a guess), a service the device advertises about
+  itself, an open port only one kind of thing listens on, and — weakest — a
+  vendor that makes only one kind of thing. The order is an `enum`'s `Ord` and
+  the tables are data, so the priority is stated once rather than emerging from
+  the shape of an `if` chain. A **hostname is deliberately not a clue**:
+  `HP-Printer` is usually right and `daves-old-printer-pc` is a desktop, so a
+  name is evidence about whoever set the device up. Every guess carries the
+  clue that produced it and the interface shows both.
+- **The vendor table earns its place by what is missing from it.** Apple,
+  Samsung, Google and Amazon each make five of the kinds, so a match on one is a
+  coin toss wearing a confident face. Only vendors with one product category are
+  listed. Adding a broad vendor to make a screenshot look fuller is the failure
+  mode to refuse.
 - **Identity is a merge of independent sources with a priority, not a race.** A
   UPnP model string beats an OUI vendor; a `_device-info` record beats a TTL
   guess. Where sources disagree, keep both — a device answering as two things is
@@ -244,6 +261,15 @@ Two things the design language decides for this application specifically:
 - **The device list is the app.** It is a dense table of figures — addresses,
   MACs, latencies, port counts — so it is `--font-figure` throughout and the
   columns align. This is the screen everything else hangs off.
+- **The device icons are colourful, and that is a stated departure.** §11 of
+  the style guide asks for one stroke set and §2.5 reserves colour for state;
+  the kind icons are filled shapes in eleven hues. The reason is that twelve
+  monochrome outlines are twelve things to *read*, and the column exists so that
+  the printer can be found without reading. What keeps it in the family:
+  **no icon names a colour.** Every one is `theme::hued`, the accent's own
+  lightness and chroma with the hue moved, so both themes come out of the
+  recipe and there is no device palette to drift. Hues stay clear of 20–40,
+  where `caution` and `critical` live, so a device never reads as a warning.
 - **A scan in progress is a normal state, not a modal.** Results arrive
   incrementally and the table fills; nothing blocks, and cancelling is always
   available and takes effect at the next packet rather than at the end of a
@@ -342,7 +368,48 @@ are what keep that true.
   own behalf is the update check, it is off until the user has been asked, and
   the setting that controls it is in one place.
 
-## Open
+## What to build next
+
+Roughly in the order the value lands. Nothing here is committed to; the point is
+that the next session does not have to rediscover the list.
+
+**The privileged engine is the biggest single win, and everything in it is
+already designed.** `portscan::Cookie` is written and tested with no transport
+under it; ARP, DHCP from port 68 without fighting the system client, passive
+fingerprinting and LLDP all wait on the same thing — raw packet access, which
+is Npcap on Windows and `CAP_NET_RAW` on Linux. When it lands, the Linux
+packages get their `setcap` back (see `build-packages.sh`, which says why they
+do not have it yet) and the README's first "not there yet" entry goes.
+
+Cheap and unprivileged, so worth doing before that:
+
+- **SSDP and UPnP.** One multicast datagram, and the description URL it returns
+  carries manufacturer, model and serial — the best identification on most home
+  networks, and it would feed `kind.rs` a clue stronger than any vendor guess.
+- **TLS certificate reading** on any open port. Subject and SAN are often the
+  only place a device's real name is written. Reading a certificate is not
+  authenticating, so it stays inside the conduct rules.
+- **Banner grabbing**, for the same reason and with the same limit: read what a
+  service volunteers, send nothing that is not a protocol's own greeting.
+- **UDP service probes** as a table (DNS, mDNS, SSDP, NetBIOS, SNMP, NTP), which
+  is the only honest way to scan UDP at all.
+- **IPv6 by NDP.** Addresses and routes are already read for both families;
+  pinging `ff02::1` finds link-local neighbours in one packet, which is a whole
+  address family for very little code.
+
+Interface work the device list is starting to ask for:
+
+- **Filter and sort.** A /24 with forty devices is already past what an
+  unsorted table serves well.
+- **Export**, as CSV and JSON. The obvious next question after a scan is "put
+  this in a ticket".
+- **User labels**, kept beside the scan: somebody who knows their network can
+  name the unknown devices once, and a label should outlive a rescan.
+- **Wake-on-LAN**, which is one broadcast packet and the only *write* this
+  application would ever make to the network. It needs its own argument before
+  it is built, because it crosses the line from looking to acting.
+
+Still genuinely open:
 
 - Whether the identification phase justifies an async runtime. The stateless
   scan needs two threads and no runtime at all; the hundreds of short
@@ -350,6 +417,10 @@ are what keep that true.
   inside `muster-net` and never appears in `muster-app`'s API.
 - How scans are persisted, and whether a saved scan is a document with a format
   worth versioning. It probably is, and comparing two scans of the same network
-  a week apart is the feature that argument should be settled by.
+  a week apart is the feature that argument should be settled by. A saved scan
+  is also what would bring back the MIME type and thumbnailer the packaging
+  currently omits.
 - Whether continuous monitoring — a scan that stays running and reports arrivals
-  and departures — is version one or version two.
+  and departures — is version one or version two. It is the feature that would
+  make "a new device appeared on your network" possible, which is the one alert
+  worth having.

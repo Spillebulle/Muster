@@ -31,9 +31,11 @@
 //! on Linux. Everything above this line runs as an ordinary user and that is
 //! worth keeping true for as much of the engine as possible.
 
+pub mod dhcp;
 pub mod discover;
 pub mod dns;
 pub mod identify;
+pub mod kind;
 pub mod mac;
 pub mod netbios;
 pub mod platform;
@@ -46,6 +48,7 @@ pub mod sysinfo;
 pub mod vendor;
 
 pub use discover::Sweep;
+pub use kind::{Guess, Kind};
 pub use mac::MacAddr;
 pub use prefix::Prefix;
 pub use survey::Survey;
