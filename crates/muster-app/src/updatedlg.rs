@@ -23,6 +23,7 @@
 //! `CLAUDE.md` allows exactly one outbound request on Muster's own behalf and
 //! requires that the user has been asked first.
 
+use crate::app::{Kind, button};
 use crate::theme::{Palette, metrics, text};
 use crate::update::flow::Phase;
 use crate::update::{Status, Updates};
@@ -41,13 +42,13 @@ const NOTES_HEIGHT: f32 = 160.0;
 /// Called once a frame from [`crate::app::App::update`]. Draws nothing at all
 /// in the ordinary case, which is the common one: no notice outstanding and no
 /// dialog open.
-pub fn show(ctx: &egui::Context, p: Palette, updates: &mut Updates) {
+pub fn show(ctx: &egui::Context, p: Palette, mode: crate::theme::Mode, updates: &mut Updates) {
     if !updates.notice_seen {
-        notice(ctx, p, updates);
+        notice(ctx, p, mode, updates);
         return;
     }
     if updates.flow().is_some() {
-        dialog(ctx, p, updates);
+        dialog(ctx, p, mode, updates);
     }
 }
 
@@ -56,8 +57,8 @@ pub fn show(ctx: &egui::Context, p: Palette, updates: &mut Updates) {
 /// Not a dialog about a feature. It is the consent `CLAUDE.md` requires, so it
 /// says what leaves the machine, and both answers are real: Yes switches the
 /// check on, No switches it off and neither leaves it ambiguous.
-fn notice(ctx: &egui::Context, p: Palette, updates: &mut Updates) {
-    modal(ctx, p, "update-notice", |ui| {
+fn notice(ctx: &egui::Context, p: Palette, mode: crate::theme::Mode, updates: &mut Updates) {
+    modal(ctx, p, mode, "update-notice", |ui| {
         heading(ui, p, "Checking for new versions");
         ui.add_space(metrics::S2);
         ui.label(
@@ -79,12 +80,12 @@ fn notice(ctx: &egui::Context, p: Palette, updates: &mut Updates) {
         ui.add_space(metrics::S4);
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if button(ui, p, "Check for updates", true).clicked() {
+            if button(ui, p, "Check for updates", Kind::Primary, true).clicked() {
                 updates.notice_seen = true;
                 updates.check_on_startup = true;
                 persist(updates);
             }
-            if button(ui, p, "Do not check", false).clicked() {
+            if button(ui, p, "Do not check", Kind::Ghost, true).clicked() {
                 updates.notice_seen = true;
                 updates.check_on_startup = false;
                 persist(updates);
@@ -94,7 +95,7 @@ fn notice(ctx: &egui::Context, p: Palette, updates: &mut Updates) {
 }
 
 /// The dialog proper, on whichever screen the flow is on.
-fn dialog(ctx: &egui::Context, p: Palette, updates: &mut Updates) {
+fn dialog(ctx: &egui::Context, p: Palette, mode: crate::theme::Mode, updates: &mut Updates) {
     let now = Instant::now();
     // Read before anything is drawn: the phase and the release are borrowed
     // from `updates`, and the buttons below need it mutably.
@@ -106,7 +107,7 @@ fn dialog(ctx: &egui::Context, p: Palette, updates: &mut Updates) {
     let actions = updates.actions(&updates.flow().expect("checked above").release.clone());
     let holds_work = updates.busy();
 
-    modal(ctx, p, "update", |ui| match &phase {
+    modal(ctx, p, mode, "update", |ui| match &phase {
         Phase::Offer => {
             heading(ui, p, &format!("Muster {version} is available"));
             ui.add_space(metrics::S2);
@@ -129,16 +130,19 @@ fn dialog(ctx: &egui::Context, p: Palette, updates: &mut Updates) {
 
             ui.add_space(metrics::S4);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if actions.update_now && button(ui, p, "Update now", true).clicked() {
+                if actions.update_now && button(ui, p, "Update now", Kind::Primary, true).clicked()
+                {
                     updates.install_offered();
                 }
-                if actions.open_page && button(ui, p, "Open the releases page", true).clicked() {
+                if actions.open_page
+                    && button(ui, p, "Open the releases page", Kind::Primary, true).clicked()
+                {
                     crate::update::open_in_browser(&page);
                 }
-                if button(ui, p, "Not now", false).clicked() {
+                if button(ui, p, "Not now", Kind::Ghost, true).clicked() {
                     updates.dismiss();
                 }
-                if button(ui, p, "Never ask again", false).clicked() {
+                if button(ui, p, "Never ask again", Kind::Ghost, true).clicked() {
                     updates.never_ask_again();
                     persist(updates);
                 }
@@ -163,7 +167,7 @@ fn dialog(ctx: &egui::Context, p: Palette, updates: &mut Updates) {
                 // rather than offered and refused.
                 if matches!(phase, Phase::Working(_))
                     && stage.can_stop()
-                    && button(ui, p, "Cancel", false).clicked()
+                    && button(ui, p, "Cancel", Kind::Secondary, true).clicked()
                 {
                     updates.stop_update();
                 }
@@ -181,10 +185,10 @@ fn dialog(ctx: &egui::Context, p: Palette, updates: &mut Updates) {
             );
             ui.add_space(metrics::S4);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if button(ui, p, "Try again", true).clicked() {
+                if button(ui, p, "Try again", Kind::Primary, true).clicked() {
                     updates.retry();
                 }
-                if button(ui, p, "Close", false).clicked() {
+                if button(ui, p, "Close", Kind::Ghost, true).clicked() {
                     updates.dismiss();
                 }
             });
@@ -217,7 +221,7 @@ fn dialog(ctx: &egui::Context, p: Palette, updates: &mut Updates) {
 
             ui.add_space(metrics::S4);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if countdown.running() && button(ui, p, "Wait", false).clicked() {
+                if countdown.running() && button(ui, p, "Wait", Kind::Secondary, true).clicked() {
                     updates.cancel_countdown();
                 }
             });
@@ -235,13 +239,13 @@ fn dialog(ctx: &egui::Context, p: Palette, updates: &mut Updates) {
             );
             ui.add_space(metrics::S4);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if button(ui, p, "Try again", true).clicked() {
+                if button(ui, p, "Try again", Kind::Primary, true).clicked() {
                     updates.retry();
                 }
-                if button(ui, p, "Open the releases page", false).clicked() {
+                if button(ui, p, "Open the releases page", Kind::Secondary, true).clicked() {
                     crate::update::open_in_browser(&page);
                 }
-                if button(ui, p, "Close", false).clicked() {
+                if button(ui, p, "Close", Kind::Ghost, true).clicked() {
                     updates.dismiss();
                 }
             });
@@ -276,20 +280,24 @@ pub fn status_line(status: &Status) -> String {
 ///
 /// §5 allows a shadow only under something that floats, and a dialog is the
 /// case it means.
-fn modal(ctx: &egui::Context, p: Palette, id: &str, contents: impl FnOnce(&mut egui::Ui)) {
+fn modal(
+    ctx: &egui::Context,
+    p: Palette,
+    mode: crate::theme::Mode,
+    id: &str,
+    contents: impl FnOnce(&mut egui::Ui),
+) {
     egui::Modal::new(egui::Id::new(id))
         .frame(
             egui::Frame::NONE
-                .fill(p.popover)
+                // §5: a modal is `chrome`, radius 10, with the deepest of the
+                // three shadows. `popover` is the *menu* surface, and the
+                // shadow here was the menu's too.
+                .fill(p.chrome.to_opaque())
                 .stroke(Stroke::new(metrics::HAIRLINE, p.line_popover))
                 .corner_radius(metrics::RADIUS_MODAL)
                 .inner_margin(egui::Margin::same(metrics::S4 as i8))
-                .shadow(egui::epaint::Shadow {
-                    offset: [0, 4],
-                    blur: 16,
-                    spread: 0,
-                    color: egui::Color32::from_black_alpha(90),
-                }),
+                .shadow(crate::theme::shadow::modal(mode)),
         )
         .show(ctx, |ui| {
             ui.set_width(WIDTH);
@@ -300,7 +308,7 @@ fn modal(ctx: &egui::Context, p: Palette, id: &str, contents: impl FnOnce(&mut e
 fn heading(ui: &mut egui::Ui, p: Palette, text: &str) {
     ui.label(
         RichText::new(text)
-            .size(crate::theme::text::HEADING)
+            .font(crate::theme::strong(crate::theme::text::HEADING))
             .color(p.text_strong),
     );
 }
@@ -345,39 +353,6 @@ fn progress(ui: &mut egui::Ui, p: Palette, fraction: Option<f32>) {
         );
         ui.painter().rect_filled(filled, 2.0, p.accent);
     }
-}
-
-/// A button, drawn rather than egui's, and `primary` is the accent-filled one.
-fn button(ui: &mut egui::Ui, p: Palette, label: &str, primary: bool) -> egui::Response {
-    let ink = if primary { p.accent_ink } else { p.text };
-    let galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        egui::FontId::proportional(text::CONTROL),
-        ink,
-    );
-    let size = vec2(galley.size().x + metrics::S4 * 2.0, metrics::BUTTON);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-
-    let fill = match (primary, response.hovered()) {
-        (true, _) => p.accent,
-        (false, true) => p.control_hover,
-        (false, false) => p.control,
-    };
-    ui.painter().rect_filled(rect, metrics::RADIUS, fill);
-    if !primary {
-        ui.painter().rect_stroke(
-            rect,
-            metrics::RADIUS,
-            Stroke::new(metrics::HAIRLINE, p.line),
-            egui::StrokeKind::Inside,
-        );
-    }
-    let at = egui::pos2(
-        rect.center().x - galley.size().x / 2.0,
-        rect.center().y - galley.size().y / 2.0,
-    );
-    ui.painter().galley(at, galley, ink);
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Write the answer to the notice out.

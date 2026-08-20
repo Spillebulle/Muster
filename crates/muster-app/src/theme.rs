@@ -59,6 +59,14 @@ pub mod metrics {
     pub const ICON: f32 = 16.0;
     pub const HAIRLINE: f32 = 1.0;
 
+    /// A slider's and a progress bar's track. §7.10 and §7.18 both say 3.
+    pub const RAIL: f32 = 3.0;
+
+    /// The options strip under the top bar, §7.2. Two points taller than the
+    /// menu bar, which is what keeps a 26 px control centred in it with room
+    /// to breathe.
+    pub const OPTIONS_STRIP: f32 = 36.0;
+
     /// The accent bar down the left of a selected navigation row.
     pub const NAV_MARK_W: f32 = 3.0;
 
@@ -70,6 +78,27 @@ pub mod metrics {
     pub const S2: f32 = 8.0;
     pub const S3: f32 = 12.0;
     pub const S4: f32 = 16.0;
+}
+
+/// The one strong family.
+///
+/// **§4 allows exactly two weights in an interface, 400 and 600**, and until
+/// now Muster had one — the wrong one. `Archivo.ttf` is a *variable* font whose
+/// default instance is SemiBold, and `ab_glyph`, which egui rasterises with,
+/// does not apply variation axes: it draws the outlines it finds, so every word
+/// in the application was 600. Body copy, table rows, tooltips, all of it.
+///
+/// The fix is two static instances cut from that variable font at build time
+/// and committed beside it, so 400 is the default family and this is the one
+/// that headings and the primary button ask for by name.
+pub const STRONG: &str = "archivo-semibold";
+
+/// A 600-weight font at `size`.
+///
+/// The only way to get the heavier weight, so that "which things are bold" is
+/// answerable by searching for this function.
+pub fn strong(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name(STRONG.into()))
 }
 
 /// The type scale. Four ranks plus the figure size, and never a fifth.
@@ -134,6 +163,11 @@ pub struct Palette {
 
     pub accent: Color32,
     pub accent_dim: Color32,
+    /// The focus ring, §7.11: the accent at a little over a third, drawn 2 px
+    /// around whatever has the keyboard.
+    pub accent_ring: Color32,
+    /// The accent at 7 %, for the one tinted row §2.4 allows.
+    pub accent_tint: Color32,
     /// Text drawn **on** the accent, and the only place that is allowed: the
     /// one primary button in a view. §2.4's list of where the accent may go is
     /// short and a fill behind body copy is not on it.
@@ -193,6 +227,8 @@ impl Palette {
 
             accent: oklch(0.674, 0.101, ACCENT_H),
             accent_dim: oklch(0.447, 0.061, ACCENT_H),
+            accent_ring: oklch(0.674, 0.101, ACCENT_H).gamma_multiply(0.35),
+            accent_tint: oklch(0.674, 0.101, ACCENT_H).gamma_multiply(0.07),
             // `window` in the dark theme, per §2.3: near-black on a light
             // accent, rather than a black that belongs to no theme.
             accent_ink: oklch(0.182, 0.004, 264.0),
@@ -251,6 +287,8 @@ impl Palette {
             // a little off. That is exactly the drift an untested table gets.
             accent: oklch(0.55, 0.10, ACCENT_H),
             accent_dim: oklch(0.79, 0.036, ACCENT_H),
+            accent_ring: oklch(0.55, 0.10, ACCENT_H).gamma_multiply(0.35),
+            accent_tint: oklch(0.55, 0.10, ACCENT_H).gamma_multiply(0.07),
             accent_ink: Color32::WHITE,
 
             caution: oklch(0.518, 0.114, 39.0),
@@ -266,6 +304,48 @@ impl Palette {
                 Color32::from_rgb(0xB0, 0x32, 0x6E),
                 Color32::from_rgb(0x7E, 0x76, 0x0A),
             ],
+        }
+    }
+}
+
+/// The three shadows §5 allows, and nothing else casts one.
+///
+/// The geometry is the style guide's table verbatim. **A light theme uses the
+/// same geometry at about a quarter of the alpha**, warm-tinted, because a
+/// black shadow that reads as depth on Graphite reads as dirt on Paper.
+pub mod shadow {
+    use super::Mode;
+    use egui::Color32;
+    use egui::epaint::Shadow;
+
+    /// A menu, a dropdown list, a tooltip.
+    pub fn menu(mode: Mode) -> Shadow {
+        build(mode, 8, 32, 153)
+    }
+
+    /// A floating panel: an undocked module, or the device window.
+    pub fn floating(mode: Mode) -> Shadow {
+        build(mode, 16, 48, 178)
+    }
+
+    /// A modal dialog.
+    pub fn modal(mode: Mode) -> Shadow {
+        build(mode, 24, 64, 178)
+    }
+
+    fn build(mode: Mode, offset: i8, blur: u8, alpha: u8) -> Shadow {
+        let color = match mode {
+            Mode::Dark => Color32::from_black_alpha(alpha),
+            // A quarter of the alpha, and warm rather than neutral: the light
+            // ladder is a warm grey and a cold shadow on it looks like a
+            // different application's dialog.
+            Mode::Light => Color32::from_rgba_unmultiplied(60, 50, 40, alpha / 4),
+        };
+        Shadow {
+            offset: [0, offset],
+            blur,
+            spread: 0,
+            color,
         }
     }
 }
