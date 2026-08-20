@@ -217,6 +217,25 @@ impl Palette {
     }
 }
 
+/// A colour at `hue`, on the accent's own lightness and chroma.
+///
+/// The one sanctioned way to get a colour that is not in [`Palette`], and it
+/// exists for exactly one caller: the device icons, which need to tell a printer
+/// from a television at a glance and cannot do it in one hue.
+///
+/// **It is the accent's recipe with the hue moved, and nothing else.** That is
+/// what keeps a dozen icons looking like one family rather than a bag of
+/// stickers: every one of them has the same weight and saturation as the accent
+/// the rest of the interface is painted in, and both themes are handled by the
+/// same two numbers the accent uses. A hand-picked hex per device kind would
+/// drift from the palette the first time a theme moved.
+pub fn hued(hue: f32, mode: Mode) -> Color32 {
+    match mode {
+        Mode::Dark => oklch(0.674, 0.101, hue),
+        Mode::Light => oklch(0.55, 0.11, hue),
+    }
+}
+
 /// OKLCH to sRGB.
 ///
 /// `L` is 0..1, `C` is chroma, `h` is degrees. The matrices are the standard

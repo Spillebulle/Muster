@@ -14,7 +14,7 @@
 use crate::scan::State;
 use crate::theme::{Mode, Palette, metrics, text};
 use crate::update::{Exit, Updates};
-use crate::{prefs, updatedlg};
+use crate::{deviceicon, dhcpcheck, ports, prefs, updatedlg};
 use egui::{Align, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 use muster_net::identify::Identity;
 use muster_net::{Prefix, Survey};
@@ -50,6 +50,15 @@ pub struct App {
     /// The prefix the next scan will take. Derived from the survey, and the
     /// default target is the local prefix — never a range somebody typed.
     target: Option<Prefix>,
+    /// The device whose detail panel is open, by address.
+    ///
+    /// By address rather than by row index: a second scan reorders the table,
+    /// and an index would quietly select whatever moved into that position.
+    selected: Option<std::net::IpAddr>,
+    /// The port scan, which is per device and only ever one at a time.
+    ports: ports::State,
+    /// Who offers addresses on this link, and whether more than one does.
+    dhcp: dhcpcheck::State,
     /// The update check and the dialog it raises.
     ///
     /// Its two settings are loaded from [`prefs`] at start-up and written back
@@ -85,6 +94,9 @@ impl App {
             view: View::Devices,
             mode,
             target,
+            selected: None,
+            ports: ports::State::Idle,
+            dhcp: dhcpcheck::State::Idle,
             updates,
         };
         apply(&cc.egui_ctx, Palette::of(app.mode));
@@ -122,6 +134,9 @@ impl App {
             view,
             mode,
             target,
+            selected: None,
+            ports: ports::State::Idle,
+            dhcp: dhcpcheck::State::Idle,
             updates,
         }
     }
@@ -151,6 +166,12 @@ impl eframe::App for App {
         if self.scan.poll() || self.scan.is_running() {
             ctx.request_repaint_after(std::time::Duration::from_millis(60));
         }
+        if self.ports.poll() || self.ports.is_running() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        }
+        if self.dhcp.poll() || self.dhcp.is_running() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
 
         // The startup check, once, and only once the notice has been answered.
         self.updates.start_if_due();
@@ -175,11 +196,18 @@ impl eframe::App for App {
         status_bar(ctx, p, self);
         sidebar(ctx, p, self);
 
+        // Before the central panel, so the table gets what is left rather than
+        // being drawn under it.
+        if self.view == View::Devices {
+            detail_panel(ctx, p, self);
+        }
+
+        let view = self.view;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(p.window))
-            .show(ctx, |ui| match self.view {
+            .show(ctx, |ui| match view {
                 View::Devices => devices_view(ui, p, self),
-                View::Network => network_view(ui, p, &self.survey),
+                View::Network => network_view(ui, p, self),
                 View::About => about_view(ui, p, &mut self.updates),
             });
 
@@ -408,9 +436,17 @@ fn progress(ui: &mut egui::Ui, p: Palette, fraction: Option<f32>) {
 }
 
 /// The device list. This is the app, so it is the densest thing in it.
-fn devices_view(ui: &mut egui::Ui, p: Palette, app: &App) {
-    let devices = app.scan.devices();
-    let names = app.scan.names();
+fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
+    // Cloned out of the scan so the loop below can hold `app` mutably to set
+    // the selection. A device list is a few dozen rows of small structs; the
+    // alternative is threading a "what was clicked" value out through two
+    // closures to satisfy the borrow checker, which is more code and no faster.
+    let devices: Vec<muster_net::discover::Found> = app.scan.devices().to_vec();
+    let names: Vec<Identity> = app.scan.names().to_vec();
+    // Read once for the whole table rather than per row: the routing table
+    // cannot change while a frame is being drawn, and `kind::identify` only
+    // wants the answer to "is this the way out".
+    let gateways: Vec<std::net::IpAddr> = app.survey.gateways.iter().map(|g| g.address).collect();
 
     if devices.is_empty() {
         let note = match &app.scan {
@@ -427,13 +463,25 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &App) {
         .show(ui, |ui| {
             ui.add_space(metrics::S2);
             table_header(ui, p);
+            let mode = app.mode;
             for (i, host) in devices.iter().enumerate() {
-                device_row(ui, p, host, names.get(i));
+                let is_gateway = gateways.contains(&host.address);
+                let selected = app.selected == Some(host.address);
+                let response = device_row(ui, p, mode, host, names.get(i), is_gateway, selected);
+                if response.clicked() {
+                    // Clicking the open row shuts the panel, which is the only
+                    // way to get the table's full width back.
+                    app.selected = if selected { None } else { Some(host.address) };
+                }
             }
             ui.add_space(metrics::S2);
         });
 }
 
+/// The device-kind icon's column. Narrow: it carries a picture and no text,
+/// and the kind's name is in the row's tooltip rather than in a column of its
+/// own, because a word per row would cost more width than the icon saves.
+const COL_KIND: f32 = 26.0;
 const COL_ADDRESS: f32 = 130.0;
 const COL_NAME: f32 = 190.0;
 const COL_MAC: f32 = 150.0;
@@ -446,6 +494,10 @@ fn table_header(ui: &mut egui::Ui, p: Palette) {
     );
     let mut x = rect.left() + metrics::PAD_PANEL;
     for (label, width) in [
+        // The icon column's heading is deliberately empty: "Kind" over a column
+        // of pictures labels the obvious and adds a word to the densest screen
+        // in the application.
+        ("", COL_KIND),
         ("Address", COL_ADDRESS),
         ("Name", COL_NAME),
         ("Hardware", COL_MAC),
@@ -472,18 +524,55 @@ fn table_header(ui: &mut egui::Ui, p: Palette) {
 fn device_row(
     ui: &mut egui::Ui,
     p: Palette,
+    mode: Mode,
     host: &muster_net::discover::Found,
     named: Option<&Identity>,
-) {
+    is_gateway: bool,
+    selected: bool,
+) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), metrics::ROW), Sense::hover());
-    if response.hovered() {
+        ui.allocate_exact_size(vec2(ui.available_width(), metrics::ROW), Sense::click());
+    // Selection is a **neutral** fill plus strong text plus a small accent
+    // mark, and never an accent background. The rule the whole design language
+    // exists to protect, drawn the same way `nav_row` draws it.
+    if selected {
+        ui.painter().rect_filled(rect, 0.0, p.control);
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.left_top(), vec2(metrics::NAV_MARK_W, rect.height())),
+            0.0,
+            p.accent,
+        );
+    } else if response.hovered() {
         ui.painter().rect_filled(rect, 0.0, p.control_hover);
     }
 
     let figure = FontId::monospace(text::TINY);
     let mut x = rect.left() + metrics::PAD_PANEL;
     let y = rect.center().y;
+
+    // What this device appears to be, and why. The guess is `muster-net`'s;
+    // this file only decides how big to draw it.
+    let empty = Identity::default();
+    let guess = muster_net::kind::identify(host, named.unwrap_or(&empty), is_gateway);
+    let kind = guess.map_or(muster_net::Kind::Unknown, |g| g.kind);
+    let icon = Rect::from_center_size(pos2(x + metrics::ICON / 2.0, y), Vec2::splat(metrics::ICON));
+    // The cut-outs are filled with whatever the row is sitting on, so a hovered
+    // row shows its own fill through them rather than a stale window colour.
+    let ground = if selected {
+        p.control
+    } else if response.hovered() {
+        p.control_hover
+    } else {
+        p.window
+    };
+    deviceicon::draw(
+        ui.painter(),
+        icon,
+        kind,
+        deviceicon::colour(kind, mode, p.text_dim),
+        ground,
+    );
+    x += COL_KIND;
 
     ui.painter().text(
         pos2(x, y),
@@ -554,7 +643,19 @@ fn device_row(
 
     if response.hovered() {
         let why: Vec<String> = host.evidence.iter().map(|e| e.reason()).collect();
-        let mut tip = why.join(", ");
+        let mut tip = String::new();
+        // The claim first, with its reason attached. `CLAUDE.md`: every claim
+        // about a device is shown beside the reason for it, and an icon with no
+        // way to ask "why do you think that" is a guess wearing a confident
+        // face.
+        if let Some(guess) = guess {
+            tip.push_str(&format!(
+                "{} — {}\n",
+                guess.kind.label(),
+                guess.clue.reason()
+            ));
+        }
+        tip.push_str(&why.join(", "));
         if let Some(best) = named.and_then(Identity::best) {
             tip.push_str(&format!("\nNamed by {}", best.source.label()));
         }
@@ -562,12 +663,14 @@ fn device_row(
             let others = named.map(Identity::other_names).unwrap_or_default();
             tip.push_str(&format!("\nAlso called {}", others.join(", ")));
         }
-        response.on_hover_text(tip);
+        response.clone().on_hover_text(tip);
     }
+    response
 }
 
 /// What the machine knows without sending anything.
-fn network_view(ui: &mut egui::Ui, p: Palette, s: &Survey) {
+fn network_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
+    let s = &app.survey.clone();
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -615,6 +718,7 @@ fn network_view(ui: &mut egui::Ui, p: Palette, s: &Survey) {
             for d in &s.dhcp_servers {
                 fact(ui, p, "", &d.to_string());
             }
+            dhcp_check(ui, p, app);
 
             if !s.gaps.is_empty() {
                 section(ui, p, "Could not read");
@@ -896,6 +1000,311 @@ pub(crate) fn apply(ctx: &egui::Context, p: Palette) {
     style.spacing.item_spacing = vec2(metrics::S2, metrics::S1);
     style.spacing.scroll.bar_width = 6.0;
     ctx.set_style(style);
+}
+
+/// The panel for the selected device: what it is, why, and what it is offering.
+///
+/// A docked panel rather than a dialog, because §7.5 makes the panel the unit
+/// for "more about the thing you selected", and because a scan of somebody's
+/// network should never be held behind a modal. The table stays live beside it.
+fn detail_panel(ctx: &egui::Context, p: Palette, app: &mut App) {
+    let Some(address) = app.selected else { return };
+    let Some(index) = app.scan.devices().iter().position(|d| d.address == address) else {
+        // The device is gone, which means a later scan did not find it. Drop
+        // the selection rather than showing a panel about nothing.
+        app.selected = None;
+        return;
+    };
+
+    let host = app.scan.devices()[index].clone();
+    let named = app.scan.names().get(index).cloned().unwrap_or_default();
+    let is_gateway = app.survey.gateways.iter().any(|g| g.address == address);
+    let guess = muster_net::kind::identify(&host, &named, is_gateway);
+    let kind = guess.map_or(muster_net::Kind::Unknown, |g| g.kind);
+    let mode = app.mode;
+
+    egui::SidePanel::right("device")
+        .exact_width(metrics::PANEL)
+        .resizable(false)
+        .frame(
+            egui::Frame::NONE
+                .fill(p.dock)
+                .inner_margin(egui::Margin::same(metrics::PAD_PANEL as i8)),
+        )
+        .show_separator_line(false)
+        .show(ctx, |ui| {
+            hairline_left(ui, p);
+
+            // The heading is the device: its icon, and its name where it has
+            // one rather than its address.
+            ui.horizontal(|ui| {
+                let (icon, _) = ui.allocate_exact_size(Vec2::splat(metrics::ROW), Sense::hover());
+                deviceicon::draw(
+                    ui.painter(),
+                    Rect::from_center_size(icon.center(), Vec2::splat(metrics::ROW - 4.0)),
+                    kind,
+                    deviceicon::colour(kind, mode, p.text_dim),
+                    p.dock,
+                );
+                ui.add_space(metrics::S1);
+                let title = named
+                    .best()
+                    .map(|n| n.value.clone())
+                    .unwrap_or_else(|| address.to_string());
+                ui.label(
+                    RichText::new(title)
+                        .size(text::HEADING)
+                        .color(p.text_strong),
+                );
+            });
+
+            // The claim and its reason, together. An icon with no way to ask
+            // why is a guess wearing a confident face.
+            match guess {
+                Some(g) => {
+                    ui.label(
+                        RichText::new(g.kind.label())
+                            .size(text::SMALL)
+                            .color(deviceicon::colour(kind, mode, p.text_muted)),
+                    );
+                    ui.label(
+                        RichText::new(g.clue.reason())
+                            .size(text::TINY)
+                            .color(p.text_dim),
+                    );
+                }
+                None => {
+                    ui.label(
+                        RichText::new("Nothing it said identifies what it is")
+                            .size(text::TINY)
+                            .color(p.text_dim),
+                    );
+                }
+            }
+
+            ui.add_space(metrics::S3);
+            panel_fact(ui, p, "Address", &address.to_string());
+            if let Some(mac) = host.mac {
+                panel_fact(ui, p, "Hardware", &mac.to_string());
+                let vendor = match muster_net::vendor::lookup(mac) {
+                    muster_net::vendor::Origin::Randomised => "randomised address".to_string(),
+                    other => other.label().to_string(),
+                };
+                panel_fact(ui, p, "Made by", &vendor);
+            }
+            if let Some(rtt) = host.rtt {
+                panel_fact(ui, p, "Answered in", &format!("{} ms", rtt.as_millis()));
+            }
+            if let Some(workgroup) = &named.workgroup {
+                panel_fact(ui, p, "Workgroup", workgroup);
+            }
+            if !named.services.is_empty() {
+                panel_fact(ui, p, "Advertises", &named.services.join(", "));
+            }
+
+            ui.add_space(metrics::S3);
+            ports_section(ui, p, app, address);
+        });
+}
+
+/// The port scan, and what it is allowed to claim.
+fn ports_section(ui: &mut egui::Ui, p: Palette, app: &mut App, address: std::net::IpAddr) {
+    ui.label(RichText::new("PORTS").size(text::TINY).color(p.placeholder));
+    ui.add_space(metrics::S1);
+
+    if app.ports.is_running() {
+        // Somebody's scan is running. If it is this device's, show it; if it is
+        // another's, say so rather than offering a button that would silently
+        // do nothing. One at a time is the rate limiter's rule, not a shortage
+        // of threads.
+        if app.ports.address() != Some(address) {
+            ui.label(
+                RichText::new("Another device is being scanned.")
+                    .size(text::TINY)
+                    .color(p.text_dim),
+            );
+            return;
+        }
+        progress(ui, p, app.ports.fraction());
+        ui.add_space(metrics::S1);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Scanning…")
+                    .size(text::TINY)
+                    .color(p.text_dim),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if button(ui, p, "Stop", true).clicked() {
+                    app.ports.cancel();
+                }
+            });
+        });
+        return;
+    }
+
+    let finished = app.ports.result_for(address).cloned();
+    match finished {
+        Some(scan) => {
+            ui.label(
+                RichText::new(ports::summary(&scan))
+                    .size(text::SMALL)
+                    .color(p.text),
+            );
+            ui.add_space(metrics::S1);
+
+            if let Some(found) = scan.hosts.first() {
+                for (port, state) in &found.answered {
+                    if *state != muster_net::portscan::PortState::Open {
+                        continue;
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{port}"))
+                                .size(text::TINY)
+                                .monospace()
+                                .color(p.text_strong),
+                        );
+                        // A convention, not a banner: Muster did not ask the
+                        // service what it was.
+                        if let Some(hint) = ports::service_hint(*port) {
+                            ui.label(RichText::new(hint).size(text::TINY).color(p.text_muted));
+                        }
+                    });
+                }
+            }
+
+            // Whatever the engine wants said about its own answer: today, that
+            // `connect()` is slower and louder than the SYN scan it will be.
+            for caveat in ports::caveats(&scan) {
+                ui.add_space(metrics::S1);
+                ui.label(RichText::new(caveat).size(text::TINY).color(p.caution));
+            }
+
+            ui.add_space(metrics::S2);
+            if button(ui, p, "Scan again", true).clicked() {
+                app.ports = ports::State::start(address, muster_net::portscan::Ports::common());
+            }
+        }
+        None => {
+            ui.label(
+                RichText::new("The ports worth knowing about, on this one device.")
+                    .size(text::TINY)
+                    .color(p.text_dim),
+            );
+            ui.add_space(metrics::S2);
+            if button(ui, p, "Scan ports", true).clicked() {
+                app.ports = ports::State::start(address, muster_net::portscan::Ports::common());
+            }
+        }
+    }
+}
+
+/// One `label` over `value` in the detail panel.
+fn panel_fact(ui: &mut egui::Ui, p: Palette, label: &str, value: &str) {
+    ui.add_space(metrics::S1);
+    ui.label(RichText::new(label).size(text::TINY).color(p.text_dim));
+    ui.label(
+        RichText::new(value)
+            .size(text::SMALL)
+            .monospace()
+            .color(p.text),
+    );
+}
+
+/// The hairline down a right-hand panel's leading edge.
+fn hairline_left(ui: &mut egui::Ui, p: Palette) {
+    let rect = ui.max_rect();
+    ui.painter().rect_filled(
+        Rect::from_min_size(
+            pos2(
+                rect.left() - metrics::PAD_PANEL,
+                rect.top() - metrics::PAD_PANEL,
+            ),
+            vec2(metrics::HAIRLINE, rect.height() + metrics::PAD_PANEL * 2.0),
+        ),
+        0.0,
+        p.line,
+    );
+}
+
+/// Who offers addresses on this link, and whether more than one does.
+///
+/// A button rather than part of a scan: a DISCOVER asks every server on the
+/// link to reserve an address, and `CLAUDE.md`'s conduct rules make anything
+/// beyond looking a deliberate act. Nothing takes the offer.
+fn dhcp_check(ui: &mut egui::Ui, p: Palette, app: &mut App) {
+    // The hardware address of the interface a scan would use. A DISCOVER is
+    // answered to whoever sent it, so an address nothing on this link owns
+    // would collect nothing.
+    let mac = app
+        .survey
+        .interfaces
+        .iter()
+        .find(|i| i.is_scannable())
+        .and_then(|i| i.mac);
+
+    ui.add_space(metrics::S2);
+    ui.horizontal(|ui| {
+        ui.add_space(metrics::PAD_PANEL);
+        if app.dhcp.is_running() {
+            ui.label(
+                RichText::new("Listening for offers…")
+                    .size(text::SMALL)
+                    .color(p.text_dim),
+            );
+            return;
+        }
+        let can = mac.is_some();
+        let label = match app.dhcp.result() {
+            Some(_) => "Check again",
+            None => "Check for another DHCP server",
+        };
+        let response = button(ui, p, label, can);
+        if !can {
+            response.clone().on_hover_text(
+                "No interface with a hardware address to ask from. Run \
+                 `muster survey` to see what this machine knows.",
+            );
+        }
+        if response.clicked()
+            && let Some(mac) = mac
+        {
+            app.dhcp = dhcpcheck::State::start(mac);
+        }
+    });
+
+    let Some(probe) = app.dhcp.result() else {
+        return;
+    };
+
+    // Two servers is the fault this exists to find, so it is the one thing here
+    // that is allowed a semantic colour. One server, or none, is a statement of
+    // fact and stays neutral.
+    let colour = if probe.is_contested() {
+        p.caution
+    } else {
+        p.text
+    };
+    ui.add_space(metrics::S1);
+    ui.horizontal(|ui| {
+        ui.add_space(metrics::PAD_PANEL);
+        ui.label(
+            RichText::new(probe.verdict())
+                .size(text::SMALL)
+                .color(colour),
+        );
+    });
+
+    for offer in &probe.offers {
+        let mut detail = format!("offered {}", offer.offered);
+        if let Some(router) = offer.router {
+            detail.push_str(&format!(", gateway {router}"));
+        }
+        if let Some(lease) = offer.lease {
+            detail.push_str(&format!(", {} h lease", lease.as_secs() / 3600));
+        }
+        fact(ui, p, &offer.server.to_string(), &detail);
+    }
 }
 
 #[cfg(test)]

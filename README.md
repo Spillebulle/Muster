@@ -20,28 +20,29 @@
 address, name, hardware address, response time and vendor, and a status bar
 naming what the sweep could not do](docs/images/window.png)
 
-> **Early days.** The survey, the sweep, naming and the port scan all work, on
-> Windows and Linux, without administrator rights. The fast SYN scan is not
-> built yet, and the port scan opens a connection per port until it is.
-> [What is not there yet](#what-is-not-there-yet) is honest about the rest.
+> **Early days.** The survey, the sweep, naming, device kinds, the port scan and
+> the DHCP check all work, on Windows and Linux, without administrator rights.
+> The fast SYN scan is not built yet, and the port scan opens a connection per
+> port until it is. [What is not there yet](#what-is-not-there-yet) is honest
+> about the rest.
 
 ## Install
 
-**Muster 0.0.4.** Take the file for your system, or browse the
+**Muster 0.0.5.** Take the file for your system, or browse the
 [release itself](https://github.com/Spillebulle/muster/releases/latest) for the
 notes and the checksums.
 
 | Your system | x86-64 | ARM64 |
 |---|---|---|
-| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-setup-0.0.4-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-setup-0.0.4-arm64.exe) |
-| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster_0.0.4_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster_0.0.4_arm64.deb) |
-| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-1.aarch64.rpm) |
-| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-bin-0.0.4-1-x86_64.pkg.tar.zst) | not built |
-| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.4/Muster-0.0.4-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.4/Muster-0.0.4-aarch64.AppImage) |
-| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-x86_64.flatpak) | not built |
-| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-arm64.msi) |
-| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-aarch64-pc-windows-msvc.zip) |
-| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-setup-0.0.5-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-setup-0.0.5-arm64.exe) |
+| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster_0.0.5_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster_0.0.5_arm64.deb) |
+| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-1.aarch64.rpm) |
+| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-bin-0.0.5-1-x86_64.pkg.tar.zst) | not built |
+| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.5/Muster-0.0.5-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.5/Muster-0.0.5-aarch64.AppImage) |
+| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-x86_64.flatpak) | not built |
+| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-arm64.msi) |
+| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-aarch64-pc-windows-msvc.zip) |
+| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-aarch64-unknown-linux-gnu.tar.gz) |
 
 There is nothing to configure and nothing to elevate. Muster scans as whatever
 user you started it as, and the window needs a GPU with Vulkan or Direct3D 12,
@@ -69,6 +70,43 @@ with no internet connection and no lookup service. **A randomised hardware
 address is reported as randomised**, not as an unknown vendor. Every modern
 phone sets one per network, and calling that "unknown" makes the list look
 broken to the people who know most.
+
+## What each device is
+
+Every device that answered gets a kind and an icon: router, computer, server,
+printer, phone, television, speaker, camera, console, smart home, network gear.
+The guess comes from what the device advertises about itself, then the ports it
+answers on, then who made its hardware, and the row's tooltip says which of
+those it was.
+
+**A device that said nothing is shown as unknown**, not guessed at. A hostname
+is never used as evidence: `HP-Printer` is usually a printer and sometimes
+somebody's desktop, and a name is evidence about whoever set the device up.
+
+## Ports, one device at a time
+
+<img src="docs/images/window.png" alt="The device table with a device selected
+and its detail panel open beside it" align="right" width="380">
+
+Select a device and a panel opens beside the table: its address, hardware,
+vendor, what it advertises, and a button to scan its ports. Open ports are
+listed with the service usually found on them, which is a convention rather
+than something the device said.
+
+Closed and filtered are counted separately and always. Rolling them together
+into "not open" is the collapse that turns a firewall into a fact.
+
+## A second DHCP server
+
+Two servers handing out addresses is one of the few faults on a home or office
+network that is nearly always real, and one of the hardest to find by hand: it
+breaks addressing intermittently and for some devices only. **This network** has
+a button that asks, collects every offer rather than the first, and names each
+server that answered. Muster never accepts an offer.
+
+It needs port 68 to hear the replies, which on Linux is privileged and on
+Windows is usually held by the system's own DHCP client. Where it cannot have
+it, it says so rather than reporting that nothing was found.
 
 ## What counts as found
 
@@ -137,7 +175,11 @@ a closed port, is in [`docs/architecture.md`](docs/architecture.md).
   families, but a sweep walks IPv4 addresses. An IPv6 prefix is not swept
   address by address, and the scan says so instead of reporting nothing found.
 - **SSDP and UPnP, TLS certificates, UDP service probes.** mDNS, NetBIOS and
-  reverse DNS answer today; the rest of identification does not.
+  reverse DNS answer today; the rest of identification does not. SSDP would be
+  the biggest single improvement to what Muster can say about a device, because
+  its description carries a model and a serial.
+- **The DHCP check often cannot run on Windows**, where the system's own DHCP
+  client already holds the port it needs to listen on.
 - **Saved scans and monitoring.** Nothing is written to disk, so two scans of
   the same network a week apart cannot yet be compared.
 - **macOS.** Not a target, and not planned.

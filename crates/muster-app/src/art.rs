@@ -191,11 +191,20 @@ fn glyph(image: &mut Image, side: u32, ink: Color32) {
     let arm = s * if compact { 0.0 } else { 0.062 };
     let orbit = s * if compact { 0.300 } else { ORBIT };
 
-    // Twelve, four and eight o'clock, so the group sits square in the frame.
+    // Twelve, four and eight o'clock.
     let satellites: [(f32, f32); 3] = std::array::from_fn(|k| {
         let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::TAU / 3.0;
         (orbit * a.cos(), orbit * a.sin())
     });
+
+    // **Optically centred, not geometrically centred.** A three-pointed group
+    // with one satellite up and two down is taller above the hub than below it:
+    // the top one reaches `orbit + node`, while the lower pair sit at
+    // `orbit·sin(30°)`, which is half as far. Drawing it about the true centre
+    // therefore leaves it sitting high in the square, which is what it looked
+    // like. Half that difference is `orbit / 4`, and shifting down by it puts
+    // the *ink* in the middle rather than the coordinate system.
+    let drop = orbit / 4.0;
 
     for py in 0..side as i32 {
         for px in 0..side as i32 {
@@ -203,7 +212,7 @@ fn glyph(image: &mut Image, side: u32, ink: Color32) {
             for sy in 0..SAMPLES {
                 for sx in 0..SAMPLES {
                     let x = px as f32 + (sx as f32 + 0.5) / SAMPLES as f32 - c;
-                    let y = py as f32 + (sy as f32 + 0.5) / SAMPLES as f32 - c;
+                    let y = py as f32 + (sy as f32 + 0.5) / SAMPLES as f32 - c - drop;
                     if in_glyph(x, y, hub, node, arm, &satellites) {
                         hits += 1;
                     }
@@ -350,8 +359,21 @@ mod tests {
         // compact one.
         let probe = |side: u32| {
             let image = mark(side, p);
-            let c = side as f32 / 2.0;
-            let y = (c - ORBIT * side as f32 * 0.66).round() as u32;
+            let s = side as f32;
+            // Mirrors `glyph`: the compact form orbits wider, and the whole
+            // group is dropped by a quarter of the orbit to sit optically
+            // centred. Measuring from the square's centre instead of the
+            // glyph's is what made this test fail when the drop was added.
+            let (hub, node, orbit) = if side < COMPACT_BELOW {
+                (0.135, 0.105, 0.300)
+            } else {
+                (0.115, 0.090, ORBIT)
+            };
+            let centre = s / 2.0 + orbit * s / 4.0;
+            // The middle of the gap between the hub and the satellite, so the
+            // probe lands on flat colour rather than on an antialiased edge.
+            let midpoint = (hub + orbit - node) / 2.0;
+            let y = (centre - midpoint * s).round() as u32;
             rgb_at(&image, side / 2, y)
         };
 
@@ -389,6 +411,34 @@ mod tests {
         image.blend(0, 0, red, 0.5);
         assert_eq!(&image.pixels[0..3], &[255, 0, 0]);
         assert_eq!(image.pixels[3], 128);
+    }
+
+    /// The glyph sits in the middle of the square by eye, not by coordinate.
+    ///
+    /// Measured from the drawn pixels, because the whole defect was that the
+    /// arithmetic was centred and the picture was not.
+    #[test]
+    fn the_glyph_is_optically_centred() {
+        let p = Palette::dark();
+        let ink = [p.accent_ink.r(), p.accent_ink.g(), p.accent_ink.b()];
+        for side in [64u32, 128, 256] {
+            let image = mark(side, p);
+            let is_ink = |x: u32, y: u32| {
+                let i = ((y * side + x) * 4) as usize;
+                image.pixels[i + 3] > 200
+                    && [image.pixels[i], image.pixels[i + 1], image.pixels[i + 2]] == ink
+            };
+            let rows: Vec<u32> = (0..side)
+                .filter(|y| (0..side).any(|x| is_ink(x, *y)))
+                .collect();
+            let top = *rows.first().expect("the glyph is drawn");
+            let bottom = side - 1 - *rows.last().expect("the glyph is drawn");
+            let slack = top.abs_diff(bottom);
+            assert!(
+                slack <= side / 32 + 1,
+                "at {side} px the glyph sits {top} from the top and {bottom} from                  the bottom, which reads as off-centre"
+            );
+        }
     }
 
     #[test]

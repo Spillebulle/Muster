@@ -3,6 +3,39 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.5
+
+Added
+
+- **Muster now tells you what each device is**, not only that it is there. A
+  router, a printer, a television, a phone, a NAS: each gets its own icon and
+  colour in the device list. The guess comes from what the device advertises
+  about itself, the ports it answers on and who made its network hardware, in
+  that order, and hovering a row says which of those it was. A device that said
+  nothing is shown as unknown rather than guessed at.
+- **Ports for one device, from the window.** Select a device and a panel opens
+  beside the table with everything known about it and a button to scan its
+  ports. Open ports are listed with the service usually found on them; closed
+  and filtered are counted separately, because a refusal is a machine answering
+  and silence is not.
+- **A check for a second DHCP server**, in This network. Two servers handing out
+  addresses is one of the few faults that is nearly always real and one of the
+  hardest to find by hand: it breaks addressing for some devices and not others.
+  Muster asks, collects every offer rather than the first, and names each server
+  that answered. It never accepts an offer.
+
+Changed
+
+- The mark sits properly in the middle of its square. The glyph is taller above
+  the centre than below it, so drawing it about the true centre left it looking
+  high.
+
+Known limits
+
+- The DHCP check needs port 68, which on Linux is privileged and on Windows is
+  usually held by the system's own DHCP client. Where it cannot have it, it says
+  so rather than reporting that no second server was found.
+
 ## 0.0.4
 
 Fixed

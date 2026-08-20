@@ -56,3 +56,65 @@ impl Ask for Udp {
         }
     }
 }
+
+/// The DHCP exchange: one broadcast out, everything that answers collected.
+///
+/// **Port 68 is the whole difficulty.** A DHCP server replies to the client
+/// port, so a client has to be listening on 68 to hear an offer at all, and 68
+/// is not a port a program simply gets:
+///
+/// * On **Linux** it is below 1024, so binding it needs `CAP_NET_BIND_SERVICE`
+///   or root.
+/// * On **Windows** the port is usually already held by the DHCP Client
+///   service, which is the thing that got this machine its own address.
+///
+/// So this fails often, and failing is fine as long as it says so: `dhcp::probe`
+/// turns the error into a sentence and the interface shows it, rather than
+/// reporting "no rogue server found" for a question that was never asked.
+///
+/// Sharing the port with the system's own client is possible with
+/// `SO_REUSEADDR` before the bind, which `std` cannot express — it is the next
+/// step for this feature and needs a socket built through `libc` and
+/// `windows-sys` by hand.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Dhcp;
+
+/// Where a DHCP server listens, and where a client does.
+const SERVER_PORT: u16 = 67;
+const CLIENT_PORT: u16 = 68;
+
+/// How long to wait on the socket between checks of the deadline.
+///
+/// Short enough that the window is honoured to within a tick, long enough that
+/// a quiet link is not a spin loop.
+const TICK: Duration = Duration::from_millis(200);
+
+impl crate::dhcp::Broadcaster for Dhcp {
+    fn broadcast(&self, payload: &[u8], window: Duration) -> io::Result<Vec<Vec<u8>>> {
+        let socket = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, CLIENT_PORT))?;
+        socket.set_broadcast(true)?;
+        socket.set_read_timeout(Some(TICK))?;
+        socket.send_to(payload, (std::net::Ipv4Addr::BROADCAST, SERVER_PORT))?;
+
+        // Every reply within the window, not the first. That is the feature:
+        // one offer is a working network and two is a fault, and a loop that
+        // stopped at the first would never be able to tell them apart.
+        let deadline = Instant::now() + window;
+        let mut replies = Vec::new();
+        let mut buffer = [0u8; 1500];
+        while Instant::now() < deadline {
+            match socket.recv_from(&mut buffer) {
+                Ok((n, _)) => replies.push(buffer[..n].to_vec()),
+                // The tick expired with nothing on the socket, which is the
+                // ordinary case for most of the window.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(replies)
+    }
+}
