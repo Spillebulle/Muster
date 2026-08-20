@@ -27,21 +27,21 @@ naming what the sweep could not do](docs/images/window.png)
 
 ## Install
 
-**Muster 0.0.3.** Take the file for your system, or browse the
+**Muster 0.0.4.** Take the file for your system, or browse the
 [release itself](https://github.com/Spillebulle/muster/releases/latest) for the
 notes and the checksums.
 
 | Your system | x86-64 | ARM64 |
 |---|---|---|
-| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster-setup-0.0.3-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster-setup-0.0.3-arm64.exe) |
-| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster_0.0.3_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster_0.0.3_arm64.deb) |
-| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster-0.0.3-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster-0.0.3-1.aarch64.rpm) |
-| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster-bin-0.0.3-1-x86_64.pkg.tar.zst) | not built |
-| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.3/Muster-0.0.3-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.3/Muster-0.0.3-aarch64.AppImage) |
-| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster-0.0.3-x86_64.flatpak) | not built |
-| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster-0.0.3-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster-0.0.3-arm64.msi) |
-| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster-0.0.3-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster-0.0.3-aarch64-pc-windows-msvc.zip) |
-| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster-0.0.3-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.3/muster-0.0.3-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-setup-0.0.4-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-setup-0.0.4-arm64.exe) |
+| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster_0.0.4_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster_0.0.4_arm64.deb) |
+| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-1.aarch64.rpm) |
+| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-bin-0.0.4-1-x86_64.pkg.tar.zst) | not built |
+| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.4/Muster-0.0.4-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.4/Muster-0.0.4-aarch64.AppImage) |
+| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-x86_64.flatpak) | not built |
+| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-arm64.msi) |
+| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-aarch64-pc-windows-msvc.zip) |
+| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.4/muster-0.0.4-aarch64-unknown-linux-gnu.tar.gz) |
 
 There is nothing to configure and nothing to elevate. Muster scans as whatever
 user you started it as, and the window needs a GPU with Vulkan or Direct3D 12,

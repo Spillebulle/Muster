@@ -17,10 +17,10 @@
 //!    against one per 64 KiB chunk, which on a 30 MB release would be five
 //!    hundred frames drawn to move a bar by a pixel.
 //! 3. **Nothing is fetched without the user knowing.** The startup check is on
-//!    by default — an update nobody is told about is an update nobody
-//!    installs, and this is a painting application people will leave alone for
-//!    months — but the first run says so before the first request goes out, and
-//!    the switch is in Settings, General.
+//!    by default — an update nobody is told about is an update nobody installs,
+//!    and a scanner is exactly the kind of tool that gets installed once and
+//!    left — but the first run says so before the first request goes out, and
+//!    the switch is in About.
 //! 4. **Only installations Muster owns are replaced.** [`install`] decides that,
 //!    and every other kind is told where to get the build instead. A package
 //!    manager's files are never written.
@@ -624,6 +624,13 @@ fn agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .https_only(true)
         .timeout_global(Some(timeout))
+        // **A status is not an error here, it is an answer to read.** ureq's
+        // default turns any non-2xx into `Error::StatusCode`, which carries the
+        // number and nothing else — so a rate-limited check could only say
+        // "http status: 403", which tells the user nothing they can act on and
+        // does not even say it was a rate limit. The callers below inspect the
+        // status themselves and say what happened.
+        .http_status_as_error(false)
         // GitHub refuses an API request with no user agent, and asks that it
         // name the application.
         .user_agent(format!("muster/{} (+{})", Version::current(), REPOSITORY))
@@ -642,6 +649,11 @@ fn latest_release() -> Result<Option<Release>, String> {
         .call()
         .map_err(|e| format!("Muster could not reach GitHub: {e}"))?;
 
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(api_failure(status, response.headers()));
+    }
+
     let body = response
         .body_mut()
         .with_config()
@@ -650,6 +662,57 @@ fn latest_release() -> Result<Option<Release>, String> {
         .map_err(|e| format!("GitHub's reply could not be read: {e}"))?;
 
     release::newest(&body).map_err(|e| format!("GitHub's reply could not be understood: {e}"))
+}
+
+/// What to tell the user when the release list comes back as something other
+/// than a list of releases.
+///
+/// **403 is the one worth naming.** GitHub allows 60 requests an hour from one
+/// address without a token, and it answers the sixty-first with 403 rather than
+/// 429. Reported as the raw status it reads as "GitHub has blocked you", which
+/// is alarming and wrong; it is a quota that refills on its own, so the message
+/// says that and says when.
+///
+/// Muster deliberately sends no token. A token would raise the limit and is a
+/// credential this application has no business holding, and `CLAUDE.md` allows
+/// exactly one outbound request on Muster's own behalf.
+fn api_failure(status: u16, headers: &ureq::http::HeaderMap) -> String {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+
+    let out_of_quota = matches!(status, 403 | 429)
+        && header("x-ratelimit-remaining").is_some_and(|left| left == 0);
+
+    if out_of_quota {
+        let wait = header("x-ratelimit-reset")
+            .and_then(|reset| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_secs();
+                reset.checked_sub(now)
+            })
+            .map(|seconds| seconds.div_ceil(60).max(1));
+        return match wait {
+            Some(minutes) => format!(
+                "GitHub is rate limiting this network. It allows 60 checks an                  hour from one address, and they have been used. Muster will be                  able to check again in about {minutes} minutes."
+            ),
+            None => "GitHub is rate limiting this network. It allows 60 checks                      an hour from one address, and they have been used. Try                      again later."
+                .to_string(),
+        };
+    }
+
+    match status {
+        403 => "GitHub refused the request. That is usually a rate limit on                 this network, which clears on its own within the hour."
+            .to_string(),
+        404 => "GitHub has no release list at that address. The repository may                 have been renamed."
+            .to_string(),
+        other => format!("GitHub answered {other} rather than the release list."),
+    }
 }
 
 /// Download an asset, reporting how much has arrived and stopping when asked.
@@ -676,6 +739,17 @@ fn fetch(
         .get(&asset.browser_download_url)
         .call()
         .map_err(|e| format!("Muster could not download {}: {e}", asset.name))?;
+
+    // The agent no longer treats a status as an error, so this is where a
+    // missing or moved asset is caught. Without it the body would be read as
+    // though an error page were the release.
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(format!(
+            "GitHub answered {status} for {}. The release may have been changed              since Muster read it.",
+            asset.name
+        ));
+    }
 
     let mut reader = response
         .body_mut()
@@ -864,6 +938,83 @@ impl Updates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A header map built from pairs, so the tests below read as the reply they
+    /// stand for.
+    fn headers(pairs: &[(&str, &str)]) -> ureq::http::HeaderMap {
+        let mut map = ureq::http::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                ureq::http::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                ureq::http::HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        map
+    }
+
+    /// The message 0.0.3 could not produce, and the reason this function exists.
+    ///
+    /// GitHub answers the sixty-first unauthenticated request in an hour with
+    /// **403**, not 429, and ureq's default turned that into `Error::StatusCode`
+    /// carrying nothing but the number. The dialog therefore said "Muster could
+    /// not reach GitHub: http status: 403", which names neither the cause nor
+    /// the remedy, and reads as though GitHub had blocked the user.
+    #[test]
+    fn a_spent_quota_is_named_as_one_and_says_when_it_refills() {
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_secs()
+            + 20 * 60;
+        let message = api_failure(
+            403,
+            &headers(&[
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset", &reset.to_string()),
+            ]),
+        );
+        assert!(
+            message.contains("rate limiting"),
+            "the message must name the cause: {message}"
+        );
+        assert!(
+            message.contains("20 minutes"),
+            "and say when it clears: {message}"
+        );
+        assert!(
+            !message.contains("403"),
+            "a status code is not a sentence: {message}"
+        );
+    }
+
+    /// 429 is the same thing under the other status, so it reads the same.
+    #[test]
+    fn too_many_requests_reads_as_the_same_quota() {
+        let message = api_failure(429, &headers(&[("x-ratelimit-remaining", "0")]));
+        assert!(message.contains("rate limiting"), "{message}");
+    }
+
+    /// A 403 with quota left is *not* a rate limit, and must not claim to be.
+    #[test]
+    fn a_refusal_with_quota_left_is_not_reported_as_a_rate_limit() {
+        let message = api_failure(403, &headers(&[("x-ratelimit-remaining", "42")]));
+        assert!(!message.contains("have been used"), "{message}");
+        assert!(message.contains("refused"), "{message}");
+    }
+
+    /// A renamed or deleted repository, which is the other way this goes wrong
+    /// and wants a different answer from the user.
+    #[test]
+    fn a_missing_release_list_says_so() {
+        let message = api_failure(404, &headers(&[]));
+        assert!(message.contains("renamed"), "{message}");
+    }
+
+    #[test]
+    fn any_other_status_is_reported_with_its_number() {
+        let message = api_failure(503, &headers(&[]));
+        assert!(message.contains("503"), "{message}");
+    }
 
     /// Nothing in this module's tests may reach the network, so the state
     /// machine is exercised without ever starting a job.

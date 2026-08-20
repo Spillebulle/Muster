@@ -26,7 +26,13 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Duration;
 
 /// The window, in logical points. Small: it says one thing.
-const WINDOW: [f32; 2] = [440.0, 250.0];
+const WINDOW: [f32; 2] = [440.0, 260.0];
+
+/// The mark's side in this window.
+///
+/// Comfortably above `art`'s threshold for dropping the glyph, so the installer
+/// shows the whole mark rather than the bare square.
+const MARK: u32 = 48;
 
 /// How often the window looks for news from the worker.
 ///
@@ -108,6 +114,7 @@ pub fn show(mut job: Job) -> Result<(), Box<dyn std::error::Error>> {
         log: None,
         mode: Mode::Dark,
         started: start,
+        mark: None,
     };
     // An update was already agreed to, so it gets on with it. Setup waits for
     // the button.
@@ -200,6 +207,9 @@ struct Installer {
     mode: Mode,
     /// Whether the work has been asked for. Setup's Install button sets it.
     started: bool,
+    /// The mark, uploaded once. `None` until the first frame has a context to
+    /// upload it with.
+    mark: Option<egui::TextureHandle>,
 }
 
 impl Installer {
@@ -331,12 +341,32 @@ impl eframe::App for Installer {
                         false => format!("Updating Muster to {}", self.job.version),
                     }
                 };
-                ui.label(
-                    RichText::new(heading)
-                        .size(text::HEADING)
-                        .color(p.text_strong),
-                );
-                ui.add_space(metrics::S3);
+                // The mark, beside the heading. This window is the whole of
+                // what a first install shows — the package is handed to
+                // `msiexec` quietly, so WiX's own artwork is never drawn — and
+                // an installer that never says whose it is was what 0.0.3
+                // shipped.
+                ui.horizontal(|ui| {
+                    let mark = self.mark.get_or_insert_with(|| {
+                        let image = crate::art::mark(MARK, p);
+                        ui.ctx().load_texture(
+                            "muster-mark",
+                            egui::ColorImage::from_rgba_unmultiplied(
+                                [MARK as usize, MARK as usize],
+                                &image.pixels,
+                            ),
+                            egui::TextureOptions::LINEAR,
+                        )
+                    });
+                    ui.image((mark.id(), egui::vec2(MARK as f32, MARK as f32)));
+                    ui.add_space(metrics::S3 - ui.spacing().item_spacing.x);
+                    ui.label(
+                        RichText::new(heading)
+                            .size(text::HEADING)
+                            .color(p.text_strong),
+                    );
+                });
+                ui.add_space(metrics::S4);
 
                 progress(ui, p, self.step.progress());
                 ui.add_space(metrics::S2);
