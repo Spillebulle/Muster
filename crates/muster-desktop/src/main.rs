@@ -15,6 +15,24 @@
 //! by care — the marker for a randomised address was appended to the hardware
 //! address once, and one phone knocked every field after it out of line.
 
+// A release build declares the **windows** subsystem, so that opening Muster
+// from the Start menu, from Explorer or from the installer's "Start Muster"
+// does not put a console window behind it. 0.0.3 shipped without this and did
+// exactly that.
+//
+// The catch, and the reason this is two changes rather than one: a
+// GUI-subsystem process does not inherit the console it was launched from
+// either, so `muster survey` in a terminal would print nothing at all. That
+// would trade a cosmetic defect for the loss of the text mode, which is half
+// the product. `attach_parent_console` is the other half of the fix.
+//
+// A debug build keeps the console subsystem, because a panic message with
+// nowhere to go is worse than a console window nobody minds.
+//
+// Linux needs none of this: it opens no terminal for a binary started from a
+// launcher, and keeps the one it was started from.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod portcmd;
 
 use muster_net::rate::Bucket;
@@ -27,6 +45,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 fn main() {
+    // Before the first write to either stream: that is when the standard
+    // library resolves the handle.
+    attach_parent_console();
+
     // Warnings from our own crates, and nothing from the graphics stack below
     // `warn`. wgpu's HAL warns once per surface configuration about present
     // modes its driver enumerates and it does not recognise — true, harmless,
@@ -549,6 +571,38 @@ fn print_survey<W: Write>(w: &mut W, s: &Survey) {
         }
     }
 }
+
+/// Take the console Muster was launched from, where there is one.
+///
+/// The `windows` subsystem above is what stops a console appearing for a
+/// double-click, and it also stops a release build inheriting the one it was
+/// started from, so `muster scan` in a terminal would otherwise print nothing.
+/// That is a real loss rather than a cosmetic one: the text mode is how Muster
+/// is used over SSH and in a script.
+///
+/// `AttachConsole(ATTACH_PARENT_PROCESS)` asks for the parent's console and
+/// fails harmlessly where there is not one — started from Explorer, from the
+/// Start menu, or by the installer — which is exactly the case the subsystem
+/// change exists to fix.
+///
+/// The known wart is that a GUI-subsystem process does not hold the shell's
+/// prompt, so its output arrives after the prompt has come back. That is what
+/// every Windows application doing this looks like, and it is a great deal
+/// better than a text mode that cannot speak.
+#[cfg(all(windows, not(debug_assertions)))]
+fn attach_parent_console() {
+    // SAFETY: no pointer arguments, and a documented failure return for "there
+    // is no console to attach to", which is the ordinary case and is ignored.
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(
+            windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        );
+    }
+}
+
+/// Every other build already has whatever console it is going to get.
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn attach_parent_console() {}
 
 #[cfg(test)]
 mod tests {

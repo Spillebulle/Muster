@@ -3,6 +3,28 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.4
+
+Fixed
+
+- **Muster had no icon on Windows.** Explorer, the Start menu shortcut and Add
+  or remove programs all showed the default one. The mark is now compiled into
+  the executable, which is where Windows looks before a process has started;
+  setting the window's icon at run time, which is what earlier releases did,
+  never reaches any of those.
+- **Opening Muster from the Start menu put a console window behind it.** The
+  release build now declares the windows subsystem, and takes the terminal's
+  console when it was started from one, so `muster scan` still prints.
+- **The update check reported "http status: 403" and left you none the wiser.**
+  GitHub answers the sixty-first check in an hour from one address with 403,
+  which is a quota that refills rather than a refusal. Muster now says so, and
+  says how many minutes are left.
+
+Changed
+
+- The installer window carries the mark. It is the whole of what a first
+  install shows, since the package is handed to Windows Installer quietly.
+
 ## 0.0.3
 
 Changed

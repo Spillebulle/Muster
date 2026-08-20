@@ -15,7 +15,17 @@ muster-net = { workspace = true }
 muster-app = { workspace = true }
 env_logger = { workspace = true }
 
+# Compiles the icon into the executable, so Explorer, the Start menu shortcut
+# and Add or remove programs all have one before the process starts. Cargo
+# selects `[target.…build-dependencies]` on the *host* triple, which is what is
+# wanted: the resource compiler is a host tool, and Linux builds never see this
+# crate at all. See `build.rs`.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 # `SetConsoleCtrlHandler`, so that Ctrl-C stops a sweep and prints what it
-# found rather than killing the process and losing it.
+# found rather than killing the process and losing it; and `AttachConsole`, so
+# that a release build declaring the `windows` subsystem can still print when it
+# was started from a terminal. See `main.rs`.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
