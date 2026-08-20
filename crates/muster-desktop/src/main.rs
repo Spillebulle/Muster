@@ -217,7 +217,7 @@ fn scan(target: Option<&str>) {
 
         let started = Instant::now();
         let last = Mutex::new(Instant::now() - Duration::from_secs(1));
-        let result = discover::sweep(prefix, &transport, &rate, opts, &cancel, &|p| {
+        let result = discover::sweep(prefix, &transport, &rate, opts, &cancel, &|p, _| {
             // A progress line is drawn by returning to the start of it, which
             // only means anything on a terminal. Redirected, every update
             // becomes another line of rubbish in the file — and because it goes

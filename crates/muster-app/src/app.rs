@@ -62,6 +62,23 @@ pub struct App {
     /// What was last written to the settings file, so a check that moved the
     /// clock is persisted once rather than on every frame.
     saved_last_check: u64,
+    /// The app mark, uploaded once, with the theme it was drawn for.
+    mark: Option<(Mode, egui::TextureHandle)>,
+    /// What the user typed in the range field. Empty means the local prefix.
+    ///
+    /// Kept as text rather than as a `Prefix` so a half-typed address stays a
+    /// half-typed address instead of a parse failure on every keystroke.
+    target_text: String,
+    /// The filter over the device table.
+    search: String,
+    /// A re-probe in flight: which device, and where its answer will arrive.
+    ping: Option<(
+        std::net::IpAddr,
+        std::sync::mpsc::Receiver<Option<std::time::Duration>>,
+    )>,
+    /// What the last re-probe said, and about which device. `None` inside the
+    /// tuple means nothing came back, which is **not** the same as gone.
+    pinged: Option<(std::net::IpAddr, Option<std::time::Duration>)>,
     /// The update check and the dialog it raises.
     ///
     /// Its two settings are loaded from [`prefs`] at start-up and written back
@@ -102,6 +119,11 @@ impl App {
             ports: ports::State::Idle,
             dhcp: dhcpcheck::State::Idle,
             saved_last_check: saved.last_check,
+            mark: None,
+            target_text: String::new(),
+            search: String::new(),
+            ping: None,
+            pinged: None,
             updates,
         };
         apply(&cc.egui_ctx, Palette::of(app.mode));
@@ -143,12 +165,102 @@ impl App {
             ports: ports::State::Idle,
             dhcp: dhcpcheck::State::Idle,
             saved_last_check: 0,
+            mark: None,
+            target_text: String::new(),
+            search: String::new(),
+            ping: None,
+            pinged: None,
             updates,
+        }
+    }
+
+    /// Is `prefix` one this machine is actually on?
+    ///
+    /// What separates the default from a range somebody typed, and what the
+    /// toolbar says out loud before a scan leaves the link.
+    fn on_link(&self, prefix: Prefix) -> bool {
+        self.survey
+            .interfaces
+            .iter()
+            .filter(|i| i.is_scannable())
+            .flat_map(|i| i.v4_prefixes())
+            .any(|local| local.contains(prefix.network()))
+    }
+
+    /// Ask one device again, on a thread.
+    fn start_ping(&mut self, address: std::net::IpAddr) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let on_link = self.target.is_some_and(|p| self.on_link(p));
+        std::thread::spawn(move || {
+            let opts = if on_link {
+                muster_net::discover::Options::on_link()
+            } else {
+                muster_net::discover::Options::default()
+            };
+            let found = muster_net::discover::probe(
+                address,
+                &muster_net::platform::Host,
+                &muster_net::rate::Bucket::polite(),
+                opts,
+            );
+            // `None` for "nothing came back" collapses with "found but no round
+            // trip measured", and that is deliberate: neither is a time to
+            // show, and the screen distinguishes them by whether a device is
+            // still in the table at all.
+            let _ = tx.send(found.and_then(|f| f.rtt));
+        });
+        self.ping = Some((address, rx));
+    }
+
+    /// Take a ping's answer if it has arrived. True when something changed.
+    fn poll_ping(&mut self) -> bool {
+        let Some((address, rx)) = &self.ping else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(rtt) => {
+                self.pinged = Some((*address, rtt));
+                self.ping = None;
+                true
+            }
+            // The worker ended without answering, which can only be a panic in
+            // it. Stop waiting rather than leaving "asking…" on screen.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pinged = Some((*address, None));
+                self.ping = None;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
         }
     }
 
     fn palette(&self) -> Palette {
         Palette::of(self.mode)
+    }
+
+    /// The app mark as a texture, drawn once per theme.
+    ///
+    /// Uploaded lazily because there is no context to upload with until the
+    /// first frame, and re-made when the theme changes: the mark is a function
+    /// of the palette, so a stale one would be the wrong accent.
+    fn mark_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        let mode = self.mode;
+        if let Some((made_for, handle)) = &self.mark
+            && *made_for == mode
+        {
+            return handle.clone();
+        }
+        let image = crate::art::mark(MARK_TEXTURE, Palette::of(mode));
+        let handle = ctx.load_texture(
+            "muster-mark",
+            egui::ColorImage::from_rgba_unmultiplied(
+                [MARK_TEXTURE as usize, MARK_TEXTURE as usize],
+                &image.pixels,
+            ),
+            egui::TextureOptions::LINEAR,
+        );
+        self.mark = Some((mode, handle.clone()));
+        handle
     }
 
     fn start_scan(&mut self) {
@@ -177,6 +289,9 @@ impl eframe::App for App {
         }
         if self.dhcp.poll() || self.dhcp.is_running() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+        if self.poll_ping() || self.ping.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
         }
 
         // The startup check, once, and only once the notice has been answered.
@@ -215,12 +330,6 @@ impl eframe::App for App {
         status_bar(ctx, p, self);
         sidebar(ctx, p, self);
 
-        // Before the central panel, so the table gets what is left rather than
-        // being drawn under it.
-        if self.view == View::Devices {
-            detail_panel(ctx, p, self);
-        }
-
         let view = self.view;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(p.window))
@@ -229,6 +338,12 @@ impl eframe::App for App {
                 View::Network => network_view(ui, p, self),
                 View::About => about_view(ui, p, &mut self.updates),
             });
+
+        // Over the table, but under the update dialog: a device's detail is
+        // not modal and must not sit on top of something that is.
+        if view == View::Devices {
+            detail_window(ctx, p, self);
+        }
 
         // Last, so it draws over everything: the first-run notice, or the
         // update dialog when there is one.
@@ -249,10 +364,25 @@ fn top_bar(ctx: &egui::Context, p: Palette, app: &mut App) {
         .show(ctx, |ui| {
             hairline_bottom(ui, p);
             ui.horizontal_centered(|ui| {
-                // The mark: a rounded square in the accent with no glyph in it.
+                // The mark, and the real one: the same `art::mark` the icon
+                // files and the installer are drawn from, uploaded once and
+                // scaled down here.
+                //
+                // Rasterised at `MARK_TEXTURE` rather than at 15 points, which
+                // is the whole reason it can carry the glyph at this size at
+                // all. `art`'s optical sizing drops the glyph below 24 *pixels*
+                // because four discs cannot be drawn with gaps in fewer; a
+                // texture built large and minified has no such limit, and it
+                // stays sharp on a high-density display where 15 points is 30
+                // pixels or more.
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(metrics::MARK), Sense::hover());
-                ui.painter()
-                    .rect_filled(rect, metrics::RADIUS_TIGHT, p.accent);
+                let mark = app.mark_texture(ui.ctx());
+                ui.painter().image(
+                    mark.id(),
+                    rect,
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
 
                 ui.add_space(metrics::S2);
                 ui.label(
@@ -467,9 +597,13 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
     // wants the answer to "is this the way out".
     let gateways: Vec<std::net::IpAddr> = app.survey.gateways.iter().map(|g| g.address).collect();
 
+    // Above the empty state as well as above the table: a scan that found
+    // nothing is exactly when somebody wants to change the range.
+    devices_toolbar(ui, p, app);
+
     if devices.is_empty() {
         let note = match &app.scan {
-            State::Running { .. } => "Scanning…",
+            State::Running { .. } => "Sweeping. Devices appear here as they answer.",
             State::Finished(_) => "Nothing answered on this network.",
             State::Idle => "No scan yet. Press Scan.",
         };
@@ -483,15 +617,27 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
             ui.add_space(metrics::S2);
             table_header(ui, p);
             let mode = app.mode;
+            let empty = Identity::default();
+            let mut shown = 0usize;
             for (i, host) in devices.iter().enumerate() {
+                let named = names.get(i);
                 let is_gateway = gateways.contains(&host.address);
+                let kind = muster_net::kind::kind_of(host, named.unwrap_or(&empty), is_gateway);
+                if !matches(&app.search, host, named, kind) {
+                    continue;
+                }
+                shown += 1;
                 let selected = app.selected == Some(host.address);
-                let response = device_row(ui, p, mode, host, names.get(i), is_gateway, selected);
+                let response = device_row(ui, p, mode, host, named, is_gateway, selected);
                 if response.clicked() {
-                    // Clicking the open row shuts the panel, which is the only
-                    // way to get the table's full width back.
+                    // Clicking the open row shuts the window, which is the way
+                    // back to the table without reaching for a close button.
                     app.selected = if selected { None } else { Some(host.address) };
                 }
+            }
+            if shown == 0 {
+                ui.add_space(metrics::S4);
+                empty_state(ui, p, "Nothing here matches that.");
             }
             ui.add_space(metrics::S2);
         });
@@ -501,6 +647,14 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
 /// and the kind's name is in the row's tooltip rather than in a column of its
 /// own, because a word per row would cost more width than the icon saves.
 const COL_KIND: f32 = 26.0;
+
+/// The size the app mark is rasterised at before being scaled into the top bar.
+///
+/// Four times the 15-point mark, so it is still oversampled on a display at
+/// twice the density and minifies cleanly rather than being drawn at a size
+/// where `art`'s optical sizing would drop the glyph.
+const MARK_TEXTURE: u32 = 64;
+
 const COL_ADDRESS: f32 = 130.0;
 const COL_NAME: f32 = 190.0;
 const COL_MAC: f32 = 150.0;
@@ -1022,16 +1176,19 @@ pub(crate) fn apply(ctx: &egui::Context, p: Palette) {
     ctx.set_style(style);
 }
 
-/// The panel for the selected device: what it is, why, and what it is offering.
+/// The window for the selected device: what it is, why, and what it offers.
 ///
-/// A docked panel rather than a dialog, because §7.5 makes the panel the unit
-/// for "more about the thing you selected", and because a scan of somebody's
-/// network should never be held behind a modal. The table stays live beside it.
-fn detail_panel(ctx: &egui::Context, p: Palette, app: &mut App) {
+/// A floating window rather than a docked panel, which is a change from how
+/// this started. The panel took 264 px off the table permanently and put the
+/// device's detail as far from the row as it is possible to get on a wide
+/// screen; a window opens next to the work, moves if it is in the way, and
+/// gives the width back when it closes. §7.17's rules apply: popover fill, a
+/// hairline, and a shadow, because it floats.
+fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
     let Some(address) = app.selected else { return };
     let Some(index) = app.scan.devices().iter().position(|d| d.address == address) else {
         // The device is gone, which means a later scan did not find it. Drop
-        // the selection rather than showing a panel about nothing.
+        // the selection rather than showing a window about nothing.
         app.selected = None;
         return;
     };
@@ -1043,20 +1200,34 @@ fn detail_panel(ctx: &egui::Context, p: Palette, app: &mut App) {
     let kind = guess.map_or(muster_net::Kind::Unknown, |g| g.kind);
     let mode = app.mode;
 
-    egui::SidePanel::right("device")
-        .exact_width(metrics::PANEL)
+    let mut open = true;
+    let title = named
+        .best()
+        .map(|n| n.value.clone())
+        .unwrap_or_else(|| address.to_string());
+
+    egui::Window::new(title)
+        .id(egui::Id::new("device-detail"))
+        .open(&mut open)
+        .collapsible(false)
         .resizable(false)
+        .default_width(320.0)
         .frame(
             egui::Frame::NONE
-                .fill(p.dock)
-                .inner_margin(egui::Margin::same(metrics::PAD_PANEL as i8)),
+                .fill(p.popover)
+                .stroke(Stroke::new(metrics::HAIRLINE, p.line_popover))
+                .corner_radius(metrics::RADIUS_MODAL)
+                .inner_margin(egui::Margin::same(metrics::PAD_PANEL as i8))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 4],
+                    blur: 16,
+                    spread: 0,
+                    color: Color32::from_black_alpha(90),
+                }),
         )
-        .show_separator_line(false)
         .show(ctx, |ui| {
-            hairline_left(ui, p);
+            ui.set_width(320.0);
 
-            // The heading is the device: its icon, and its name where it has
-            // one rather than its address.
             ui.horizontal(|ui| {
                 let (icon, _) = ui.allocate_exact_size(Vec2::splat(metrics::ROW), Sense::hover());
                 deviceicon::draw(
@@ -1064,67 +1235,188 @@ fn detail_panel(ctx: &egui::Context, p: Palette, app: &mut App) {
                     Rect::from_center_size(icon.center(), Vec2::splat(metrics::ROW - 4.0)),
                     kind,
                     deviceicon::colour(kind, mode, p.text_dim),
-                    p.dock,
+                    p.popover,
                 );
                 ui.add_space(metrics::S1);
-                let title = named
-                    .best()
-                    .map(|n| n.value.clone())
-                    .unwrap_or_else(|| address.to_string());
-                ui.label(
-                    RichText::new(title)
-                        .size(text::HEADING)
-                        .color(p.text_strong),
-                );
+                // The claim and its reason, together. An icon with no way to
+                // ask why is a guess wearing a confident face.
+                match guess {
+                    Some(g) => {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(g.kind.label())
+                                    .size(text::CONTROL)
+                                    .color(deviceicon::colour(kind, mode, p.text_muted)),
+                            );
+                            ui.label(
+                                RichText::new(g.clue.reason())
+                                    .size(text::TINY)
+                                    .color(p.text_dim),
+                            );
+                        });
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("Nothing it said identifies what it is")
+                                .size(text::TINY)
+                                .color(p.text_dim),
+                        );
+                    }
+                }
             });
 
-            // The claim and its reason, together. An icon with no way to ask
-            // why is a guess wearing a confident face.
-            match guess {
-                Some(g) => {
-                    ui.label(
-                        RichText::new(g.kind.label())
-                            .size(text::SMALL)
-                            .color(deviceicon::colour(kind, mode, p.text_muted)),
-                    );
-                    ui.label(
-                        RichText::new(g.clue.reason())
-                            .size(text::TINY)
-                            .color(p.text_dim),
-                    );
-                }
-                None => {
-                    ui.label(
-                        RichText::new("Nothing it said identifies what it is")
-                            .size(text::TINY)
-                            .color(p.text_dim),
-                    );
-                }
-            }
-
-            ui.add_space(metrics::S3);
-            panel_fact(ui, p, "Address", &address.to_string());
+            ui.add_space(metrics::S2);
+            fact_row(ui, p, "Address", &address.to_string());
             if let Some(mac) = host.mac {
-                panel_fact(ui, p, "Hardware", &mac.to_string());
+                fact_row(ui, p, "Hardware", &mac.to_string());
                 let vendor = match muster_net::vendor::lookup(mac) {
                     muster_net::vendor::Origin::Randomised => "randomised address".to_string(),
                     other => other.label().to_string(),
                 };
-                panel_fact(ui, p, "Made by", &vendor);
-            }
-            if let Some(rtt) = host.rtt {
-                panel_fact(ui, p, "Answered in", &format!("{} ms", rtt.as_millis()));
+                fact_row(ui, p, "Made by", &vendor);
             }
             if let Some(workgroup) = &named.workgroup {
-                panel_fact(ui, p, "Workgroup", workgroup);
+                fact_row(ui, p, "Workgroup", workgroup);
+            }
+            for name in &named.names {
+                fact_row(ui, p, name.source.label(), &name.value);
             }
             if !named.services.is_empty() {
-                panel_fact(ui, p, "Advertises", &named.services.join(", "));
+                fact_row(ui, p, "Advertises", &named.services.join(", "));
             }
+            fact_row(
+                ui,
+                p,
+                "Answered",
+                &host
+                    .evidence
+                    .iter()
+                    .map(muster_net::discover::Evidence::reason)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+
+            ui.add_space(metrics::S3);
+            ping_section(ui, p, app, address, host.rtt);
 
             ui.add_space(metrics::S3);
             ports_section(ui, p, app, address);
         });
+
+    if !open {
+        app.selected = None;
+    }
+}
+
+/// Ask this one device again, now.
+///
+/// The same three probes the sweep uses, through `discover::probe`, so a
+/// re-check and the sweep cannot disagree about what counts as an answer. It is
+/// the question somebody actually has in front of a device list: *is it still
+/// there?*
+fn ping_section(
+    ui: &mut egui::Ui,
+    p: Palette,
+    app: &mut App,
+    address: std::net::IpAddr,
+    swept_rtt: Option<std::time::Duration>,
+) {
+    ui.horizontal(|ui| {
+        let waiting = app.ping.as_ref().is_some_and(|(a, _)| *a == address);
+        if button(ui, p, "Ping", !waiting).clicked() && !waiting {
+            app.start_ping(address);
+        }
+        ui.add_space(metrics::S2);
+
+        let line = if waiting {
+            "asking…".to_string()
+        } else {
+            match app.pinged {
+                Some((a, Some(rtt))) if a == address => {
+                    format!("answered in {} ms", rtt.as_millis())
+                }
+                // **Not "it is gone".** Silence is a device that is off, a
+                // device that drops, or a probe that was rate limited into the
+                // next second. The sweep's own rule, kept here.
+                Some((a, None)) if a == address => "nothing came back this time".to_string(),
+                _ => match swept_rtt {
+                    Some(rtt) => format!("{} ms when it was swept", rtt.as_millis()),
+                    None => String::new(),
+                },
+            }
+        };
+        ui.label(RichText::new(line).size(text::TINY).color(p.text_dim));
+    });
+}
+
+/// One `label  value` line with a control that copies the value.
+///
+/// Every field is copyable because every field is something somebody is about
+/// to paste somewhere: a hardware address into a DHCP reservation, an address
+/// into a browser, a vendor into a search.
+fn fact_row(ui: &mut egui::Ui, p: Palette, label: &str, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    ui.add_space(metrics::S1);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(text::TINY).color(p.text_dim));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            copy_button(ui, p, value);
+        });
+    });
+    ui.label(
+        RichText::new(value)
+            .size(text::SMALL)
+            .monospace()
+            .color(p.text),
+    );
+}
+
+/// A small copy control: two offset rectangles, drawn rather than lettered.
+///
+/// Icon-only, so it carries a tooltip — §11's rule, and the only thing that
+/// makes an unlabelled control honest.
+fn copy_button(ui: &mut egui::Ui, p: Palette, value: &str) -> egui::Response {
+    let side = metrics::ICON;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
+    let ink = if response.hovered() {
+        p.text_strong
+    } else {
+        p.text_dim
+    };
+
+    // The back sheet, then the front one over it, so the two read as a stack
+    // rather than as a cross.
+    let back = Rect::from_min_size(
+        pos2(rect.left() + side * 0.10, rect.top() + side * 0.10),
+        Vec2::splat(side * 0.58),
+    );
+    let front = Rect::from_min_size(
+        pos2(rect.left() + side * 0.32, rect.top() + side * 0.32),
+        Vec2::splat(side * 0.58),
+    );
+    ui.painter().rect_stroke(
+        back,
+        2.0,
+        Stroke::new(1.2_f32, ink),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().rect_filled(front, 2.0, p.popover);
+    ui.painter().rect_stroke(
+        front,
+        2.0,
+        Stroke::new(1.2_f32, ink),
+        egui::StrokeKind::Inside,
+    );
+
+    if response.clicked() {
+        ui.ctx().copy_text(value.to_string());
+    }
+    response
+        .clone()
+        .on_hover_text(format!("Copy {value}"))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// The port scan, and what it is allowed to claim.
@@ -1194,10 +1486,26 @@ fn ports_section(ui: &mut egui::Ui, p: Palette, app: &mut App, address: std::net
             }
 
             // Whatever the engine wants said about its own answer: today, that
-            // `connect()` is slower and louder than the SYN scan it will be.
-            for caveat in ports::caveats(&scan) {
-                ui.add_space(metrics::S1);
-                ui.label(RichText::new(caveat).size(text::TINY).color(p.caution));
+            // `connect()` is slower and louder than the SYN scan it will be,
+            // and that silence is not a closed port.
+            //
+            // **Drawn as notes, in a neutral.** They were `caution` amber
+            // first, which made every successful scan look like it had gone
+            // wrong; these are facts about the method, not warnings about the
+            // result. §2.5: semantic colour marks state, and "this is how it
+            // was measured" is not a state.
+            let notes = ports::caveats(&scan);
+            if !notes.is_empty() {
+                ui.add_space(metrics::S2);
+                ui.label(
+                    RichText::new("ABOUT THIS SCAN")
+                        .size(text::TINY)
+                        .color(p.placeholder),
+                );
+                for note in notes {
+                    ui.add_space(metrics::S1);
+                    ui.label(RichText::new(note).size(text::TINY).color(p.text_dim));
+                }
             }
 
             ui.add_space(metrics::S2);
@@ -1217,34 +1525,6 @@ fn ports_section(ui: &mut egui::Ui, p: Palette, app: &mut App, address: std::net
             }
         }
     }
-}
-
-/// One `label` over `value` in the detail panel.
-fn panel_fact(ui: &mut egui::Ui, p: Palette, label: &str, value: &str) {
-    ui.add_space(metrics::S1);
-    ui.label(RichText::new(label).size(text::TINY).color(p.text_dim));
-    ui.label(
-        RichText::new(value)
-            .size(text::SMALL)
-            .monospace()
-            .color(p.text),
-    );
-}
-
-/// The hairline down a right-hand panel's leading edge.
-fn hairline_left(ui: &mut egui::Ui, p: Palette) {
-    let rect = ui.max_rect();
-    ui.painter().rect_filled(
-        Rect::from_min_size(
-            pos2(
-                rect.left() - metrics::PAD_PANEL,
-                rect.top() - metrics::PAD_PANEL,
-            ),
-            vec2(metrics::HAIRLINE, rect.height() + metrics::PAD_PANEL * 2.0),
-        ),
-        0.0,
-        p.line,
-    );
 }
 
 /// Who offers addresses on this link, and whether more than one does.
@@ -1325,6 +1605,139 @@ fn dhcp_check(ui: &mut egui::Ui, p: Palette, app: &mut App) {
         }
         fact(ui, p, &offer.server.to_string(), &detail);
     }
+}
+
+/// The strip above the device table: what to scan, and what to show.
+///
+/// §7.2's options strip. It carries the two things a scan needs from the user
+/// and nothing else: the range to sweep, and a filter over what came back.
+fn devices_toolbar(ui: &mut egui::Ui, p: Palette, app: &mut App) {
+    ui.horizontal(|ui| {
+        ui.add_space(metrics::PAD_PANEL);
+
+        ui.label(RichText::new("Range").size(text::TINY).color(p.text_dim));
+        let target = field(ui, p, &mut app.target_text, 150.0, "192.168.1.0/24");
+
+        // Parsed on every keystroke so the field can say whether it is usable
+        // before the button is pressed, rather than failing after it.
+        //
+        // **The default is still the local prefix.** Typing here is how
+        // `CLAUDE.md`'s "scanning outside the local prefix is a deliberate act"
+        // is expressed: an empty field means this machine's own network, and
+        // anything else is something somebody chose to write.
+        let typed: Option<Prefix> = match app.target_text.trim() {
+            "" => app.survey.default_targets().first().copied(),
+            text => text.parse().ok(),
+        };
+        let unparsed = !app.target_text.trim().is_empty() && typed.is_none();
+        if unparsed {
+            target.on_hover_text(
+                "Not an address and prefix length. Try something like 192.168.1.0/24.",
+            );
+        }
+        app.target = typed;
+
+        // Off the link is worth saying once, plainly, without moralising.
+        if let Some(prefix) = typed
+            && !app.on_link(prefix)
+        {
+            ui.label(
+                RichText::new("not this machine's network")
+                    .size(text::TINY)
+                    .color(p.caution),
+            )
+            .on_hover_text(
+                "Muster will sweep it if you ask. Scanning a network you are \
+                 not responsible for is your decision.",
+            );
+        }
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(metrics::PAD_PANEL);
+            if !app.search.is_empty() && button(ui, p, "Clear", false).clicked() {
+                app.search.clear();
+            }
+            field(ui, p, &mut app.search, 200.0, "Search");
+            ui.label(RichText::new("Filter").size(text::TINY).color(p.text_dim));
+        });
+    });
+    ui.add_space(metrics::S1);
+}
+
+/// A text field, drawn to §7.11 rather than egui's own.
+fn field(
+    ui: &mut egui::Ui,
+    p: Palette,
+    text_of: &mut String,
+    width: f32,
+    placeholder: &str,
+) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(vec2(width, metrics::FIELD), Sense::hover());
+    ui.painter().rect_filled(rect, metrics::RADIUS, p.field);
+    ui.painter().rect_stroke(
+        rect,
+        metrics::RADIUS,
+        Stroke::new(metrics::HAIRLINE, p.line),
+        egui::StrokeKind::Inside,
+    );
+
+    let inner = rect.shrink2(vec2(metrics::S2, 0.0));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    child.add(
+        egui::TextEdit::singleline(text_of)
+            .desired_width(inner.width())
+            .frame(false)
+            .hint_text(RichText::new(placeholder).color(p.placeholder))
+            .font(FontId::proportional(text::CONTROL))
+            .text_color(p.text),
+    )
+}
+
+/// Does `text` match this device?
+///
+/// Matched across everything the row shows — address, name, hardware address,
+/// vendor and kind — because somebody searching a device list is as likely to
+/// be looking for "epson" or "printer" as for an address. Case-insensitive,
+/// substring, and no syntax: a filter box that needs a query language is a
+/// filter box nobody uses.
+fn matches(
+    needle: &str,
+    host: &muster_net::discover::Found,
+    named: Option<&Identity>,
+    kind: muster_net::Kind,
+) -> bool {
+    let needle = needle.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    let mut hay = host.address.to_string();
+    if let Some(mac) = host.mac {
+        hay.push(' ');
+        hay.push_str(&mac.to_string());
+        hay.push(' ');
+        hay.push_str(muster_net::vendor::lookup(mac).label());
+    }
+    if let Some(identity) = named {
+        for name in &identity.names {
+            hay.push(' ');
+            hay.push_str(&name.value);
+        }
+        for service in &identity.services {
+            hay.push(' ');
+            hay.push_str(service);
+        }
+        if let Some(workgroup) = &identity.workgroup {
+            hay.push(' ');
+            hay.push_str(workgroup);
+        }
+    }
+    hay.push(' ');
+    hay.push_str(kind.label());
+    hay.to_ascii_lowercase().contains(&needle)
 }
 
 #[cfg(test)]
