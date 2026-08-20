@@ -54,7 +54,7 @@ use std::time::Duration;
 /// the width §17.3 asks a right-aligned picture to sit at.
 const SHOTS: [(&str, View, [f32; 2], Option<u8>); 5] = [
     ("settings.png", View::Devices, [1400.0, 700.0], Some(0)),
-    ("window.png", View::Devices, [1400.0, 520.0], None),
+    ("window.png", View::Devices, [1400.0, 620.0], None),
     // The detail window, opened on the printer: the device with the most to
     // say about itself, so the picture shows the panel doing its job.
     ("device.png", View::Devices, [1400.0, 520.0], Some(27)),
@@ -258,7 +258,7 @@ fn survey() -> Survey {
 
 /// A finished scan of that network.
 ///
-/// Eleven devices, which is an ordinary house, chosen so the table shows what
+/// Fourteen devices, which is an ordinary house, chosen so the table shows what
 /// the table is for: things that name themselves over mDNS, a Windows machine
 /// only NetBIOS answers for, devices that prove they are there by refusing a
 /// connection rather than accepting one, two with no name at all, and a phone
@@ -342,6 +342,31 @@ fn scan() -> Outcome {
             vec![Evidence::Ping],
             44_200,
         ),
+        // An Epson that says nothing about itself. Its vendor is the whole of
+        // the evidence, which is the case the vendor table exists for: Seiko
+        // Epson's networked products are printers, so the address alone is
+        // enough.
+        (
+            36,
+            [0x00, 0x26, 0xab, 0x51, 0x0d, 0x72],
+            vec![Evidence::Ping],
+            8_600,
+        ),
+        // A speaker, likewise identified by a vendor that makes one thing.
+        (
+            64,
+            [0x00, 0x0e, 0x58, 0x3c, 0x91, 0x0a],
+            vec![Evidence::Ping, Evidence::TcpOpen(1400)],
+            5_400,
+        ),
+        // And a handset from a maker that only makes handsets, which is a
+        // whole category the vendor table could not reach before.
+        (
+            149,
+            [0x00, 0xca, 0xe0, 0x2d, 0x77, 0xb1],
+            vec![Evidence::Ping],
+            33_800,
+        ),
     ];
 
     let found: Vec<Found> = devices
@@ -391,7 +416,19 @@ fn scan() -> Outcome {
         named(&[("iphone-kitchen.local", Source::Mdns)], None, &[]),
         named(&[("NAS-01", Source::NetBios)], Some("WORKGROUP"), &[]),
         Identity::default(),
+        // The Epson, the Sonos and the phone each volunteer nothing: their
+        // hardware vendor is the only thing that names them.
+        Identity::default(),
+        Identity::default(),
+        Identity::default(),
     ];
+
+    // Sorted by address, because the real sweep returns them that way and a
+    // picture in a different order from the application is a picture of
+    // something else. Paired first so a device and its name cannot come apart.
+    let mut paired: Vec<(Found, Identity)> = found.into_iter().zip(names).collect();
+    paired.sort_by_key(|(device, _)| device.address);
+    let (found, names): (Vec<Found>, Vec<Identity>) = paired.into_iter().unzip();
 
     Outcome {
         sweep: Sweep {

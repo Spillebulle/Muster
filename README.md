@@ -85,18 +85,31 @@ those it was.
 is never used as evidence: `HP-Printer` is usually a printer and sometimes
 somebody's desktop, and a name is evidence about whoever set the device up.
 
-## Ports, one device at a time
+## One device, in full
 
-<img src="docs/images/window.png" alt="The device table with a device selected
-and its detail panel open beside it" align="right" width="380">
+<img src="docs/images/device.png" alt="The device window: a printer's kind and
+the reason for it, its address, hardware and vendor, what it advertises, a ping
+button and its open ports" align="right" width="380">
 
-Select a device and a panel opens beside the table: its address, hardware,
-vendor, what it advertises, and a button to scan its ports. Open ports are
-listed with the service usually found on them, which is a convention rather
-than something the device said.
+Click a device and a window opens with everything known about it: what Muster
+thinks it is and why, its address, hardware and vendor, what it advertises, and
+a button to ask it again. Every field has a copy control, because every field
+is something about to be pasted somewhere.
 
-Closed and filtered are counted separately and always. Rolling them together
-into "not open" is the collapse that turns a firewall into a fact.
+Scan its ports from the same window. Open ports are listed with the service
+usually found on them, which is a convention rather than something the device
+said. **Closed and filtered are counted separately and always.** Rolling them
+together into "not open" is the collapse that turns a firewall into a fact.
+
+## Finding things
+
+Devices appear as they answer rather than when the sweep ends, so a large range
+fills as it goes instead of showing nothing for a minute.
+
+The filter matches everything a row shows: address, name, hardware address,
+vendor and kind. Searching `epson`, `printer` or `192.168.1.5` all work. The
+range field takes anything shaped like `10.0.0.0/24`; leave it empty and Muster
+sweeps the network this machine is on and nothing beyond it.
 
 ## A second DHCP server
 
@@ -149,6 +162,19 @@ required, so it works over SSH.
 | `muster scan 10.0.0.0/24` | Sweeps a prefix you name |
 | `muster ports 192.0.2.18` | The ports worth knowing about, on one host |
 | `muster ports 192.0.2.18 1-1024` | A range you name |
+
+## Settings
+
+<img src="docs/images/settings.png" alt="The settings page: theme, interface
+scale and the update switch, with a rail listing General, Scanning and Themes"
+align="right" width="380">
+
+Theme, interface scale, how hard a scan knocks, which ports it tries. Settings
+save as you change them, so there is nothing to confirm and nothing to lose.
+
+Muster reads the same `.umbertheme` files as the rest of the family, so a theme
+made in a sibling application opens here. Put them in the themes folder the
+Themes page names.
 
 ## Conduct
 
