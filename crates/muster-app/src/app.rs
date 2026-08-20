@@ -14,7 +14,7 @@
 use crate::scan::State;
 use crate::theme::{Mode, Palette, metrics, text};
 use crate::update::{Exit, Updates};
-use crate::{deviceicon, dhcpcheck, ports, prefs, updatedlg};
+use crate::{deviceicon, dhcpcheck, ports, prefs, settings, updatedlg};
 use egui::{Align, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 use muster_net::identify::Identity;
 use muster_net::{Prefix, Survey};
@@ -71,6 +71,12 @@ pub struct App {
     target_text: String,
     /// The filter over the device table.
     search: String,
+    /// The settings page, and everything it remembers.
+    settings: settings::State,
+    /// The settings themselves, as loaded and as edited.
+    prefs: prefs::Prefs,
+    /// What the desktop asked for, so `Theme::System` has something to follow.
+    system_mode: Mode,
     /// A re-probe in flight: which device, and where its answer will arrive.
     ping: Option<(
         std::net::IpAddr,
@@ -93,12 +99,18 @@ impl App {
 
         let survey = muster_net::survey();
         let target = survey.default_targets().first().copied();
-        let mode = match cc.egui_ctx.style().visuals.dark_mode {
+        // What the desktop asked for. `Theme::System` follows it; the other
+        // two override it.
+        let system_mode = match cc.egui_ctx.style().visuals.dark_mode {
             true => Mode::Dark,
             false => Mode::Light,
         };
 
         let saved = prefs::load();
+        let mode = saved.theme.resolve(system_mode);
+        // The scale is egui's to hold: setting it marks the font atlas dirty,
+        // so it is set once here and then only when it actually moves.
+        cc.egui_ctx.set_zoom_factor(saved.interface_scale);
         let mut updates = Updates::default();
         updates.check_on_startup = saved.check_on_startup;
         updates.notice_seen = saved.notice_seen;
@@ -122,6 +134,9 @@ impl App {
             mark: None,
             target_text: String::new(),
             search: String::new(),
+            settings: settings::State::default(),
+            prefs: saved.clone(),
+            system_mode,
             ping: None,
             pinged: None,
             updates,
@@ -168,6 +183,9 @@ impl App {
             mark: None,
             target_text: String::new(),
             search: String::new(),
+            settings: settings::State::default(),
+            prefs: prefs::Prefs::default(),
+            system_mode: mode,
             ping: None,
             pinged: None,
             updates,
@@ -234,7 +252,33 @@ impl App {
         }
     }
 
+    /// Open the settings page, for `examples/docs-images.rs`.
+    pub fn open_settings(&mut self) {
+        self.settings.open();
+    }
+
+    /// Open the detail window on one device.
+    ///
+    /// The seam `examples/docs-images.rs` uses to photograph it. Nothing else
+    /// outside this module sets the selection.
+    pub fn select(&mut self, address: std::net::IpAddr) {
+        self.selected = Some(address);
+    }
+
+    /// The theme in force: the chosen file, or the chosen mode, or the
+    /// desktop's.
+    fn theme_mode(&self) -> Mode {
+        self.prefs.theme.resolve(self.system_mode)
+    }
+
+    /// The palette in force, which is a custom theme's table where one is
+    /// chosen and a built-in ladder otherwise.
     fn palette(&self) -> Palette {
+        if let Some(id) = &self.prefs.custom_theme
+            && let Some(custom) = self.settings.themes().iter().find(|t| &t.id == id)
+        {
+            return custom.palette;
+        }
         Palette::of(self.mode)
     }
 
@@ -286,6 +330,21 @@ impl eframe::App for App {
         }
         if self.ports.poll() || self.ports.is_running() {
             ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            // A finished port scan is evidence about the device, so it goes
+            // back into the device rather than staying in the panel. This is
+            // what makes `kind`'s port table reachable at all: the sweep's own
+            // knock only ever tries four ports, and the kind table excludes
+            // exactly those four.
+            if let Some(address) = self.ports.address()
+                && let Some(scan) = self.ports.result_for(address)
+            {
+                let open: Vec<u16> = scan
+                    .hosts
+                    .first()
+                    .map(|h| h.open().collect())
+                    .unwrap_or_default();
+                self.scan.record_open_ports(address, &open);
+            }
         }
         if self.dhcp.poll() || self.dhcp.is_running() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
@@ -304,11 +363,10 @@ impl eframe::App for App {
         // knowing nothing about where settings live.
         if self.updates.last_check != self.saved_last_check {
             self.saved_last_check = self.updates.last_check;
-            prefs::save(prefs::Prefs {
-                check_on_startup: self.updates.check_on_startup,
-                notice_seen: self.updates.notice_seen,
-                last_check: self.updates.last_check,
-            });
+            self.prefs.check_on_startup = self.updates.check_on_startup;
+            self.prefs.notice_seen = self.updates.notice_seen;
+            self.prefs.last_check = self.updates.last_check;
+            prefs::save(&self.prefs);
         }
 
         // An update that has landed asks the window to close, and the two ways
@@ -343,6 +401,32 @@ impl eframe::App for App {
         // not modal and must not sit on top of something that is.
         if view == View::Devices {
             detail_window(ctx, p, self);
+        }
+
+        // The settings page, over the window and under the update dialog.
+        let outcome = settings::show(
+            ctx,
+            p,
+            &mut self.settings,
+            &mut self.prefs,
+            &mut self.updates,
+        );
+        if let Some(scale) = outcome.scale {
+            // Only when it actually differs: `set_zoom_factor` marks the font
+            // atlas dirty, and calling it every frame rebuilds every glyph.
+            if (ctx.zoom_factor() - scale).abs() > f32::EPSILON {
+                ctx.set_zoom_factor(scale);
+            }
+        }
+        if outcome.changed {
+            // The theme is resolved here rather than stored twice: the page
+            // records a *choice*, and what that choice means depends on what
+            // the desktop is doing.
+            self.mode = self.theme_mode();
+            apply(ctx, self.palette());
+            self.updates.check_on_startup = self.prefs.check_on_startup;
+            self.updates.notice_seen = self.prefs.notice_seen;
+            prefs::save(&self.prefs);
         }
 
         // Last, so it draws over everything: the first-run notice, or the
@@ -392,6 +476,11 @@ fn top_bar(ctx: &egui::Context, p: Palette, app: &mut App) {
                 );
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // §6.1 puts a settings gear at the right of the 34 px bar.
+                    if gear_button(ui, p).clicked() {
+                        app.settings.open();
+                    }
+                    ui.add_space(metrics::S2);
                     scan_control(ui, p, app);
                 });
             });
@@ -429,7 +518,7 @@ fn scan_control(ui: &mut egui::Ui, p: Palette, app: &mut App) {
 
 /// A painted button. Not egui's, because the design's controls are drawn to §7
 /// and a stock control is the one thing the style guide refuses outright.
-fn button(ui: &mut egui::Ui, p: Palette, label: &str, enabled: bool) -> egui::Response {
+pub(crate) fn button(ui: &mut egui::Ui, p: Palette, label: &str, enabled: bool) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(
         label.to_string(),
         FontId::proportional(text::CONTROL),
@@ -487,7 +576,12 @@ fn sidebar(ctx: &egui::Context, p: Palette, app: &mut App) {
 /// be getting it wrong everywhere: a **neutral** fill (`control`), **strong**
 /// text, and a small accent bar at the leading edge. An accent *background* is
 /// the thing §2.4 forbids.
-fn nav_row(ui: &mut egui::Ui, p: Palette, label: &str, selected: bool) -> egui::Response {
+pub(crate) fn nav_row(
+    ui: &mut egui::Ui,
+    p: Palette,
+    label: &str,
+    selected: bool,
+) -> egui::Response {
     let size = vec2(ui.available_width(), metrics::NAV_ROW);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
 
@@ -981,77 +1075,16 @@ fn updates_section(ui: &mut egui::Ui, p: Palette, updates: &mut Updates) {
         }
     });
 
+    // **No switch here.** `CLAUDE.md` requires the setting that governs the
+    // check to live in one place, and once the settings page existed, About
+    // having its own copy broke that rule from the inside. What stays is the
+    // status and the command — reporting and doing are not settings.
     ui.add_space(metrics::S2);
-    let mut on = updates.check_on_startup;
-    if checkbox(ui, p, &mut on, "Check when Muster starts") {
-        updates.check_on_startup = on;
-        prefs::save(prefs::Prefs {
-            check_on_startup: updates.check_on_startup,
-            notice_seen: updates.notice_seen,
-            last_check: updates.last_check,
-        });
-    }
-}
-
-/// A tick box, drawn to §7.12. Returns whether it was just changed.
-fn checkbox(ui: &mut egui::Ui, p: Palette, on: &mut bool, label: &str) -> bool {
-    let galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        FontId::proportional(text::CONTROL),
-        p.text,
+    ui.label(
+        RichText::new("Settings, General has the switch for the startup check.")
+            .size(text::TINY)
+            .color(p.text_dim),
     );
-    let box_side = 14.0;
-    let size = vec2(
-        box_side + metrics::S2 + galley.size().x,
-        metrics::ROW_PLAIN.max(box_side),
-    );
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    if response.clicked() {
-        *on = !*on;
-    }
-
-    let square = Rect::from_min_size(
-        pos2(rect.left(), rect.center().y - box_side / 2.0),
-        Vec2::splat(box_side),
-    );
-    ui.painter().rect_filled(
-        square,
-        metrics::RADIUS_TIGHT,
-        if *on { p.accent } else { p.field },
-    );
-    if !*on {
-        ui.painter().rect_stroke(
-            square,
-            metrics::RADIUS_TIGHT,
-            Stroke::new(metrics::HAIRLINE, p.line),
-            egui::StrokeKind::Inside,
-        );
-    } else {
-        // The tick, drawn rather than set in a glyph: two strokes in the ink
-        // that belongs on an accent fill.
-        let c = square.center();
-        let s = box_side * 0.24;
-        ui.painter().line_segment(
-            [pos2(c.x - s, c.y), pos2(c.x - s * 0.2, c.y + s * 0.8)],
-            Stroke::new(1.6_f32, p.accent_ink),
-        );
-        ui.painter().line_segment(
-            [
-                pos2(c.x - s * 0.2, c.y + s * 0.8),
-                pos2(c.x + s, c.y - s * 0.7),
-            ],
-            Stroke::new(1.6_f32, p.accent_ink),
-        );
-    }
-    ui.painter().galley(
-        pos2(
-            square.right() + metrics::S2,
-            rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        p.text,
-    );
-    response.clicked()
 }
 
 fn section(ui: &mut egui::Ui, p: Palette, title: &str) {
@@ -1176,6 +1209,9 @@ pub(crate) fn apply(ctx: &egui::Context, p: Palette) {
     ctx.set_style(style);
 }
 
+/// How wide the device window is.
+const DETAIL_WIDTH: f32 = 320.0;
+
 /// The window for the selected device: what it is, why, and what it offers.
 ///
 /// A floating window rather than a docked panel, which is a change from how
@@ -1206,27 +1242,52 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
         .map(|n| n.value.clone())
         .unwrap_or_else(|| address.to_string());
 
-    egui::Window::new(title)
+    // **No stock chrome.** `title_bar(false)` and our own header: egui's title
+    // bar is another toolkit's control, drawn in another toolkit's colours, and
+    // §16 refuses those outright. It also arrived translucent, so the device
+    // table read straight through the panel.
+    egui::Window::new("device")
         .id(egui::Id::new("device-detail"))
-        .open(&mut open)
+        .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .default_width(320.0)
+        .default_width(DETAIL_WIDTH)
         .frame(
             egui::Frame::NONE
-                .fill(p.popover)
+                // Opaque, and stated: a floating thing over a dense table has
+                // to be readable, and `popover` is the surface §5 puts menus
+                // and floating panels on.
+                .fill(p.popover.to_opaque())
                 .stroke(Stroke::new(metrics::HAIRLINE, p.line_popover))
                 .corner_radius(metrics::RADIUS_MODAL)
                 .inner_margin(egui::Margin::same(metrics::PAD_PANEL as i8))
                 .shadow(egui::epaint::Shadow {
-                    offset: [0, 4],
-                    blur: 16,
+                    offset: [0, 16],
+                    blur: 48,
                     spread: 0,
-                    color: Color32::from_black_alpha(90),
+                    color: Color32::from_black_alpha(178),
                 }),
         )
         .show(ctx, |ui| {
-            ui.set_width(320.0);
+            ui.set_width(DETAIL_WIDTH);
+
+            // Our own header: the name, and a close mark that is an icon
+            // button rather than a letter.
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&title)
+                        .size(text::HEADING)
+                        .color(p.text_strong),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if close_button(ui, p).clicked() {
+                        open = false;
+                    }
+                });
+            });
+            ui.add_space(metrics::S1);
+            hairline_across(ui, p, ui.min_rect().bottom());
+            ui.add_space(metrics::S2);
 
             ui.horizontal(|ui| {
                 let (icon, _) = ui.allocate_exact_size(Vec2::splat(metrics::ROW), Sense::hover());
@@ -1665,7 +1726,7 @@ fn devices_toolbar(ui: &mut egui::Ui, p: Palette, app: &mut App) {
 }
 
 /// A text field, drawn to §7.11 rather than egui's own.
-fn field(
+pub(crate) fn field(
     ui: &mut egui::Ui,
     p: Palette,
     text_of: &mut String,
@@ -1738,6 +1799,63 @@ fn matches(
     hay.push(' ');
     hay.push_str(kind.label());
     hay.to_ascii_lowercase().contains(&needle)
+}
+
+/// A close mark: two strokes, drawn rather than lettered.
+///
+/// §7.5's header ends in one of these, and §11 requires a tooltip on any
+/// icon-only control.
+pub(crate) fn close_button(ui: &mut egui::Ui, p: Palette) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(metrics::ICON), Sense::click());
+    let ink = if response.hovered() {
+        p.text_strong
+    } else {
+        p.text_dim
+    };
+    let arm = rect.shrink(metrics::ICON * 0.28);
+    ui.painter().line_segment(
+        [arm.left_top(), arm.right_bottom()],
+        Stroke::new(1.4_f32, ink),
+    );
+    ui.painter().line_segment(
+        [arm.right_top(), arm.left_bottom()],
+        Stroke::new(1.4_f32, ink),
+    );
+    response
+        .clone()
+        .on_hover_text("Close")
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The settings gear: a ring with teeth, drawn rather than lettered.
+///
+/// Icon-only, so §11 requires the tooltip.
+fn gear_button(ui: &mut egui::Ui, p: Palette) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(metrics::ICON), Sense::click());
+    let ink = if response.hovered() {
+        p.text_strong
+    } else {
+        p.text_muted
+    };
+    let c = rect.center();
+    let r = metrics::ICON * 0.30;
+    ui.painter().circle_stroke(c, r, Stroke::new(1.6_f32, ink));
+    // Six teeth, which reads as a gear at 16 px where eight reads as a blur.
+    for k in 0..6 {
+        let a = std::f32::consts::TAU * k as f32 / 6.0;
+        let (sin, cos) = a.sin_cos();
+        ui.painter().line_segment(
+            [
+                pos2(c.x + cos * r, c.y + sin * r),
+                pos2(c.x + cos * (r + 3.0), c.y + sin * (r + 3.0)),
+            ],
+            Stroke::new(1.6_f32, ink),
+        );
+    }
+    response
+        .clone()
+        .on_hover_text("Settings")
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 #[cfg(test)]

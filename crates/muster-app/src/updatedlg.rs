@@ -380,11 +380,16 @@ fn button(ui: &mut egui::Ui, p: Palette, label: &str, primary: bool) -> egui::Re
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// Write the two settings out. Called wherever an answer changes one of them.
+/// Write the answer to the notice out.
+///
+/// **Read, amend, write**, rather than building a fresh `Prefs`: the file now
+/// carries a dozen settings and constructing one here would write the defaults
+/// over somebody's theme and scale on the way past. The notice is the one thing
+/// this dialog owns.
 fn persist(updates: &Updates) {
-    crate::prefs::save(crate::prefs::Prefs {
-        check_on_startup: updates.check_on_startup,
-        notice_seen: updates.notice_seen,
-        last_check: updates.last_check,
-    });
+    let mut prefs = crate::prefs::load();
+    prefs.check_on_startup = updates.check_on_startup;
+    prefs.notice_seen = updates.notice_seen;
+    prefs.last_check = updates.last_check;
+    crate::prefs::save(&prefs);
 }

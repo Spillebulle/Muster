@@ -17,7 +17,9 @@ pub mod dhcpcheck;
 pub mod ports;
 pub mod prefs;
 pub mod scan;
+pub mod settings;
 pub mod theme;
+pub mod themelib;
 /// Checking for, fetching and installing a new release.
 ///
 /// Public because `examples/make-setup.rs` builds the setup executable with

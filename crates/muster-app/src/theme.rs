@@ -74,6 +74,13 @@ pub mod metrics {
 
 /// The type scale. Four ranks plus the figure size, and never a fifth.
 pub mod text {
+    /// A page heading, which is what a settings pane's title is. §4's rank
+    /// above `HEADING`, and the only place in Muster large enough to want it.
+    pub const PAGE: f32 = 15.0;
+    /// An eyebrow: the small upper-case label over a group of rows. §4 tracks
+    /// it 2 px, which egui cannot express, so it is written down as a
+    /// departure rather than silently drawn wrong.
+    pub const EYEBROW: f32 = 10.0;
     pub const HEADING: f32 = 13.0;
     pub const BODY: f32 = 12.0;
     pub const CONTROL: f32 = 11.5;
@@ -109,6 +116,10 @@ pub struct Palette {
 
     pub control: Color32,
     pub control_hover: Color32,
+    /// The unfilled part of a slider, and the track of a progress bar.
+    pub rail: Color32,
+    /// The knob on a slider or a toggle.
+    pub knob: Color32,
     /// The one accent-tinted neutral in the family, and it must stay the only
     /// one: selection is a neutral fill plus strong text plus a small accent
     /// mark, never an accent background.
@@ -130,8 +141,19 @@ pub struct Palette {
 
     /// State, never decoration.
     pub caution: Color32,
+    /// The tint behind a caution badge, and its edge.
+    pub caution_bg: Color32,
+    pub caution_line: Color32,
     pub good: Color32,
     pub critical: Color32,
+
+    /// The six chart series, in order.
+    ///
+    /// Muster draws no chart yet, and they are here anyway: they are six of the
+    /// twenty-seven keys a `.umbertheme` file carries, so a palette without
+    /// them could not round-trip a theme somebody made in a sibling
+    /// application. See `themelib`.
+    pub series: [Color32; 6],
 }
 
 impl Palette {
@@ -158,6 +180,8 @@ impl Palette {
 
             control: oklch(0.244, 0.006, 271.0),
             control_hover: oklch(0.276, 0.006, 258.0),
+            rail: oklch(0.276, 0.006, 258.0),
+            knob: oklch(0.928, 0.003, 265.0),
             control_active: oklch(0.29, 0.012, ACCENT_H),
             field: oklch(0.195, 0.004, 264.0),
 
@@ -174,8 +198,18 @@ impl Palette {
             accent_ink: oklch(0.182, 0.004, 264.0),
 
             caution: oklch(0.693, 0.096, 38.0),
+            caution_bg: oklch(0.245, 0.023, 42.0),
+            caution_line: oklch(0.424, 0.068, 35.0),
             good: oklch(0.70, 0.10, 145.0),
             critical: oklch(0.66, 0.13, 22.0),
+            series: [
+                Color32::from_rgb(0x3F, 0x7B, 0xE8),
+                Color32::from_rgb(0x46, 0xB0, 0x4A),
+                Color32::from_rgb(0xA9, 0x6B, 0xE8),
+                Color32::from_rgb(0x1F, 0xB5, 0xB5),
+                Color32::from_rgb(0xEE, 0x5A, 0xA8),
+                Color32::from_rgb(0xF0, 0xD5, 0x3C),
+            ],
         }
     }
 
@@ -195,6 +229,8 @@ impl Palette {
 
             control: oklch(0.929, 0.009, 85.0),
             control_hover: oklch(0.896, 0.010, 82.0),
+            rail: oklch(0.890, 0.010, 82.0),
+            knob: Color32::WHITE,
             control_active: oklch(0.909, 0.020, ACCENT_H),
             field: Color32::WHITE,
 
@@ -206,13 +242,30 @@ impl Palette {
 
             // The accent is darkened for a light ground so it still reads
             // against it; the hue and the recipe are the same.
-            accent: oklch(0.55, 0.11, ACCENT_H),
-            accent_dim: oklch(0.70, 0.06, ACCENT_H),
+            //
+            // **These are `tokens.css`'s figures, and four of them had drifted.**
+            // The dark ladder is checked against the style guide by a test and
+            // the light one was not, so `accent` carried chroma 0.11 where the
+            // guide says 0.10, `accent_dim` was a hand-picked pair rather than
+            // the guide's `0.79 0.036`, and caution, good and critical were each
+            // a little off. That is exactly the drift an untested table gets.
+            accent: oklch(0.55, 0.10, ACCENT_H),
+            accent_dim: oklch(0.79, 0.036, ACCENT_H),
             accent_ink: Color32::WHITE,
 
-            caution: oklch(0.55, 0.11, 38.0),
-            good: oklch(0.55, 0.11, 145.0),
-            critical: oklch(0.52, 0.15, 22.0),
+            caution: oklch(0.518, 0.114, 39.0),
+            caution_bg: oklch(0.943, 0.018, 49.0),
+            caution_line: oklch(0.832, 0.042, 51.0),
+            good: oklch(0.50, 0.11, 145.0),
+            critical: oklch(0.50, 0.14, 22.0),
+            series: [
+                Color32::from_rgb(0x2A, 0x5A, 0xB4),
+                Color32::from_rgb(0x2E, 0x7C, 0x33),
+                Color32::from_rgb(0x77, 0x42, 0xAE),
+                Color32::from_rgb(0x13, 0x7F, 0x7F),
+                Color32::from_rgb(0xB0, 0x32, 0x6E),
+                Color32::from_rgb(0x7E, 0x76, 0x0A),
+            ],
         }
     }
 }

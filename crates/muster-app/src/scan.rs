@@ -21,6 +21,7 @@ use muster_net::discover::{self, Found};
 use muster_net::identify::{self, Identity};
 use muster_net::rate::Bucket;
 use muster_net::{Prefix, Survey};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -170,13 +171,27 @@ impl State {
                         moved = true;
                         break;
                     }
-                    // Disconnected without a result means the thread died. The
-                    // scan is over either way and the window must not wait for
-                    // ever; an empty outcome is not invented here, so the state
-                    // simply returns to idle.
+                    // Disconnected without a result means the thread died,
+                    // which can only be a panic in it.
+                    //
+                    // **This must return to idle, and for a while it said so
+                    // and did not.** The comment here described the behaviour
+                    // and the code only broke out of the loop, leaving `self`
+                    // in `Running`: the bar sat at "Sweeping n of m" for ever,
+                    // Stop did nothing anybody could see, the Scan button stayed
+                    // unreachable because `scan_control` returns early while a
+                    // scan is running, and the window asked for a repaint every
+                    // 60 ms for the rest of the session. `ports.rs` and
+                    // `dhcpcheck.rs` both handle this correctly, which is what
+                    // makes the omission plainly accidental rather than a
+                    // decision.
+                    //
+                    // No outcome is invented: idle is "no scan", which is what
+                    // is true, where an empty `Finished` would claim the network
+                    // was swept and found nothing.
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        moved = true;
-                        break;
+                        *self = Self::Idle;
+                        return true;
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 }
@@ -208,6 +223,38 @@ impl State {
             Self::Finished(o) => &o.sweep.found,
             Self::Running { devices, .. } => devices,
             Self::Idle => &[],
+        }
+    }
+
+    /// Record what a port scan found, so identification can use it.
+    ///
+    /// **Without this the port half of `kind::identify` is dead code.** The
+    /// only producer of `Evidence::TcpOpen` in the engine is the sweep's knock,
+    /// which tries 80, 443, 22 and 445 — and `kind`'s port table deliberately
+    /// excludes exactly those four, because they are on everything and name
+    /// nothing. So the ports that *do* name a kind (9100 a printer, 32400 a
+    /// Plex server, 554 a camera) were never in the evidence a guess was made
+    /// from, and a device stayed `Unknown` even after the user had run a port
+    /// scan and could see 9100 open in the panel.
+    ///
+    /// Folding the result back into the device's own evidence is what closes
+    /// that, and it keeps the existing rule intact: the guess is still made
+    /// from evidence attached to the device, and the row's tooltip still names
+    /// the clue.
+    pub fn record_open_ports(&mut self, address: IpAddr, open: &[u16]) {
+        let devices = match self {
+            Self::Finished(outcome) => &mut outcome.sweep.found,
+            Self::Running { devices, .. } => devices,
+            Self::Idle => return,
+        };
+        let Some(device) = devices.iter_mut().find(|d| d.address == address) else {
+            return;
+        };
+        for port in open {
+            let evidence = muster_net::discover::Evidence::TcpOpen(*port);
+            if !device.evidence.contains(&evidence) {
+                device.evidence.push(evidence);
+            }
         }
     }
 
