@@ -65,6 +65,11 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.0.7" date="2026-08-20">
+      <description>
+        <p>A settings page with themes and scale, live scan results, a filter, per-device windows, and much wider device identification.</p>
+      </description>
+    </release>
     <release version="0.0.6" date="2026-08-20">
       <description>
         <p>The update check no longer spends GitHub's hourly rate limit, and its messages read properly.</p>

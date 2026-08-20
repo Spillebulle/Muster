@@ -23,14 +23,13 @@ use super::procfs;
 use crate::discover::{Capabilities, Outcome, Transport};
 use crate::mac::MacAddr;
 use crate::prefix::Prefix;
-use crate::sysinfo::{
-    IfAddr, IfFlags, Interface, LinkKind, Neighbour, NeighbourState, Route, SystemProbe,
-};
+use crate::sysinfo::{IfAddr, IfFlags, Interface, LinkKind, Neighbour, Route, SystemProbe};
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -134,7 +133,7 @@ impl Transport for Host {
         // out is most of a sweep.
         let deadline = Instant::now() + timeout;
         loop {
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(procfs::ARP_SNAPSHOT_TTL);
             if let Some(mac) = arp_cache(addr)? {
                 return Ok(Some(mac));
             }
@@ -146,6 +145,14 @@ impl Transport for Host {
 
     fn ping(&self, addr: IpAddr, timeout: Duration) -> io::Result<Option<Duration>> {
         let IpAddr::V4(v4) = addr else {
+            // A v6 echo is a ping socket of its own (`AF_INET6`,
+            // `IPPROTO_ICMPV6`) and a different header, and it is not written.
+            // This is reached: `Prefix::hosts` gates on the size of a prefix
+            // rather than on its family, so a /112 or longer is walked address
+            // by address. `Capabilities` has no family axis to say so in
+            // advance, so the error is what carries it, and `discover` puts it
+            // in `Sweep::not_done` rather than letting every v6 address read as
+            // a silent host.
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "IPv6 echo is not implemented",
@@ -159,14 +166,28 @@ impl Transport for Host {
     }
 }
 
+/// The one snapshot of `/proc/net/arp` the whole process shares.
+///
+/// A `static` because `Host` is a unit struct that callers construct freshly
+/// wherever they need one, and the thing being shared is a reading of the
+/// machine rather than anything a `Host` owns. One process, one kernel table,
+/// one copy of it.
+static ARP_TABLE: LazyLock<procfs::ArpSnapshot> =
+    LazyLock::new(|| procfs::ArpSnapshot::new(procfs::ARP_SNAPSHOT_TTL));
+
 /// Looks one address up in the kernel's ARP table, ignoring entries that are
 /// only a record of a question nobody answered.
+///
+/// **Through a shared snapshot, not a fresh read.** Written the obvious way
+/// this was `read_to_string` plus a parse of the whole table for one address,
+/// called by every worker every five milliseconds: a mostly empty /24 with 256
+/// workers issued some fifteen thousand whole-table reads, and the cost grew
+/// with the square of the address count. The answer is the same one; see
+/// `procfs::ArpSnapshot`.
 fn arp_cache(addr: Ipv4Addr) -> io::Result<Option<MacAddr>> {
-    let text = std::fs::read_to_string("/proc/net/arp")?;
-    Ok(procfs::neighbours_v4(&text).into_iter().find_map(|(_, n)| {
-        (n.address == IpAddr::V4(addr) && n.state != NeighbourState::Incomplete && !n.mac.is_zero())
-            .then_some(n.mac)
-    }))
+    ARP_TABLE.lookup(addr, Instant::now(), || {
+        std::fs::read_to_string("/proc/net/arp")
+    })
 }
 
 /// Opens a ping socket, or reports why not.

@@ -14,6 +14,23 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
+/// The receive buffer, which is one whole datagram's worth.
+///
+/// It was 4 KiB, on the reasoning that a longer reply is a service list nothing
+/// is going to display and that a truncated datagram parses as far as it goes.
+/// That reasoning holds on Linux, where the kernel truncates and reports the
+/// bytes it copied. **It does not hold on Windows**, where an oversized
+/// datagram fails the receive with `WSAEMSGSIZE` instead — so a device with a
+/// long mDNS service list was identified on one platform and not on the other,
+/// and the difference was invisible because the error looked like any other
+/// timeout. A buffer as large as UDP can carry is what makes the two platforms
+/// agree; [`WSAEMSGSIZE`] below is the belt to its braces.
+const RECV_BUFFER: usize = 65_536;
+
+/// `WSAEMSGSIZE`. Named by number because it has no `io::ErrorKind` of its own
+/// and is a no-op on every other platform.
+const WSAEMSGSIZE: i32 = 10040;
+
 /// The exchange. Held by `Host` so callers have one type to pass around.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Udp;
@@ -31,13 +48,23 @@ impl Ask for Udp {
         socket.set_read_timeout(Some(timeout))?;
         socket.send_to(payload, to)?;
 
-        // 4 KiB holds any reply worth reading here. A device sending more is
-        // sending a service list longer than anything is going to display, and
-        // a truncated datagram parses as far as it goes.
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; RECV_BUFFER];
         let deadline = Instant::now() + timeout;
         loop {
-            let (n, from) = socket.recv_from(&mut buf)?;
+            let (n, from) = match socket.recv_from(&mut buf) {
+                Ok(got) => got,
+                // A datagram longer than the buffer. Windows reports this as a
+                // failure *after* filling the buffer, and the sender it filled
+                // in is thrown away with the return value, so the reply cannot
+                // be attributed. That is why the buffer is a whole datagram
+                // wide: nothing a device can put on a UDP socket reaches here,
+                // and the arm exists so that if something ever does it is a
+                // partial parse rather than a device that identifies as
+                // nothing. What arrived is what was asked for as far as
+                // anything can tell, and the alternative is discarding it.
+                Err(e) if e.raw_os_error() == Some(WSAEMSGSIZE) => (buf.len(), to),
+                Err(e) => return Err(e),
+            };
             // The socket is unconnected, so anything on the network can send to
             // it. Only the address that was asked gets to answer: otherwise a
             // device could name its neighbour.

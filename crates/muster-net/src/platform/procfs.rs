@@ -22,7 +22,11 @@
 use crate::mac::MacAddr;
 use crate::prefix::Prefix;
 use crate::sysinfo::{Neighbour, NeighbourState, Route};
+use std::collections::BTreeMap;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 /// `RTF_UP`, and the flag that says an entry carries a gateway.
 const RTF_UP: u32 = 0x0001;
@@ -169,6 +173,101 @@ pub fn neighbours_v4(text: &str) -> Vec<(String, Neighbour)> {
     out
 }
 
+/// How long a snapshot of the neighbour table is worth reusing.
+///
+/// The sweep polls for a provoked entry every five milliseconds, so a snapshot
+/// that lasts that long is one read per poll for the whole prefix instead of
+/// one per address.
+pub const ARP_SNAPSHOT_TTL: Duration = Duration::from_millis(5);
+
+/// One shared, short-lived reading of the kernel's neighbour table.
+///
+/// **This exists because the obvious implementation is quadratic.** The
+/// unprivileged Linux ARP provokes the kernel into resolving an address and
+/// then waits for the answer to appear in `/proc/net/arp`; written per address
+/// that is a whole-file read and a whole-table parse every five milliseconds,
+/// per address, per worker. With 256 workers and a 300 ms budget a mostly empty
+/// /24 issued on the order of fifteen thousand reads of the same file, some
+/// fifty thousand a second, and the cost grew with the square of the address
+/// count. All 256 workers want the identical file at the identical moment, so
+/// they take one copy of it.
+///
+/// The clock and the reader are both arguments, which is what lets this be
+/// tested on a machine with no `/proc` at all — the same rule the rest of this
+/// module follows.
+#[derive(Debug)]
+pub struct ArpSnapshot {
+    ttl: Duration,
+    held: RwLock<Held>,
+}
+
+#[derive(Debug, Default)]
+struct Held {
+    /// When the text was read. `None` before the first read.
+    taken: Option<Instant>,
+    /// Only the entries that are evidence: an incomplete entry is the record
+    /// of a question nobody answered, and a zero address is not a device.
+    entries: BTreeMap<Ipv4Addr, MacAddr>,
+}
+
+impl ArpSnapshot {
+    pub const fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            held: RwLock::new(Held {
+                taken: None,
+                entries: BTreeMap::new(),
+            }),
+        }
+    }
+
+    /// Looks one address up, re-reading the table first where the snapshot has
+    /// expired.
+    ///
+    /// `read` is called at most once per TTL however many callers arrive: the
+    /// refresh happens under the write lock, and a caller that waited for it
+    /// re-checks the age rather than reading again. Serialising the workers on
+    /// one read is the point, not a cost.
+    pub fn lookup<R>(&self, addr: Ipv4Addr, now: Instant, read: R) -> io::Result<Option<MacAddr>>
+    where
+        R: FnOnce() -> io::Result<String>,
+    {
+        {
+            let held = self.held.read().unwrap_or_else(|e| e.into_inner());
+            if held.fresh_at(now, self.ttl) {
+                return Ok(held.entries.get(&addr).copied());
+            }
+        }
+
+        let mut held = self.held.write().unwrap_or_else(|e| e.into_inner());
+        // Another worker may have refreshed it while this one waited for the
+        // lock, which is the ordinary case with 256 of them.
+        if held.fresh_at(now, self.ttl) {
+            return Ok(held.entries.get(&addr).copied());
+        }
+
+        let text = read()?;
+        held.entries = neighbours_v4(&text)
+            .into_iter()
+            .filter_map(|(_, n)| match n.address {
+                IpAddr::V4(a) if n.state != NeighbourState::Incomplete && !n.mac.is_zero() => {
+                    Some((a, n.mac))
+                }
+                _ => None,
+            })
+            .collect();
+        held.taken = Some(now);
+        Ok(held.entries.get(&addr).copied())
+    }
+}
+
+impl Held {
+    fn fresh_at(&self, now: Instant, ttl: Duration) -> bool {
+        self.taken
+            .is_some_and(|taken| now.saturating_duration_since(taken) < ttl)
+    }
+}
+
 /// `/etc/resolv.conf`, or what `resolvectl` writes into it.
 ///
 /// `127.0.0.53` is kept rather than filtered: it is `systemd-resolved`, it is
@@ -204,6 +303,155 @@ pub fn lease_server(text: &str) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The table as the kernel writes it: one answered entry, one entry that is
+    /// only the record of an unanswered question.
+    const ARP_TABLE: &str = "\
+IP address       HW type     Flags       HW address            Mask     Device
+192.168.1.1      0x1         0x2         3c:22:fb:aa:bb:cc     *        wlan0
+192.168.1.9      0x1         0x0         00:00:00:00:00:00     *        wlan0
+";
+
+    fn at(base: Instant, millis: u64) -> Instant {
+        base + Duration::from_millis(millis)
+    }
+
+    /// The reading itself, unchanged by the caching: an answered entry is a
+    /// hardware address and an incomplete one is not a device.
+    #[test]
+    fn the_snapshot_answers_exactly_what_a_fresh_read_would() {
+        let snap = ArpSnapshot::new(ARP_SNAPSHOT_TTL);
+        let now = Instant::now();
+        let read = || Ok(ARP_TABLE.to_string());
+
+        assert_eq!(
+            snap.lookup("192.168.1.1".parse().unwrap(), now, read)
+                .unwrap(),
+            Some("3c:22:fb:aa:bb:cc".parse().unwrap())
+        );
+        assert_eq!(
+            snap.lookup("192.168.1.9".parse().unwrap(), now, read)
+                .unwrap(),
+            None,
+            "an entry nothing answered is not a device"
+        );
+        assert_eq!(
+            snap.lookup("192.168.1.55".parse().unwrap(), now, read)
+                .unwrap(),
+            None
+        );
+    }
+
+    /// The defect this type exists for. Every address in a /24 asking at the
+    /// same moment reads the file once, not 254 times.
+    #[test]
+    fn a_whole_prefix_asking_at_once_reads_the_table_once() {
+        let snap = ArpSnapshot::new(ARP_SNAPSHOT_TTL);
+        let reads = AtomicU64::new(0);
+        let now = Instant::now();
+
+        for i in 1..=254u8 {
+            let addr = Ipv4Addr::new(192, 168, 1, i);
+            snap.lookup(addr, now, || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok(ARP_TABLE.to_string())
+            })
+            .unwrap();
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    /// And it is still a *snapshot*: past the TTL the next caller re-reads, so
+    /// an address that has only just answered is found.
+    #[test]
+    fn an_expired_snapshot_is_read_again() {
+        let snap = ArpSnapshot::new(Duration::from_millis(5));
+        let base = Instant::now();
+        let addr: Ipv4Addr = "192.168.1.1".parse().unwrap();
+
+        assert_eq!(snap.lookup(addr, base, || Ok(String::new())).unwrap(), None);
+        // Inside the window the empty reading stands, whatever the file says.
+        assert_eq!(
+            snap.lookup(addr, at(base, 4), || Ok(ARP_TABLE.to_string()))
+                .unwrap(),
+            None
+        );
+        // Past it, the answer arrives.
+        assert_eq!(
+            snap.lookup(addr, at(base, 5), || Ok(ARP_TABLE.to_string()))
+                .unwrap(),
+            Some("3c:22:fb:aa:bb:cc".parse().unwrap())
+        );
+    }
+
+    /// A read that failed is an error rather than an empty table. Caching the
+    /// failure would turn one unreadable moment into a prefix of addresses that
+    /// look settled, which is the rule `CLAUDE.md` is built on.
+    #[test]
+    fn a_failed_read_is_not_cached_as_an_empty_table() {
+        let snap = ArpSnapshot::new(ARP_SNAPSHOT_TTL);
+        let now = Instant::now();
+        let addr: Ipv4Addr = "192.168.1.1".parse().unwrap();
+
+        let e = snap
+            .lookup(addr, now, || Err(io::Error::other("no /proc here")))
+            .expect_err("the failure is reported");
+        assert_eq!(e.to_string(), "no /proc here");
+
+        assert_eq!(
+            snap.lookup(addr, now, || Ok(ARP_TABLE.to_string()))
+                .unwrap(),
+            Some("3c:22:fb:aa:bb:cc".parse().unwrap()),
+            "and the next caller reads for itself"
+        );
+    }
+
+    /// Every worker in a sweep shares one snapshot, so the concurrent case is
+    /// the normal case.
+    #[test]
+    fn workers_sharing_a_snapshot_still_get_the_right_answer() {
+        let snap = ArpSnapshot::new(Duration::from_secs(3600));
+        let reads = AtomicU64::new(0);
+        let now = Instant::now();
+
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    for i in 1..=64u8 {
+                        let got = snap
+                            .lookup(Ipv4Addr::new(192, 168, 1, i), now, || {
+                                reads.fetch_add(1, Ordering::SeqCst);
+                                Ok(ARP_TABLE.to_string())
+                            })
+                            .unwrap();
+                        assert_eq!(got.is_some(), i == 1);
+                    }
+                });
+            }
+        });
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "one read, sixteen threads");
+    }
+
+    /// The reader is called at most once per window even when the caller keeps
+    /// asking, which is what the sweep's five millisecond poll relies on.
+    #[test]
+    fn the_reader_runs_once_per_window_however_often_it_is_asked() {
+        let snap = ArpSnapshot::new(Duration::from_millis(5));
+        let base = Instant::now();
+        let reads = Cell::new(0u32);
+        let addr: Ipv4Addr = "192.168.1.1".parse().unwrap();
+
+        for step in 0..20u64 {
+            let _ = snap.lookup(addr, at(base, step), || {
+                reads.set(reads.get() + 1);
+                Ok(ARP_TABLE.to_string())
+            });
+        }
+        assert_eq!(reads.get(), 4, "twenty milliseconds is four windows");
+    }
+
     use super::*;
 
     /// A laptop on a home network, wired and with a VPN up. Real output shape,

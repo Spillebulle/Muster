@@ -186,9 +186,11 @@ fn scan(target: Option<&str>) {
     let live = std::io::stderr().is_terminal();
 
     // Ctrl-C cancels rather than killing, so a sweep stopped halfway still
-    // prints what it found and says that it stopped.
-    {
-        let _ = ctrl_c(Arc::clone(&cancel));
+    // prints what it found and says that it stopped. Where the handler could
+    // not be installed the scan still runs, and the user is told what Ctrl-C
+    // will cost rather than finding out by pressing it.
+    if !ctrl_c(Arc::clone(&cancel)) && live {
+        eprintln!("  Note: Ctrl-C will end this scan without printing what it found.");
     }
 
     for prefix in prefixes {
@@ -447,10 +449,66 @@ pub fn ctrl_c(flag: Arc<AtomicBool>) -> bool {
     ok != 0
 }
 
-/// No handler on this platform yet, so Ctrl-C ends the process and the findings
-/// with it. Saying so here rather than silently doing nothing is what keeps the
-/// gap visible when the Unix side is written.
-#[cfg(not(windows))]
+/// The same thing on Unix, through `signal`.
+///
+/// This is the platform most likely to be used from a terminal, and until this
+/// existed Ctrl-C killed `muster scan` outright and took the findings with it,
+/// while Windows stopped politely and printed a partial table. The same command
+/// on two platforms must not answer a keystroke differently.
+///
+/// No dependency for it: `signal` is one symbol out of the C library that every
+/// Rust binary on Unix already links, so it is declared here rather than
+/// pulling `libc` into a crate that otherwise needs none of it.
+///
+/// What a handler may do is the constraint that shapes the rest. It runs
+/// between two instructions of whatever the process was doing, so it may not
+/// allocate, may not lock and may not print — one atomic store is the whole of
+/// it, and the scan notices at its next probe. `OnceLock::get` on an already
+/// set cell and dereferencing the `Arc` inside it are both plain loads, which
+/// is why the flag can be reached at all without a capture.
+#[cfg(unix)]
+#[must_use]
+pub fn ctrl_c(flag: Arc<AtomicBool>) -> bool {
+    use std::sync::OnceLock;
+    use std::sync::atomic::Ordering;
+
+    // The same shape as the Windows handler above, and for the same reason: a
+    // signal handler is a bare `extern "C" fn` with nowhere to put a capture.
+    static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    if FLAG.set(flag).is_err() {
+        return false;
+    }
+
+    extern "C" fn on_signal(_signum: i32) {
+        if let Some(flag) = FLAG.get() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // The handler is declared as a function *pointer* rather than as a word,
+    // so that passing `on_signal` needs no cast: casting a function item
+    // straight to an integer is a lint, and `-D warnings` makes a lint a
+    // broken build on the platform this code only compiles for.
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+    }
+    // 2 on every Unix Muster targets, and it has been 2 since the seventh
+    // edition. Written out rather than taken from a crate.
+    const SIGINT: i32 = 2;
+    // `SIG_ERR` is `(void(*)(int))-1` rather than a null, which is why the
+    // failure test is against `usize::MAX` and not against zero: zero is
+    // `SIG_DFL`, a perfectly ordinary previous handler.
+    const SIG_ERR: usize = usize::MAX;
+
+    // SAFETY: the signal number is valid and `on_signal` has the signature the
+    // C library requires of a handler.
+    unsafe { signal(SIGINT, on_signal) != SIG_ERR }
+}
+
+/// Neither Windows nor Unix, so Ctrl-C ends the process and the findings with
+/// it. Saying so here rather than silently doing nothing is what keeps the gap
+/// visible.
+#[cfg(not(any(windows, unix)))]
 #[must_use]
 pub fn ctrl_c(_flag: Arc<AtomicBool>) -> bool {
     false

@@ -18,6 +18,7 @@
 //! suite that takes minutes and a limiter nobody re-tests after changing.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Probes per second the default scan is willing to send.
@@ -33,6 +34,13 @@ pub const DEFAULT_RATE: u32 = 1_000;
 /// One breath's worth of a /24. Larger and a sweep arrives as a single burst
 /// that looks exactly like the thing storm control exists to stop.
 pub const DEFAULT_BURST: u32 = 256;
+
+/// The longest a cancellable wait sleeps without looking at the flag.
+///
+/// Short enough that Stop is felt as immediate and long enough that a slow
+/// rate is not a spin loop: a one-per-second bucket wakes fifty times over a
+/// wait instead of once, which is nothing beside the packet it is not sending.
+const CANCEL_TICK: Duration = Duration::from_millis(20);
 
 /// Where the current time comes from. Real time in the application, a counter
 /// in the tests.
@@ -125,6 +133,38 @@ impl Bucket {
         if !delay.is_zero() {
             std::thread::sleep(delay);
         }
+    }
+
+    /// The same wait, given up on when `cancel` is set. Answers **false** when
+    /// the caller must not send.
+    ///
+    /// `CLAUDE.md` asks that cancelling take effect at the next packet rather
+    /// than at the end of a phase, and an uninterruptible sleep is how that
+    /// rule gets broken without anybody writing it down: at a slow rate one
+    /// wait is seconds long, and a sweep with hundreds of workers in it can go
+    /// on sending for as long again after the user has pressed Stop. So the
+    /// sleep is in slices and the flag is read between them, and it is read
+    /// once *before* the budget is taken so that a cancelled scan sends
+    /// nothing more at all.
+    ///
+    /// The budget is still charged when the answer is false, exactly as
+    /// [`Bucket::take`] documents: a charge that is not spent costs the next
+    /// scan one token and keeps the rate honest across threads, which is the
+    /// side to err on.
+    pub fn wait_unless(&self, cancel: &AtomicBool) -> bool {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut left = self.take();
+        while !left.is_zero() {
+            let slice = left.min(CANCEL_TICK);
+            std::thread::sleep(slice);
+            left -= slice;
+            if cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn rate(&self) -> u32 {
@@ -234,6 +274,53 @@ mod tests {
             b.take() >= Duration::from_millis(900),
             "then a second a probe"
         );
+    }
+
+    /// The rule cancelling depends on: a wait that cannot be interrupted is a
+    /// scan that keeps sending after Stop.
+    #[test]
+    fn a_cancelled_wait_gives_up_long_before_the_delay_is_over() {
+        // A real clock and a real sleep, because the thing under test *is* the
+        // sleep. One per second with a burst of one, so the second probe is
+        // told to wait a whole second.
+        let b = Bucket::with_clock(1, 1, Box::new(SystemClock));
+        assert!(b.wait_unless(&AtomicBool::new(false)), "the burst token");
+
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(30));
+                cancel.store(true, Ordering::SeqCst);
+            });
+            assert!(!b.wait_unless(&cancel), "cancelled, so do not send");
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "waited {:?} of a one second delay",
+            started.elapsed()
+        );
+    }
+
+    /// And the flag is read before the budget is spent, so a scan already
+    /// stopped sends nothing more at all.
+    #[test]
+    fn an_already_cancelled_wait_sends_nothing_and_returns_at_once() {
+        let b = Bucket::new(1_000);
+        let cancel = AtomicBool::new(true);
+        let started = Instant::now();
+        assert!(!b.wait_unless(&cancel));
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn an_uncancelled_wait_still_hands_out_the_burst() {
+        let clock = Fake::new();
+        let b = Bucket::with_clock(1_000, 4, Box::new(clock.clone()));
+        let go = AtomicBool::new(false);
+        for i in 0..4 {
+            assert!(b.wait_unless(&go), "probe {i} is inside the burst");
+        }
     }
 
     /// Two threads asking at the same moment must be charged twice.
