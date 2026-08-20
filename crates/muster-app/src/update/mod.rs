@@ -259,6 +259,27 @@ impl Updates {
     /// taking one message: a burst of download progress collapses into the
     /// newest reading, which is the only one worth drawing.
     pub fn poll(&mut self, now: Instant) {
+        // **The countdown is read here, before the inbox, and that order is the
+        // whole of the fix.** `Flow::due` was written, tested and then called by
+        // nothing, so the completion screen counted 5, 4, 3, 2, 1 and sat there:
+        // the model knew the wait was over and no one asked it.
+        //
+        // Before the early return below, because by the time a countdown is
+        // running the job that started it has already reported `Installed` and
+        // dropped its receiver — so `inbox` is `None` for every frame the
+        // countdown is on screen, and anything after that return would never
+        // run at all.
+        if let Some(outcome) = self.flow.as_ref().and_then(|flow| flow.due(now)) {
+            self.request_exit(match outcome {
+                // The binary is already swapped, so this process can start the
+                // new one on its way out.
+                Applied::Restart => Exit::Restart,
+                // Windows Installer is waiting for this process to go, and
+                // starts the new version itself.
+                Applied::Installer => Exit::Quit,
+            });
+        }
+
         let Some(inbox) = self.inbox.take() else {
             return;
         };
@@ -821,19 +842,36 @@ pub fn open_in_browser(url: &str) {
         log::warn!("refusing to open {url}: not https");
         return;
     }
-    let result = if cfg!(target_os = "windows") {
-        // Through `cmd /c start` because Windows has no "open this" binary, and
-        // the empty argument is `start`'s window title — without it, a quoted
-        // URL is taken *as* the title and nothing opens.
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
-            .spawn()
-    } else {
-        std::process::Command::new("xdg-open").arg(url).spawn()
-    };
+    let result = open_with_the_platform(url);
     if let Err(e) = result {
         log::warn!("could not open {url}: {e}");
     }
+}
+
+/// Hand a URL to the platform, without a console window coming with it.
+///
+/// `cmd /c start` because Windows has no "open this" binary, and the empty
+/// argument is `start`'s window title: without it a quoted URL is taken *as*
+/// the title and nothing opens.
+///
+/// **`CREATE_NO_WINDOW` is what stops a console flashing up.** `cmd` is a
+/// console application, and since Muster declares the windows subsystem it has
+/// no console of its own for a child to inherit — so Windows makes one, and it
+/// is visible. This did not happen while Muster was a console application,
+/// which is exactly the kind of defect that arrives with the fix for another
+/// one.
+#[cfg(windows)]
+fn open_with_the_platform(url: &str) -> std::io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .spawn()
+}
+
+#[cfg(not(windows))]
+fn open_with_the_platform(url: &str) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("xdg-open").arg(url).spawn()
 }
 
 // ---------------------------------------------------------------------------
@@ -1050,6 +1088,92 @@ mod tests {
 
         updates.request_exit(Exit::Restart);
         assert_eq!(updates.take_exit_request(), Some(Exit::Restart));
+    }
+
+    /// An update that has just landed, with its countdown running from `now`.
+    ///
+    /// Built here rather than through `Updates::demo`, which is
+    /// `#[cfg(debug_assertions)]` for the rehearsal menu: a test that depended
+    /// on it would stop compiling under `cargo test --release`.
+    fn just_finished(updates: &mut Updates, outcome: Applied, now: Instant) {
+        let release = Release {
+            version: Version::parse("9.9.9").expect("a well-formed version"),
+            tag: "v9.9.9".to_string(),
+            page: RELEASES_PAGE.to_string(),
+            notes: String::new(),
+            assets: Vec::new(),
+        };
+        let mut flow = Flow::offering(release);
+        flow.begin();
+        flow.finished(outcome, now);
+        updates.flow = Some(flow);
+    }
+
+    /// The bug 0.0.4 shipped: the countdown ran out and nothing happened.
+    ///
+    /// `Flow::due` was written and tested, and then called by no one, so the
+    /// completion screen counted down to zero and sat there for ever. The
+    /// countdown is a model with no way to act on its own; this is the thing
+    /// that reads it.
+    #[test]
+    fn a_countdown_that_has_run_out_asks_the_window_to_close() {
+        let start = Instant::now();
+        for (outcome, expected) in [
+            // A swapped binary: this process can start the new one on its way
+            // out.
+            (Applied::Restart, Exit::Restart),
+            // Windows Installer wants Muster gone and starts it itself.
+            (Applied::Installer, Exit::Quit),
+        ] {
+            let mut updates = Updates::default();
+            just_finished(&mut updates, outcome, start);
+
+            updates.poll(start);
+            assert_eq!(
+                updates.take_exit_request(),
+                None,
+                "nothing closes while the countdown is still running"
+            );
+
+            updates.poll(start + flow::RESTART_DELAY);
+            assert_eq!(
+                updates.take_exit_request(),
+                Some(expected),
+                "once the wait is over, the window is asked to close"
+            );
+        }
+    }
+
+    /// **The early return this fix had to be placed above.**
+    ///
+    /// By the time a countdown is on screen, the job that started it has
+    /// reported `Installed` and its receiver has been dropped, so `inbox` is
+    /// `None` on every one of those frames. A countdown check written after the
+    /// inbox was taken would never run at all, which is exactly how the first
+    /// version of this went wrong.
+    #[test]
+    fn the_countdown_is_read_even_though_no_job_is_left_to_report() {
+        let start = Instant::now();
+        let mut updates = Updates::default();
+        just_finished(&mut updates, Applied::Restart, start);
+        assert!(
+            updates.inbox.is_none(),
+            "the premise: a finished update has no job left"
+        );
+        updates.poll(start + flow::RESTART_DELAY);
+        assert_eq!(updates.take_exit_request(), Some(Exit::Restart));
+    }
+
+    /// Cancel means cancel. A stopped countdown never becomes due, so the
+    /// window is never asked to close behind the user's back.
+    #[test]
+    fn a_cancelled_countdown_never_closes_the_window() {
+        let start = Instant::now();
+        let mut updates = Updates::default();
+        just_finished(&mut updates, Applied::Restart, start);
+        updates.cancel_countdown();
+        updates.poll(start + flow::RESTART_DELAY * 10);
+        assert_eq!(updates.take_exit_request(), None);
     }
 
     #[test]
