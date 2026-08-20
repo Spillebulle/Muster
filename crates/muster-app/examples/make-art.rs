@@ -22,11 +22,12 @@
 //!   a bold gets the Regular master back without complaint. `skrifa` applies
 //!   them, which is why it is here for one string. This is the same reason
 //!   Umber's splash carries it.
-//! * **The cap height is the mark's side, not the em.** §17.4 puts the mark
-//!   beside the wordmark, and the two read as one object only if the letters'
-//!   flat tops line up with the square's. Setting the point size and hoping
-//!   gets it wrong by the font's ascender, which is about a third of the height
-//!   too much.
+//! * **The wordmark is sized by its cap height, not by the em.** §17.4 puts
+//!   the mark beside the wordmark, and the two read as one object only if the
+//!   letters are set against the square's own measure. Setting the point size
+//!   and hoping gets it wrong by the font's ascender, which is about a third of
+//!   the height too much. The mark then takes [`MARK_PER_CAP`] of that cap and
+//!   the two are centred on one line.
 
 use ab_glyph_rasterizer::{Point, Rasterizer, point};
 use muster_app::art::{Image, mark};
@@ -113,7 +114,18 @@ const SIDEBAR_GAP: f32 = 22.0;
 /// Tracking, in pixels, at a 64 px em. Negative: the wordmark is set tight.
 const TRACKING_AT_64: f32 = -2.0;
 
-/// The space between the mark and the first letter, as a fraction of the mark.
+/// The mark's side, as a multiple of the wordmark's cap height.
+///
+/// Not one. A square exactly as tall as the caps reads as *smaller* than them,
+/// because the letters carry overshoot on their round tops and the eye measures
+/// a solid block against a row of strokes. Umber's banner sets the mark a sixth
+/// again over the caps and every repository in the family follows it, so the
+/// number is here rather than in the two places that lay the row out.
+const MARK_PER_CAP: f32 = 1.2;
+
+/// The space between the mark and the first letter, as a fraction of the cap
+/// height. Of the cap rather than of the mark, so that making the mark taller
+/// moves the mark alone and not the air beside it.
 const GAP_FRACTION: f32 = 0.46;
 
 /// How much of the banner's width the mark and wordmark together may occupy.
@@ -176,14 +188,17 @@ fn banner(width: u32, height: u32, palette: Palette) -> Image {
     // calculation rather than a guess per banner size.
     const PROBE: f32 = 100.0;
     let probe = Font::new(PROBE).expect("Archivo is a variable font with a wght axis");
-    let probe_total = PROBE + PROBE * GAP_FRACTION + probe.width(WORDMARK);
+    let probe_total = PROBE * MARK_PER_CAP + PROBE * GAP_FRACTION + probe.width(WORDMARK);
 
-    let side = (height as f32 * 0.34)
+    // A third of the height is the mark's share, so the height constrains the
+    // mark and the width constrains the pair.
+    let cap = (height as f32 * 0.34 / MARK_PER_CAP)
         .min(PROBE * (width as f32 * CONTENT_FRACTION) / probe_total)
         .round();
-    let gap = side * GAP_FRACTION;
+    let side = (cap * MARK_PER_CAP).round();
+    let gap = cap * GAP_FRACTION;
 
-    let font = Font::new(side).expect("Archivo is a variable font with a wght axis");
+    let font = Font::new(cap).expect("Archivo is a variable font with a wght axis");
     let text = font.width(WORDMARK);
     let total = side + gap + text;
 
@@ -191,9 +206,11 @@ fn banner(width: u32, height: u32, palette: Palette) -> Image {
     let y = ((height as f32 - side) / 2.0).round();
 
     stamp(&mut image, x, y, side, palette);
-    // The baseline sits one cap height below the mark's top, which is what puts
-    // the letters' flat tops on the square's.
-    font.draw(WORDMARK, x + side + gap, y + side, |px, py, coverage| {
+    // The mark stands taller than the caps, so the two share a centre line
+    // rather than a top edge: the cap band is centred on the same middle the
+    // square is, which is the baseline one half cap below it.
+    let baseline = (height as f32 / 2.0 + cap / 2.0).round();
+    font.draw(WORDMARK, x + side + gap, baseline, |px, py, coverage| {
         image.blend(px, py, palette.text_strong, coverage)
     });
 
@@ -230,17 +247,19 @@ fn installer_banner() -> Image {
 
     const PROBE: f32 = 100.0;
     let probe = Font::new(PROBE).expect("Archivo");
-    let probe_total = PROBE + PROBE * GAP_FRACTION + probe.width(WORDMARK);
+    let probe_total = PROBE * MARK_PER_CAP + PROBE * GAP_FRACTION + probe.width(WORDMARK);
 
-    let side = (h as f32 - BLOCK_MARGIN * 2.0).min(PROBE * available / probe_total);
-    let gap = side * GAP_FRACTION;
-    let font = Font::new(side).expect("Archivo");
+    let cap = ((h as f32 - BLOCK_MARGIN * 2.0) / MARK_PER_CAP).min(PROBE * available / probe_total);
+    let side = cap * MARK_PER_CAP;
+    let gap = cap * GAP_FRACTION;
+    let font = Font::new(cap).expect("Archivo");
     let total = side + gap + font.width(WORDMARK);
     let x = BANNER_SPLIT as f32 + (block_w - total) / 2.0;
     let y = (h as f32 - side) / 2.0;
 
     stamp(&mut image, x, y, side, ink);
-    font.draw(WORDMARK, x + side + gap, y + side, |px, py, coverage| {
+    let baseline = h as f32 / 2.0 + cap / 2.0;
+    font.draw(WORDMARK, x + side + gap, baseline, |px, py, coverage| {
         image.blend(px, py, ink.text_strong, coverage)
     });
 
