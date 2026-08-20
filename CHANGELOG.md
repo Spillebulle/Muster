@@ -3,6 +3,28 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.8
+
+Changed
+
+- **The interface has two weights now, and had one before.** Headings and the
+  primary button are heavier than the text around them; everything else is
+  lighter than it was. The font Muster bundles is a variable one whose default
+  weight is semibold, and the drawing library cannot vary it, so every word in
+  the application was coming out bold.
+- **Buttons follow one table.** The thing to do on a screen is filled in the
+  accent, everything else is a plain fill, and a button you cannot press is
+  dimmed rather than left looking pressable.
+- **The light theme is drawn from the light theme.** Scroll bars, tooltips,
+  text selection and the dimming behind a dialog were all still taken from the
+  dark one.
+- The scan control sits next to the range it scans, in a strip of its own,
+  rather than in the title bar.
+- Text fields show where the keyboard is, which they did not before.
+- Empty screens offer the thing to do instead of naming a button elsewhere.
+- Sentences are set as sentences: several were monospaced as though they were
+  figures.
+
 ## 0.0.7
 
 Added
