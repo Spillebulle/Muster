@@ -367,6 +367,21 @@ are what keep that true.
   hostname against a remote service. The one network request Muster makes on its
   own behalf is the update check, it is off until the user has been asked, and
   the setting that controls it is in one place.
+- **That one request has a budget, and it is small.** GitHub allows sixty
+  unauthenticated requests an hour *per address*, shared with everything else on
+  that network, and answers the sixty-first with **403** rather than 429 — which
+  read as a bare status says "GitHub has blocked you" when it means "wait". 0.0.5
+  checked on every launch and spent the budget in an afternoon. The automatic
+  check is therefore throttled to one per six hours, persisted, and a check the
+  user asks for is never held back. **The proper fix is a conditional request**:
+  a stored `ETag` with `If-None-Match`, whose 304 replies GitHub does not count
+  at all. That is the next thing to do here, and it needs the newest release
+  cached beside the tag so a 304 can be answered without the body.
+- **A message with a `\` line-continuation in it is a defect waiting to
+  happen.** Lose the backslash and the literal keeps the source's indentation;
+  it compiles, passes clippy, reads correctly in the editor, and is wrong only
+  on screen. `crates/muster-app/tests/messages.rs` reads the crate's own source
+  and fails on any string carrying a run of spaces mid-sentence.
 
 ## What to build next
 

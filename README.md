@@ -28,21 +28,21 @@ naming what the sweep could not do](docs/images/window.png)
 
 ## Install
 
-**Muster 0.0.5.** Take the file for your system, or browse the
+**Muster 0.0.6.** Take the file for your system, or browse the
 [release itself](https://github.com/Spillebulle/muster/releases/latest) for the
 notes and the checksums.
 
 | Your system | x86-64 | ARM64 |
 |---|---|---|
-| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-setup-0.0.5-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-setup-0.0.5-arm64.exe) |
-| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster_0.0.5_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster_0.0.5_arm64.deb) |
-| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-1.aarch64.rpm) |
-| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-bin-0.0.5-1-x86_64.pkg.tar.zst) | not built |
-| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.5/Muster-0.0.5-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.5/Muster-0.0.5-aarch64.AppImage) |
-| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-x86_64.flatpak) | not built |
-| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-arm64.msi) |
-| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-aarch64-pc-windows-msvc.zip) |
-| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.5/muster-0.0.5-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster-setup-0.0.6-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster-setup-0.0.6-arm64.exe) |
+| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster_0.0.6_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster_0.0.6_arm64.deb) |
+| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster-0.0.6-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster-0.0.6-1.aarch64.rpm) |
+| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster-bin-0.0.6-1-x86_64.pkg.tar.zst) | not built |
+| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.6/Muster-0.0.6-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.6/Muster-0.0.6-aarch64.AppImage) |
+| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster-0.0.6-x86_64.flatpak) | not built |
+| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster-0.0.6-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster-0.0.6-arm64.msi) |
+| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster-0.0.6-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster-0.0.6-aarch64-pc-windows-msvc.zip) |
+| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster-0.0.6-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.6/muster-0.0.6-aarch64-unknown-linux-gnu.tar.gz) |
 
 There is nothing to configure and nothing to elevate. Muster scans as whatever
 user you started it as, and the window needs a GPU with Vulkan or Direct3D 12,
@@ -52,7 +52,9 @@ runs happily over SSH.
 
 Muster can check for new versions when it starts. It asks you before the first
 check, and you can change the answer in **About**. That request is the only one
-Muster ever makes on its own behalf.
+Muster ever makes on its own behalf, and it goes out at most once every six
+hours, because GitHub allows sixty an hour from one address and a scanner gets
+opened a great deal more often than that.
 
 ## The device list
 

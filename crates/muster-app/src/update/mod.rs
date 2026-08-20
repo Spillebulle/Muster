@@ -55,6 +55,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
+/// How long to leave between automatic checks.
+///
+/// **The reason is GitHub's rate limit, and it is not generous.** Sixty
+/// unauthenticated requests an hour from one address, shared by everything on
+/// that network. Muster is a utility: opened to answer a question, closed, and
+/// opened again twenty minutes later. A check per launch spends the budget in
+/// an afternoon, and what the sixty-first launch sees is a 403 that reads as
+/// though GitHub had blocked them — which is exactly what happened, and is why
+/// this constant exists rather than a comment saying it would be nice.
+///
+/// Six hours means a few checks a day at most, which is far more often than
+/// releases appear. **A check the user asks for is never held back**: they are
+/// looking at the answer, so they can see a failure and judge it.
+const MIN_BETWEEN_CHECKS: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Seconds since the epoch, or zero on a machine whose clock predates it.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// How long the whole exchange may take before it is abandoned.
 ///
 /// Generous, because it is not blocking anything: nothing on screen waits for
@@ -145,6 +167,11 @@ pub struct Updates {
     /// see `notice_seen`, which holds the first check back until the user has
     /// been shown what it does.
     pub check_on_startup: bool,
+    /// When the automatic check last went out, in seconds since the epoch.
+    ///
+    /// Loaded from [`crate::prefs`] and written back after every check. See
+    /// [`MIN_BETWEEN_CHECKS`] for why it exists.
+    pub last_check: u64,
     /// Whether the user has been told that Muster checks for updates.
     ///
     /// False on a fresh install. While it is false no automatic check runs at
@@ -176,6 +203,7 @@ impl Default for Updates {
         Self {
             check_on_startup: true,
             notice_seen: false,
+            last_check: 0,
             flow: None,
             cancel: None,
             exit: None,
@@ -381,8 +409,30 @@ impl Updates {
         {
             return;
         }
+        // Once per run *and* not more often than the rate limit can afford.
+        // `started` is set either way, so a launch inside the window costs
+        // nothing and does not try again later in the same session.
         self.started = true;
+        if self
+            .since_last_check()
+            .is_some_and(|d| d < MIN_BETWEEN_CHECKS)
+        {
+            return;
+        }
         self.check();
+    }
+
+    /// How long since the last automatic check, or `None` if there has been
+    /// none — or if the clock has moved backwards since, which a machine that
+    /// has just corrected its time will do and which must not lock the check
+    /// out until the recorded moment comes round again.
+    pub fn since_last_check(&self) -> Option<Duration> {
+        if self.last_check == 0 {
+            return None;
+        }
+        now_unix()
+            .checked_sub(self.last_check)
+            .map(Duration::from_secs)
     }
 
     /// Ask GitHub what the newest release is.
@@ -393,6 +443,10 @@ impl Updates {
         if self.busy() || self.check_unavailable().is_some() {
             return;
         }
+        // Recorded when the request goes out rather than when it comes back, so
+        // a run of failures cannot turn into a run of retries against a limit
+        // that is already spent.
+        self.last_check = now_unix();
         self.status = Status::Checking;
         self.spawn("muster-update-check", |reporter| {
             reporter.send(Report::Checked(match latest_release() {
@@ -720,17 +774,17 @@ fn api_failure(status: u16, headers: &ureq::http::HeaderMap) -> String {
             .map(|seconds| seconds.div_ceil(60).max(1));
         return match wait {
             Some(minutes) => format!(
-                "GitHub is rate limiting this network. It allows 60 checks an                  hour from one address, and they have been used. Muster will be                  able to check again in about {minutes} minutes."
+                "GitHub is rate limiting this network. It allows 60 checks an hour from one address, and they have been used. Muster will be able to check again in about {minutes} minutes."
             ),
-            None => "GitHub is rate limiting this network. It allows 60 checks                      an hour from one address, and they have been used. Try                      again later."
+            None => "GitHub is rate limiting this network. It allows 60 checks an hour from one address, and they have been used. Try again later."
                 .to_string(),
         };
     }
 
     match status {
-        403 => "GitHub refused the request. That is usually a rate limit on                 this network, which clears on its own within the hour."
+        403 => "GitHub refused the request. That is usually a rate limit on this network, which clears on its own within the hour."
             .to_string(),
-        404 => "GitHub has no release list at that address. The repository may                 have been renamed."
+        404 => "GitHub has no release list at that address. The repository may have been renamed."
             .to_string(),
         other => format!("GitHub answered {other} rather than the release list."),
     }
@@ -767,7 +821,7 @@ fn fetch(
     let status = response.status().as_u16();
     if status != 200 {
         return Err(format!(
-            "GitHub answered {status} for {}. The release may have been changed              since Muster read it.",
+            "GitHub answered {status} for {}. The release may have been changed since Muster read it.",
             asset.name
         ));
     }
@@ -1174,6 +1228,79 @@ mod tests {
         updates.cancel_countdown();
         updates.poll(start + flow::RESTART_DELAY * 10);
         assert_eq!(updates.take_exit_request(), None);
+    }
+
+    /// The defect 0.0.5 shipped, seen from the other end.
+    ///
+    /// GitHub allows sixty unauthenticated requests an hour from one address.
+    /// A check on every launch spends that in an afternoon of ordinary use, and
+    /// the sixty-first launch is told it has been blocked. This is the thing
+    /// that stops it.
+    #[test]
+    fn a_launch_soon_after_the_last_check_does_not_spend_a_request() {
+        let mut updates = Updates {
+            notice_seen: true,
+            last_check: now_unix(),
+            ..Default::default()
+        };
+        updates.start_if_due();
+        assert_eq!(
+            *updates.status(),
+            Status::Idle,
+            "a launch inside the window must not ask GitHub anything"
+        );
+    }
+
+    #[test]
+    fn a_launch_long_after_the_last_check_does() {
+        let mut updates = Updates {
+            notice_seen: true,
+            last_check: now_unix() - MIN_BETWEEN_CHECKS.as_secs() - 1,
+            ..Default::default()
+        };
+        updates.start_if_due();
+        assert_eq!(*updates.status(), Status::Checking);
+    }
+
+    #[test]
+    fn a_fresh_install_checks_the_first_time_it_is_allowed_to() {
+        // `last_check` of zero is "never", and never is not "recently".
+        let mut updates = Updates {
+            notice_seen: true,
+            ..Default::default()
+        };
+        assert_eq!(updates.since_last_check(), None);
+        updates.start_if_due();
+        assert_eq!(*updates.status(), Status::Checking);
+    }
+
+    #[test]
+    fn a_check_the_user_asked_for_is_never_held_back() {
+        // They are looking at the answer, so they can see a failure and judge
+        // it. Throttling that would be the application refusing to do the one
+        // thing it was just asked to do.
+        let mut updates = Updates {
+            notice_seen: true,
+            last_check: now_unix(),
+            ..Default::default()
+        };
+        updates.check();
+        assert_eq!(*updates.status(), Status::Checking);
+    }
+
+    #[test]
+    fn a_clock_that_moved_backwards_does_not_lock_the_check_out() {
+        // A machine that has just corrected its time can hold a `last_check` in
+        // the future. Read naively that would block every check until the
+        // recorded moment came round again.
+        let mut updates = Updates {
+            notice_seen: true,
+            last_check: now_unix() + 60 * 60 * 24 * 365,
+            ..Default::default()
+        };
+        assert_eq!(updates.since_last_check(), None);
+        updates.start_if_due();
+        assert_eq!(*updates.status(), Status::Checking);
     }
 
     #[test]

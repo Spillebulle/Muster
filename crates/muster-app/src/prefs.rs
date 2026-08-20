@@ -32,6 +32,19 @@ pub struct Prefs {
     /// all**. This is what makes `check_on_startup`'s default defensible: the
     /// request does not go out until somebody has been told it would.
     pub notice_seen: bool,
+    /// When the last check went out, in seconds since the epoch.
+    ///
+    /// **This is a rate limit, not a cache.** GitHub allows sixty
+    /// unauthenticated requests an hour from one address, and Muster is a tool
+    /// people open, look at, and close — a check on every launch spends that
+    /// budget in an afternoon of ordinary use, and the sixty-first launch is
+    /// told it has been blocked. Remembering the last one is what keeps the
+    /// automatic check to a few a day. A check the user asks for is never
+    /// throttled: they can see the answer, so they can see the failure.
+    ///
+    /// Zero means never, which is what a fresh install and an unreadable file
+    /// both come to.
+    pub last_check: u64,
 }
 
 impl Default for Prefs {
@@ -41,6 +54,7 @@ impl Default for Prefs {
             // `update::Updates::check_on_startup`, which carries the argument.
             check_on_startup: true,
             notice_seen: false,
+            last_check: 0,
         }
     }
 }
@@ -66,10 +80,15 @@ pub fn load() -> Prefs {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
+        let raw = value;
         let value = value.trim() == "true";
         match key.trim() {
             "check_on_startup" => prefs.check_on_startup = value,
             "notice_seen" => prefs.notice_seen = value,
+            // The one setting that is not a boolean, so it is read from the
+            // raw text rather than from `value`. Anything unparseable is
+            // "never", which costs one extra check and never skips one.
+            "last_check" => prefs.last_check = raw.trim().parse().unwrap_or(0),
             // An unknown key is a file written by a newer Muster. Ignored
             // rather than refused: the alternative is a downgrade wiping
             // settings it did not understand.
@@ -96,8 +115,8 @@ pub fn save(prefs: Prefs) {
         return;
     }
     let text = format!(
-        "check_on_startup = {}\nnotice_seen = {}\n",
-        prefs.check_on_startup, prefs.notice_seen
+        "check_on_startup = {}\nnotice_seen = {}\nlast_check = {}\n",
+        prefs.check_on_startup, prefs.notice_seen, prefs.last_check
     );
     if let Err(e) = std::fs::write(&path, text) {
         log::warn!("could not write {}: {e}", path.display());
@@ -116,10 +135,12 @@ mod tests {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
+            let raw = value;
             let value = value.trim() == "true";
             match key.trim() {
                 "check_on_startup" => prefs.check_on_startup = value,
                 "notice_seen" => prefs.notice_seen = value,
+                "last_check" => prefs.last_check = raw.trim().parse().unwrap_or(0),
                 _ => {}
             }
         }
@@ -137,10 +158,11 @@ mod tests {
         let prefs = Prefs {
             check_on_startup: false,
             notice_seen: true,
+            last_check: 1_760_000_000,
         };
         let text = format!(
-            "check_on_startup = {}\nnotice_seen = {}\n",
-            prefs.check_on_startup, prefs.notice_seen
+            "check_on_startup = {}\nnotice_seen = {}\nlast_check = {}\n",
+            prefs.check_on_startup, prefs.notice_seen, prefs.last_check
         );
         assert_eq!(parse(&text), prefs);
     }
@@ -152,6 +174,14 @@ mod tests {
         let prefs = parse("notice_seen = true\naccent = 200\ncheck_on_startup = false\n");
         assert!(prefs.notice_seen);
         assert!(!prefs.check_on_startup);
+    }
+
+    #[test]
+    fn a_last_check_that_will_not_parse_means_never() {
+        // Costs one extra check, which is the harmless direction. Reading it as
+        // "just now" would silently switch the startup check off.
+        assert_eq!(parse("last_check = tomorrow\n").last_check, 0);
+        assert_eq!(parse("last_check = 42\n").last_check, 42);
     }
 
     #[test]

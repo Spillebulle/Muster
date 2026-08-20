@@ -436,7 +436,7 @@ mod tests {
             let slack = top.abs_diff(bottom);
             assert!(
                 slack <= side / 32 + 1,
-                "at {side} px the glyph sits {top} from the top and {bottom} from                  the bottom, which reads as off-centre"
+                "at {side} px the glyph sits {top} from the top and {bottom} from the bottom, which reads as off-centre"
             );
         }
     }

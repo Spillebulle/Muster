@@ -59,6 +59,9 @@ pub struct App {
     ports: ports::State,
     /// Who offers addresses on this link, and whether more than one does.
     dhcp: dhcpcheck::State,
+    /// What was last written to the settings file, so a check that moved the
+    /// clock is persisted once rather than on every frame.
+    saved_last_check: u64,
     /// The update check and the dialog it raises.
     ///
     /// Its two settings are loaded from [`prefs`] at start-up and written back
@@ -82,6 +85,7 @@ impl App {
         let mut updates = Updates::default();
         updates.check_on_startup = saved.check_on_startup;
         updates.notice_seen = saved.notice_seen;
+        updates.last_check = saved.last_check;
         // The check runs on a thread and reports through a channel, which is not
         // an event: without a waker the answer would sit there until the mouse
         // moved. eframe's context is the waker.
@@ -97,6 +101,7 @@ impl App {
             selected: None,
             ports: ports::State::Idle,
             dhcp: dhcpcheck::State::Idle,
+            saved_last_check: saved.last_check,
             updates,
         };
         apply(&cc.egui_ctx, Palette::of(app.mode));
@@ -137,6 +142,7 @@ impl App {
             selected: None,
             ports: ports::State::Idle,
             dhcp: dhcpcheck::State::Idle,
+            saved_last_check: 0,
             updates,
         }
     }
@@ -176,6 +182,19 @@ impl eframe::App for App {
         // The startup check, once, and only once the notice has been answered.
         self.updates.start_if_due();
         self.updates.poll(std::time::Instant::now());
+
+        // A check moves `last_check`, and it has to survive the process or the
+        // throttle is per run and the rate limit is spent by the next launch.
+        // Written here rather than in `update::check` so that module goes on
+        // knowing nothing about where settings live.
+        if self.updates.last_check != self.saved_last_check {
+            self.saved_last_check = self.updates.last_check;
+            prefs::save(prefs::Prefs {
+                check_on_startup: self.updates.check_on_startup,
+                notice_seen: self.updates.notice_seen,
+                last_check: self.updates.last_check,
+            });
+        }
 
         // An update that has landed asks the window to close, and the two ways
         // it ends are genuinely different: a swapped binary can be started
@@ -815,6 +834,7 @@ fn updates_section(ui: &mut egui::Ui, p: Palette, updates: &mut Updates) {
         prefs::save(prefs::Prefs {
             check_on_startup: updates.check_on_startup,
             notice_seen: updates.notice_seen,
+            last_check: updates.last_check,
         });
     }
 }
