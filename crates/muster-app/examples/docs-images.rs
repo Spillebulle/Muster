@@ -52,10 +52,14 @@ use std::time::Duration;
 /// narrow window instead. That is a real size the interface has to work at, so
 /// the picture is of the application rather than of a cut-out of it, and it is
 /// the width §17.3 asks a right-aligned picture to sit at.
-const SHOTS: [(&str, View, [f32; 2]); 3] = [
-    ("window.png", View::Devices, [1400.0, 520.0]),
-    ("network.png", View::Network, [720.0, 380.0]),
-    ("about.png", View::About, [720.0, 480.0]),
+const SHOTS: [(&str, View, [f32; 2], Option<u8>); 5] = [
+    ("settings.png", View::Devices, [1400.0, 700.0], Some(0)),
+    ("window.png", View::Devices, [1400.0, 520.0], None),
+    // The detail window, opened on the printer: the device with the most to
+    // say about itself, so the picture shows the panel doing its job.
+    ("device.png", View::Devices, [1400.0, 520.0], Some(27)),
+    ("network.png", View::Network, [720.0, 380.0], None),
+    ("about.png", View::About, [720.0, 480.0], None),
 ];
 
 fn main() {
@@ -66,14 +70,14 @@ fn main() {
     let out = root.join("docs/images");
     std::fs::create_dir_all(&out).expect("create docs/images");
 
-    for (name, view, window) in SHOTS {
-        shoot(out.join(name), view, window);
+    for (name, view, window, select) in SHOTS {
+        shoot(out.join(name), view, window, select);
         println!("  {}", out.join(name).display());
     }
 }
 
 /// Open the window on one view, photograph it, write the file and close.
-fn shoot(path: PathBuf, view: View, window: [f32; 2]) {
+fn shoot(path: PathBuf, view: View, window: [f32; 2], select: Option<u8>) {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size(window)
@@ -90,13 +94,20 @@ fn shoot(path: PathBuf, view: View, window: [f32; 2]) {
             // One point per pixel. The scale the machine happens to run at is
             // not the scale the picture is specified at.
             cc.egui_ctx.set_pixels_per_point(1.0);
-            let app = App::seeded(
+            let mut app = App::seeded(
                 cc,
                 survey(),
                 State::Finished(Box::new(scan())),
                 view,
                 Mode::Dark,
             );
+            match select {
+                // Zero is not a host: it means "open the settings page", which
+                // is the one picture that is not about a device.
+                Some(0) => app.open_settings(),
+                Some(host) => app.select(v4(192, 0, 2, host)),
+                None => {}
+            }
             Ok(Box::new(Shot {
                 app,
                 path,
