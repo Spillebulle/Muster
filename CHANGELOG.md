@@ -3,6 +3,21 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.6
+
+Fixed
+
+- **Muster spent GitHub's rate limit and then told you it had been blocked.**
+  GitHub allows sixty checks an hour from one address, and Muster asked on every
+  launch, which an afternoon of ordinary use gets through. The automatic check
+  now runs at most once every six hours. A check you ask for yourself is never
+  held back: you are looking at the answer, so you can see a failure and judge
+  it.
+- **Several messages were shown with runs of spaces in the middle of them**, so
+  a sentence arrived looking like "60 checks an        hour from one address".
+  A test now reads Muster's own source and fails the build on any message with
+  that shape.
+
 ## 0.0.5
 
 Added

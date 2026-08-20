@@ -385,5 +385,6 @@ fn persist(updates: &Updates) {
     crate::prefs::save(crate::prefs::Prefs {
         check_on_startup: updates.check_on_startup,
         notice_seen: updates.notice_seen,
+        last_check: updates.last_check,
     });
 }
