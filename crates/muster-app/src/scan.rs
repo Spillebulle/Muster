@@ -31,6 +31,12 @@ pub enum Update {
         probed: u64,
         total: u64,
         found: u64,
+        /// The device this probe found, where it found one.
+        ///
+        /// Carried so the table can fill as the sweep runs. `CLAUDE.md` asks
+        /// for results to arrive incrementally, and this is what makes that
+        /// true of the devices themselves rather than only of the counter.
+        hit: Option<Box<Found>>,
     },
     Identifying {
         done: usize,
@@ -84,6 +90,14 @@ pub enum State {
     Running {
         phase: Phase,
         found: u64,
+        /// Devices found so far, in the order they answered.
+        ///
+        /// **Kept here rather than waited for.** The table reads this while the
+        /// sweep runs, so a device appears the moment it answers instead of
+        /// when the last address in the prefix has been probed. On a /24 that
+        /// is a few seconds; on anything larger it is the difference between a
+        /// tool that is working and a tool that has hung.
+        devices: Vec<Found>,
         cancel: Arc<AtomicBool>,
         rx: Receiver<Update>,
     },
@@ -112,6 +126,7 @@ impl State {
                 total: prefix.host_count(),
             },
             found: 0,
+            devices: Vec::new(),
             cancel,
             rx,
         }
@@ -124,7 +139,11 @@ impl State {
         let mut finished = None;
 
         if let Self::Running {
-            phase, found, rx, ..
+            phase,
+            found,
+            devices,
+            rx,
+            ..
         } = self
         {
             loop {
@@ -133,9 +152,13 @@ impl State {
                         probed,
                         total,
                         found: f,
+                        hit,
                     }) => {
                         *phase = Phase::Sweeping { probed, total };
                         *found = f;
+                        if let Some(device) = hit {
+                            devices.push(*device);
+                        }
                         moved = true;
                     }
                     Ok(Update::Identifying { done, total }) => {
@@ -175,13 +198,25 @@ impl State {
     }
 
     /// The devices to show: the finished ones, or nothing yet.
+    /// Every device known so far, finished or not.
+    ///
+    /// While a sweep runs this is what has answered up to now; once it ends it
+    /// is the sweep's own list. Both are "what Muster has found", which is the
+    /// only thing the table ever wants.
     pub fn devices(&self) -> &[Found] {
         match self {
             Self::Finished(o) => &o.sweep.found,
-            _ => &[],
+            Self::Running { devices, .. } => devices,
+            Self::Idle => &[],
         }
     }
 
+    /// The names learned, parallel to [`Self::devices`].
+    ///
+    /// Empty while a sweep is running: identification is phase four and has not
+    /// started yet, so a device on screen mid-scan has an address and no name.
+    /// That is honest — the alternative is holding the whole table back until
+    /// every name is in.
     pub fn names(&self) -> &[Identity] {
         match self {
             Self::Finished(o) => &o.names,
@@ -205,11 +240,12 @@ fn run(
         discover::Options::default()
     };
 
-    let sweep = discover::sweep(prefix, &transport, &rate, opts, &cancel, &|p| {
+    let sweep = discover::sweep(prefix, &transport, &rate, opts, &cancel, &|p, hit| {
         let _ = tx.send(Update::Swept {
             probed: p.probed,
             total: p.total,
             found: p.found,
+            hit: hit.cloned().map(Box::new),
         });
     });
 

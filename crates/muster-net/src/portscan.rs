@@ -157,12 +157,18 @@ impl Method {
 
     /// What the user needs to know about this method's limits, or [`None`]
     /// where there is nothing to say.
+    ///
+    /// **Worded as a note, not as a fault.** These are properties of the method
+    /// that was used, and the first version read like something had gone wrong
+    /// with the scan — which is worse than saying nothing, because a reader who
+    /// thinks the tool broke stops trusting the numbers above it.
     pub const fn caveat(self) -> Option<&'static str> {
         match self {
             Self::Syn => None,
             Self::Connect => Some(
-                "used connect(), which is slower and completes the handshake, \
-                 so the far end may log it",
+                "Scanned by opening a connection to each port. That is slower \
+                 than a SYN scan and completes the handshake, so the far end \
+                 may record it.",
             ),
         }
     }
@@ -346,13 +352,14 @@ impl Scan {
             out.push(c.to_string());
         }
         if self.cancelled {
-            out.push("stopped early, so this is not every port".into());
+            out.push("Stopped early, so this is not every port.".into());
         }
         let filtered: usize = self.hosts.iter().map(|h| h.filtered).sum();
         if filtered > 0 {
             out.push(format!(
-                "{filtered} port{} did not answer, which is not the same as being closed",
-                if filtered == 1 { "" } else { "s" }
+                "{filtered} port{} nothing came back from. That is not the same \
+                 as closed: a firewall that drops looks exactly like this.",
+                if filtered == 1 { " that" } else { "s that" }
             ));
         }
         out
@@ -633,13 +640,13 @@ mod tests {
         assert_eq!(s.hosts[0].filtered, 2);
         assert_eq!(s.hosts[0].open().count(), 0);
 
-        // And the caveat says so in words.
-        let caveats = s.caveats().join("; ");
-        assert!(caveats.contains("did not answer"), "{caveats}");
-        assert!(
-            caveats.contains("not the same as being closed"),
-            "{caveats}"
-        );
+        // And the note says so in words. Asserted on the meaning rather than
+        // on the sentence: the wording is the interface's to improve, and this
+        // test is here to stop the *distinction* being lost, not to freeze a
+        // phrase.
+        let notes = s.caveats().join("; ").to_ascii_lowercase();
+        assert!(notes.contains("nothing came back"), "{notes}");
+        assert!(notes.contains("not the same as closed"), "{notes}");
     }
 
     /// The unprivileged method is never substituted silently.
@@ -649,7 +656,12 @@ mod tests {
         let s = run(&fake, &[ip("10.0.0.1")], "80");
         assert_eq!(s.method, Method::Connect);
         assert_eq!(s.method.label(), "connect()");
-        assert!(s.caveats().iter().any(|c| c.contains("connect()")));
+        // The note names what the method does rather than what it is called:
+        // "connect()" means nothing to most readers, and the point of saying it
+        // at all is that the far end can see the connection.
+        let notes = s.caveats().join("; ").to_ascii_lowercase();
+        assert!(notes.contains("connection"), "{notes}");
+        assert!(notes.contains("handshake"), "{notes}");
         assert_eq!(
             Method::Syn.caveat(),
             None,
@@ -695,7 +707,11 @@ mod tests {
         );
         assert!(s.cancelled);
         assert!(s.probed < s.total);
-        assert!(s.caveats().iter().any(|c| c.contains("stopped early")));
+        assert!(
+            s.caveats()
+                .iter()
+                .any(|c| c.to_ascii_lowercase().contains("stopped early"))
+        );
     }
 
     #[test]

@@ -226,6 +226,11 @@ impl Options {
 }
 
 /// Progress, reported as the sweep runs.
+///
+/// Carried beside the device the probe found, where it found one: see
+/// [`sweep`]'s `progress` argument. It stays `Copy` for that reason — a `Found`
+/// holds a `Vec` of evidence, and folding it in here would make every progress
+/// report an allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Progress {
     pub probed: u64,
@@ -270,7 +275,7 @@ pub fn sweep<T: Transport>(
     rate: &Bucket,
     opts: Options,
     cancel: &AtomicBool,
-    progress: &(dyn Fn(Progress) + Sync),
+    progress: &(dyn Fn(Progress, Option<&Found>) + Sync),
 ) -> Sweep {
     let caps = transport.capabilities();
     let mut result = Sweep {
@@ -324,18 +329,27 @@ pub fn sweep<T: Transport>(
 
                     let hit = probe_one(address, transport, rate, &caps, opts);
                     let done = probed.fetch_add(1, Ordering::Relaxed) + 1;
-                    let hits = match hit {
-                        Some(f) => {
-                            mine.push(f);
-                            found_count.fetch_add(1, Ordering::Relaxed) + 1
-                        }
+                    let hits = match &hit {
+                        Some(_) => found_count.fetch_add(1, Ordering::Relaxed) + 1,
                         None => found_count.load(Ordering::Relaxed),
                     };
-                    progress(Progress {
-                        probed: done,
-                        total: addresses.len() as u64,
-                        found: hits,
-                    });
+                    // Reported **before** it is kept, so a caller can put the
+                    // device on screen the moment it answers rather than when
+                    // the whole prefix has been walked. A /24 takes seconds and
+                    // a /16 takes a great deal longer; either way, a table that
+                    // fills as it goes is the difference between watching a
+                    // scan and waiting for one.
+                    progress(
+                        Progress {
+                            probed: done,
+                            total: addresses.len() as u64,
+                            found: hits,
+                        },
+                        hit.as_ref(),
+                    );
+                    if let Some(f) = hit {
+                        mine.push(f);
+                    }
                 }
                 mine
             }));
@@ -359,6 +373,21 @@ pub fn sweep<T: Transport>(
 /// below any firewall — and because it yields the hardware address, which is
 /// what the whole device list is keyed on. The knock is last and only for
 /// silence, so a host that answered already costs four fewer probes.
+/// Probe one address, once.
+///
+/// The single-host form of the sweep, for asking again about a device that is
+/// already on screen. It runs the same three probes in the same order and
+/// returns the same [`Found`], so what a re-check says and what the sweep said
+/// cannot disagree about what counts as an answer.
+pub fn probe<T: Transport>(
+    address: IpAddr,
+    transport: &T,
+    rate: &Bucket,
+    opts: Options,
+) -> Option<Found> {
+    probe_one(address, transport, rate, &transport.capabilities(), opts)
+}
+
 fn probe_one<T: Transport>(
     address: IpAddr,
     transport: &T,
@@ -492,7 +521,7 @@ mod tests {
             &Bucket::new(1_000_000),
             opts,
             &AtomicBool::new(false),
-            &|_| {},
+            &|_, _| {},
         )
     }
 
@@ -651,7 +680,7 @@ mod tests {
             &Bucket::new(1_000_000),
             Options::on_link(),
             &AtomicBool::new(false),
-            &|_| {},
+            &|_, _| {},
         );
         assert_eq!(s.found.len(), 1, "the pinging host survives a broken ARP");
         assert_eq!(s.found[0].address, ip("192.168.1.2"));
@@ -711,7 +740,7 @@ mod tests {
                 ..Default::default()
             },
             &cancel,
-            &|_| {
+            &|_, _| {
                 if seen.fetch_add(1, Ordering::SeqCst) >= 9 {
                     cancel.store(true, Ordering::SeqCst);
                 }
@@ -739,7 +768,7 @@ mod tests {
             &Bucket::new(1_000_000),
             Options::default(),
             &AtomicBool::new(false),
-            &|p| {
+            &|p, _| {
                 let mut last = last.lock().unwrap();
                 assert!(p.probed <= p.total, "{p:?} overshot");
                 *last = p;
@@ -765,7 +794,7 @@ mod tests {
             &rate,
             opts,
             &AtomicBool::new(false),
-            &|_| {},
+            &|_, _| {},
         );
         // Two addresses, each: one ARP, one ping, then four knocks.
         assert_eq!(fake.count("arp"), 2);
