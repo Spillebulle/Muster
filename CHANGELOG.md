@@ -3,6 +3,73 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.10
+
+Added
+
+- **A table of devices you can act on.** Every row has a mark box and the
+  heading has one that marks everything the filter is showing, so "the three
+  printers" is a search and one click. **Copy** puts one column of the marked
+  devices on the clipboard, one value per line — the addresses for a firewall
+  rule, the hardware addresses for a set of DHCP reservations, or the whole row
+  tab separated for a spreadsheet — and a pill at the foot of the window says
+  how many of what it copied. **Actions** pings them, pings them until you stop
+  it, or scans their ports one device at a time.
+- **Two new columns.** Ping is the last re-check's round trip, and it stays
+  blank until you ask for one rather than dressing up the sweep's own
+  measurement as a fresh one. Ports is every port known open on the device: what
+  the sweep's knock found, and whatever a port scan has added since, which now
+  survives closing the panel it was run from.
+- **Muster asks what a device serves over a connection, not only over a
+  datagram.** Three new badges, each earned by an answer in the protocol
+  itself: `SMB` from the negotiate an SMB client sends first, `NFS` from the
+  null call the protocol defines for exactly this question, and `SSH` from the
+  greeting a server volunteers to anything that connects — that last one sends
+  nothing at all. Nothing is opened, listed or authenticated. All three are off
+  until you turn them on, because a connection is a thing the far end writes
+  down where a datagram to port 53 is not.
+- **The scan control carries what a scan asks.** The arrow at the right of the
+  Scan button opens it, and it stays open while you set it rather than closing
+  on the first switch you touch: it closes when you click outside it, press
+  escape, or press Scan at its foot.
+- The text mode learned `--smb`, `--nfs` and `--ssh`, so it asks the same
+  questions the window does.
+
+Changed
+
+- **This network is one card per network.** Each card answers the same
+  questions — the address and its prefix, the gateway out of that link, the
+  resolvers, the DHCP server that gave the lease, the hardware address — rather
+  than one long column in the order the survey happens to be in. On a laptop
+  with a VPN up, or one on wifi and Ethernet at once, which gateway belongs to
+  which link is the whole question, and the old shape could not answer it.
+- The scan menu has left the top bar, which is now the mark and the name and
+  nothing else. Everything it held is behind the Scan button's arrow, beside
+  the range it acts on.
+- Table headings are set one rank larger, so a heading reads as the column's
+  label rather than as another row of it.
+- The icons are Lucide's throughout, drawn from vendored path data rather than
+  by hand.
+
+Fixed
+
+- **A packaged Muster on Debian, Ubuntu and Pop!_OS reported every device as
+  silent.** Those distributions leave `net.ipv4.ping_group_range` shut, so no
+  echo was sent at all; Muster now falls back to a raw ICMP socket and the
+  packages grant the one capability that buys, alongside the port 68 the DHCP
+  check needs. Both hints name the same `setcap` command, because `setcap`
+  replaces a capability set rather than adding to it.
+- **A device with a long mDNS service list was identified on Linux and not on
+  Windows.** An oversized datagram is truncated by one kernel and refused by
+  the other, so the receive buffer is now as large as UDP can carry.
+- The DHCP check's failure message named the wrong cure when the machine's own
+  DHCP client was holding port 68, which is a different fault from not being
+  allowed to bind it.
+- A re-check's "could not send ARP requests" caveat printed with a run of
+  spaces through the middle of it. The test that catches that class of defect
+  reads the engine as well as the interface now, which is where most of these
+  sentences are actually written.
+
 ## 0.0.9
 
 Added

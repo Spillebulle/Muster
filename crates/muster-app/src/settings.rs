@@ -328,10 +328,10 @@ fn general(
 }
 
 fn scanning(ui: &mut egui::Ui, p: Palette, prefs: &mut Prefs) {
-    // The same three values the scan menu in the top bar carries, because they
-    // are the same three fields of `Prefs`. Somebody looking for what a scan
-    // does will look in Settings, and a Settings page that does not have it is
-    // a page that is lying by omission.
+    // The same values the scan control's own popover carries, because they are
+    // the same fields of `Prefs`. Somebody looking for what a scan does will
+    // look in Settings, and a Settings page that does not have it is a page
+    // that is lying by omission.
     eyebrow(ui, p, "WHAT A SCAN ASKS");
     row(
         ui,
@@ -369,6 +369,54 @@ fn scanning(ui: &mut egui::Ui, p: Palette, prefs: &mut Prefs) {
             let mut on = prefs.scan_dhcp;
             if toggle(ui, p, &mut on) {
                 prefs.scan_dhcp = on;
+            }
+        },
+    );
+    // The three questions that need a connection rather than a datagram. See
+    // `prefs::Prefs::scan_smb` for why all three are off until they are asked
+    // for, and `muster_net::service` for what each one sends.
+    row(
+        ui,
+        p,
+        "Find file shares",
+        Some(
+            "The negotiate an SMB client sends first, on port 445. Nothing is \
+             opened, listed or authenticated.",
+        ),
+        |ui| {
+            let mut on = prefs.scan_smb;
+            if toggle(ui, p, &mut on) {
+                prefs.scan_smb = on;
+            }
+        },
+    );
+    row(
+        ui,
+        p,
+        "Find NFS exports",
+        Some(
+            "The null call the protocol defines for it, on port 2049. It asks a \
+             server to do nothing and answer.",
+        ),
+        |ui| {
+            let mut on = prefs.scan_nfs;
+            if toggle(ui, p, &mut on) {
+                prefs.scan_nfs = on;
+            }
+        },
+    );
+    row(
+        ui,
+        p,
+        "Read SSH greetings",
+        Some(
+            "Connects to port 22 and reads the line a server volunteers. Nothing \
+             is sent to it.",
+        ),
+        |ui| {
+            let mut on = prefs.scan_ssh;
+            if toggle(ui, p, &mut on) {
+                prefs.scan_ssh = on;
             }
         },
     );

@@ -176,7 +176,9 @@ Unprivileged, and more capable than it sounds:
   `GetIpNetTable2` give the interfaces, the gateway, the DNS servers and the
   neighbour table.
 - **Linux.** Netlink gives the routes and the neighbour table; `SOCK_DGRAM`
-  `IPPROTO_ICMP` pings where `net.ipv4.ping_group_range` allows it. Neighbour
+  `IPPROTO_ICMP` pings where `net.ipv4.ping_group_range` allows it — Debian,
+  Ubuntu and Pop!_OS do not, so `platform::linux::Echo` asks for a raw ICMP
+  socket second and the packages grant `CAP_NET_RAW` for exactly that. Neighbour
   entries can be *provoked* by touching each address and then re-reading the
   table, which is how an unprivileged sweep still learns MACs.
 - **Both.** `connect()` scanning, and every one of the discovery protocols in
@@ -251,6 +253,22 @@ wearing a confident face.
   resolver; folding that into one label loses two of the three. **A role is
   only ever a service that answered** — never an open port, never a vendor that
   usually runs one — which is what keeps a badge from being a guess.
+- **The roles that need a connection live in `service.rs`, behind `Speak`.**
+  DHCP and DNS are datagrams and belong with the rest of `identify`; SMB, NFS
+  and SSH cannot be asked without a TCP connection, so they are a phase of their
+  own with a transport of their own and one recorded fake behind it. Each sends
+  the protocol's *opening move* and nothing else: an SMB2 `NEGOTIATE`, an ONC
+  RPC `NULL` call, and for SSH nothing at all, because a server greets whoever
+  connects. Two rules came out of writing them and are worth keeping. **A reply
+  in the protocol is the test, never a successful one** — a server refusing
+  every SMB dialect has still proved it is a file server — and **an accept
+  status is read**, because RPC `PROG_UNAVAIL` on port 2049 is something else
+  answering there and badging it would be the port-scan mistake this whole rule
+  exists to avoid. HTTP is deliberately not among them: every device on a
+  network answers on 80, so a web badge would be a column of noise.
+- **The connected questions are off by default and the datagram ones are not.**
+  A connection is a thing the far end writes down; a datagram to port 53 is not.
+  Same rule as `scan_dhcp`, same answer.
 - **A question put to somebody else's resolver carries nothing about this
   network.** The DNS probe asks `version.bind` in the CHAOS class, which a name
   server answers out of itself and a forwarder has nowhere to forward; the
@@ -314,11 +332,40 @@ short version of what it means here: 34 px top bar with the accent mark, 240 px
 sidebar, 26 px status bar; selection is a neutral fill plus strong text plus a
 small accent mark and never an accent background; hairlines everywhere, shadows
 only under things that float; every figure monospaced and tabular; icons from
-one stroke set with a tooltip on every icon-only control; British spelling,
+one stroke set — **Lucide's**, whose path data is vendored verbatim in
+`icons.rs` and flattened by `lucide.rs`, because the set drawn by hand here
+first produced a settings "gear" that was a sun — with a tooltip on every
+icon-only control; British spelling,
 sentence case, and no em dashes in anything a user reads.
 
 Two things the design language decides for this application specifically:
 
+- **A control that acts and a menu that changes what it does are one control.**
+  The scan control is a split button: the label acts, and a fenced-off arrow at
+  its right end opens what the next scan will ask. This was a menu in the top
+  bar and a button in the options strip, which put a control in one strip
+  governing a menu in another; §6.2 wants the top bar empty of both, and the
+  arrow is what let it be. **The popover it opens is not a menu and does not
+  close on a click**, because it is a panel of switches and somebody turning two
+  things on should not have to open it twice. It closes on a click outside, on
+  escape, and on the Scan button at its foot.
+- **The table is a set of devices, not one.** A row carries a mark, the
+  heading carries a box that marks everything the *filter* is showing, and the
+  toolbar's Copy and Actions act on the marks — or, with nothing marked, on
+  everything shown, which the menus say out loud before anything is chosen.
+  Marks are kept by address, so they survive a rescan the way the open panel
+  does. **Everything means everything in front of the reader**: an action that
+  reached devices a search had hidden would be the one surprise this control
+  cannot afford, and "some devices are marked and none of them are on screen"
+  is its own state rather than a silent fall back to the filtered set.
+- **A column shows a fact, and blank is a fact too.** Ping is empty until
+  somebody asks for one, because a sweep's round trip is a different
+  measurement from a re-check's and overwriting one with the other would date
+  the column silently. Ports is empty where nothing has looked, and the row's
+  tooltip says which of "nothing found" and "not looked for" is meant. What
+  does not fit in a cell is **counted, never dropped** — the badges and the
+  ports both end in a `+n` — because a cell that quietly stops short shows a
+  device serving less than it does.
 - **The device list is the app.** It is a dense table of figures — addresses,
   MACs, latencies, port counts — so it is `--font-figure` throughout and the
   columns align. This is the screen everything else hangs off.
@@ -331,6 +378,13 @@ Two things the design language decides for this application specifically:
   lightness and chroma with the hue moved, so both themes come out of the
   recipe and there is no device palette to drift. Hues stay clear of 20–40,
   where `caution` and `critical` live, so a device never reads as a warning.
+- **A page that is a list of groups draws the groups.** `This network` is one
+  §7.14 card per interface, each answering the same four questions — address,
+  gateway, DNS, DHCP — rather than one column of eyebrows in the order the
+  survey happens to be in. The old shape could not say which gateway belonged
+  to which link, which is the whole question on a laptop with a VPN up. Where
+  the platform keeps resolvers per interface the card shows that interface's,
+  and where it keeps one list for the machine the card says so.
 - **A scan in progress is a normal state, not a modal.** Results arrive
   incrementally and the table fills; nothing blocks, and cancelling is always
   available and takes effect at the next packet rather than at the end of a
@@ -365,14 +419,25 @@ check needs it *today*: a client has to listen on port 68 to hear an offer at
 all, so without it that feature answers "Permission denied" on every Linux
 where Muster is not root. The `.deb`, the `.rpm` and the Arch package grant it
 in their install scriptlets, `packaging/check.sh` fails when a scriptlet or the
-message that names it drifts, and `platform::DHCP_HINT` prints the same
+message that names it drifts, and `platform::dhcp_hint` prints the same
 `setcap` line for everyone else.
 
-`CAP_NET_RAW` (plus `CAP_NET_ADMIN` for promiscuous mode) is what the privileged
-engine will need, and it is deliberately **not** granted: there is no code path
-that would use it yet, and a capability handed to a binary that cannot spend it
-is a capability handed out for nothing. It belongs in the same scriptlets the
-moment the raw transport lands. **AppImage and Flatpak cannot**: an AppImage is
+`CAP_NET_RAW` is granted beside it, and the test for granting a capability is
+unchanged: **a code path has to spend it.** One does. A ping socket is gated on
+`net.ipv4.ping_group_range` and Debian, Ubuntu and Pop!_OS leave it shut for
+everybody, so a packaged Muster there reported "no echo was sent" for every
+device on the network; `Echo::open` falls back to a raw ICMP socket, which is
+what the capability buys. `CAP_NET_ADMIN`, for the promiscuous mode the passive
+half of the privileged engine will want, is still **not** granted and belongs in
+the same scriptlets the moment there is something to spend it on.
+
+**The two messages print one command**, because `setcap` replaces a binary's
+capability set rather than adding to it: a user told to grant the raw socket
+alone would silently give up port 68, and a user told to grant the port alone
+would give up the echo. Both hints name
+`cap_net_bind_service,cap_net_raw=+ep`, and so does the README.
+
+**AppImage and Flatpak cannot**: an AppImage is
 extracted at run time and loses file capabilities, and a Flatpak sandbox has no
 mechanism to grant them. Those two builds are unprivileged-only, they must say
 so on the screen where it matters rather than in a README, and the Flatpak
@@ -501,10 +566,11 @@ that the next session does not have to rediscover the list.
 already designed.** `portscan::Cookie` is written and tested with no transport
 under it; ARP, DHCP from port 68 without fighting the system client, passive
 fingerprinting and LLDP all wait on the same thing — raw packet access, which
-is Npcap on Windows and `CAP_NET_RAW` on Linux. When it lands, the Linux
-packages add `cap_net_raw` beside the `cap_net_bind_service` they already grant
-(see `build-packages.sh`, which argues the difference) and the README's first
-"not there yet" entry goes.
+is Npcap on Windows and `CAP_NET_RAW` on Linux — which the Linux packages now
+grant, for the ICMP echo's raw fallback, so that half of the ask is already in
+place and `build-packages.sh` argues what each capability buys. When the engine
+lands, `CAP_NET_ADMIN` joins them and the README's first "not there yet" entry
+goes.
 
 Cheap and unprivileged, so worth doing before that:
 
@@ -515,8 +581,10 @@ Cheap and unprivileged, so worth doing before that:
 - **TLS certificate reading** on any open port. Subject and SAN are often the
   only place a device's real name is written. Reading a certificate is not
   authenticating, so it stays inside the conduct rules.
-- **Banner grabbing**, for the same reason and with the same limit: read what a
-  service volunteers, send nothing that is not a protocol's own greeting.
+- **Banner grabbing** beyond the SSH greeting `service.rs` already reads, with
+  the same limit: read what a service volunteers, send nothing that is not a
+  protocol's own greeting. HTTP `Server` headers are the obvious next one, and
+  they are a header to read rather than a badge to add.
 - **UDP service probes** as a table (DNS, mDNS, SSDP, NetBIOS, SNMP, NTP), which
   is the only honest way to scan UDP at all.
 - **IPv6 by NDP.** Addresses and routes are already read for both families;
@@ -525,8 +593,10 @@ Cheap and unprivileged, so worth doing before that:
 
 Interface work the device list is starting to ask for:
 
-- **Export**, as CSV and JSON. The obvious next question after a scan is "put
-  this in a ticket".
+- **Export**, as CSV and JSON, to a *file*. Copying a column of the marked
+  devices to the clipboard is built, and it covers the "put this in a ticket"
+  case one column at a time; a file with every column in it is the other half
+  and is where a format worth versioning starts.
 - **User labels**, kept beside the scan: somebody who knows their network can
   name the unknown devices once, and a label should outlive a rescan.
 - **Wake-on-LAN**, which is one broadcast packet and the only *write* this

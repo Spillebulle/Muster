@@ -15,6 +15,8 @@ pub mod art;
 pub mod deviceicon;
 pub mod dhcpcheck;
 pub mod icons;
+pub mod lucide;
+pub mod ping;
 pub mod ports;
 pub mod prefs;
 pub mod scan;
@@ -45,6 +47,17 @@ pub mod updatedlg;
 /// change lightly.
 pub const APP_ID: &str = "io.github.spillebulle.muster";
 
+/// The size the window opens at.
+///
+/// **Wide enough for the device table's fixed columns, the sidebar and a
+/// readable vendor column**, with nothing scrolled sideways. It is a constant
+/// rather than a literal because `app`'s own test measures the columns against
+/// it: a column added without room for it is a column that silently pushes
+/// "Made by" off the edge, and that is the sort of thing nobody notices until
+/// they are on a laptop. Tall enough for a /24's worth of rows to be worth
+/// scrolling through.
+pub const WINDOW: [f32; 2] = [1280.0, 760.0];
+
 /// Opens the window.
 ///
 /// The one entry point the binary uses. Returns the framework's error rather
@@ -53,10 +66,7 @@ pub const APP_ID: &str = "io.github.spillebulle.muster";
 pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            // Wide enough for the device table's columns without a horizontal
-            // scroll, and tall enough for a /24's worth of rows to be worth
-            // scrolling through.
-            .with_inner_size([1100.0, 720.0])
+            .with_inner_size(WINDOW)
             .with_min_inner_size([760.0, 420.0])
             .with_title("Muster")
             // The mark, rasterised from the palette rather than loaded

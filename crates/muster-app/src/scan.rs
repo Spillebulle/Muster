@@ -52,6 +52,26 @@ pub struct Options {
     pub dns: bool,
     /// Broadcast a DHCP DISCOVER and collect every offer.
     pub dhcp: bool,
+    /// Ask each device that answered whether it serves files over SMB.
+    pub smb: bool,
+    /// The same question over NFS.
+    pub nfs: bool,
+    /// Read the greeting an SSH server volunteers. Nothing is sent.
+    pub ssh: bool,
+}
+
+impl Options {
+    /// What [`muster_net::service`] is to be asked, out of the three flags
+    /// above. One place, so the phase that runs it and the phase that decides
+    /// whether to run it at all cannot disagree.
+    pub fn serving(self) -> muster_net::service::Options {
+        muster_net::service::Options {
+            smb: self.smb,
+            nfs: self.nfs,
+            ssh: self.ssh,
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for Options {
@@ -63,6 +83,11 @@ impl Default for Options {
             // See `prefs::Prefs::scan_dhcp`: asking servers to reserve an
             // address is a deliberate act, so it is off until somebody says so.
             dhcp: false,
+            // And these three are connections rather than datagrams, which the
+            // far end writes down. Same rule, same answer.
+            smb: false,
+            nfs: false,
+            ssh: false,
         }
     }
 }
@@ -81,6 +106,10 @@ pub enum Update {
         hit: Option<Box<Found>>,
     },
     Identifying {
+        done: usize,
+        total: usize,
+    },
+    Serving {
         done: usize,
         total: usize,
     },
@@ -105,8 +134,21 @@ pub struct Outcome {
 /// Which part of a scan is running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
-    Sweeping { probed: u64, total: u64 },
-    Identifying { done: usize, total: usize },
+    Sweeping {
+        probed: u64,
+        total: u64,
+    },
+    Identifying {
+        done: usize,
+        total: usize,
+    },
+    /// Asking the devices that answered what they serve: the connected
+    /// questions, which are a phase of their own because they are a different
+    /// shape from the datagrams above and are usually not asked at all.
+    Serving {
+        done: usize,
+        total: usize,
+    },
 }
 
 impl Phase {
@@ -120,7 +162,9 @@ impl Phase {
     pub fn fraction(self) -> Option<f32> {
         match self {
             Self::Sweeping { probed, total } if total > 0 => Some(probed as f32 / total as f32),
-            Self::Identifying { done, total } if total > 0 => Some(done as f32 / total as f32),
+            Self::Identifying { done, total } | Self::Serving { done, total } if total > 0 => {
+                Some(done as f32 / total as f32)
+            }
             _ => None,
         }
     }
@@ -129,6 +173,9 @@ impl Phase {
         match self {
             Self::Sweeping { probed, total } => format!("Sweeping {probed} of {total}"),
             Self::Identifying { done, total } => format!("Identifying {done} of {total}"),
+            Self::Serving { done, total } => {
+                format!("Asking {done} of {total} what they serve")
+            }
         }
     }
 }
@@ -220,6 +267,10 @@ impl State {
                     }
                     Ok(Update::Identifying { done, total }) => {
                         *phase = Phase::Identifying { done, total };
+                        moved = true;
+                    }
+                    Ok(Update::Serving { done, total }) => {
+                        *phase = Phase::Serving { done, total };
                         moved = true;
                     }
                     Ok(Update::Done(outcome)) => {
@@ -392,6 +443,26 @@ fn run(
             let _ = tx.send(Update::Identifying { done, total });
         },
     );
+
+    // What the devices serve, over a connection rather than a datagram. A
+    // phase of its own and after identification rather than inside it: these
+    // are TCP, they are off unless somebody switched one on, and a device that
+    // never answered the sweep is never connected to.
+    if opts.serving().any() && !cancel.load(Ordering::SeqCst) {
+        let serving = muster_net::service::many(
+            &addresses,
+            &muster_net::platform::tcp::Stream,
+            &rate,
+            opts.serving(),
+            &cancel,
+            &|done, total| {
+                let _ = tx.send(Update::Serving { done, total });
+            },
+        );
+        for (identity, serves) in names.iter_mut().zip(serving.iter()) {
+            identity.serves(serves);
+        }
+    }
 
     // The offers, and who made them. A server that answered is a device on the
     // list — usually the gateway — so the badge goes on its row rather than

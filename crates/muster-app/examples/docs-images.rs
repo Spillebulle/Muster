@@ -59,7 +59,7 @@ const SHOTS: [(&str, View, [f32; 2], Option<u8>); 5] = [
     // say about itself, so the picture shows the panel doing its job. It is
     // the one row that carries both badges, and the badges are the thing the
     // table alone cannot explain.
-    ("device.png", View::Devices, [1400.0, 520.0], Some(0)),
+    ("device.png", View::Devices, [1400.0, 520.0], Some(1)),
     ("network.png", View::Network, [720.0, 380.0], None),
     ("about.png", View::About, [720.0, 480.0], None),
 ];

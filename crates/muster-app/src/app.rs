@@ -20,7 +20,7 @@ use crate::icons::{self, Icon};
 use crate::scan::{self, State};
 use crate::theme::{self, Mode, Palette, metrics, text};
 use crate::update::{Exit, Updates};
-use crate::{deviceicon, dhcpcheck, ports, prefs, settings, updatedlg};
+use crate::{deviceicon, dhcpcheck, ping, ports, prefs, settings, updatedlg};
 use egui::{Align, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 use muster_net::identify::Identity;
 use muster_net::{Prefix, Survey};
@@ -110,19 +110,31 @@ pub struct App {
     prefs: prefs::Prefs,
     /// What the desktop asked for, so `Theme::System` has something to follow.
     system_mode: Mode,
-    /// A re-probe in flight: which device, and where its answer will arrive.
-    ping: Option<(
-        std::net::IpAddr,
-        std::sync::mpsc::Receiver<muster_net::discover::Recheck>,
-    )>,
-    /// What the last re-probe said, and about which device.
+    /// Re-checks: the last answer about each device, and any run in flight.
     ///
-    /// The whole [`muster_net::discover::Recheck`] rather than the round trip
-    /// alone, because the round trip cannot tell "it did not answer" from "the
-    /// question was never asked". A machine that cannot open a ping socket
-    /// sends no echo at all, and reporting that as silence from the device is
-    /// the failure `CLAUDE.md` calls the worst this application can produce.
-    pinged: Option<(std::net::IpAddr, muster_net::discover::Recheck)>,
+    /// A map rather than "the last one", because a run can be about twenty
+    /// devices and because a loop keeps answering. See [`crate::ping`], which
+    /// also holds the reason the whole `Recheck` is kept rather than the round
+    /// trip: a round trip cannot tell "it did not answer" from "the question
+    /// was never asked".
+    ping: ping::State,
+    /// The devices the user has marked, by address.
+    ///
+    /// By address for the same reason [`Self::selected`] is: a second scan
+    /// reorders the table, and an index would carry a mark to whatever moved
+    /// into that row. A device that is no longer in the table keeps its mark
+    /// and is simply not shown, which is what makes a mark survive a rescan of
+    /// the same network.
+    marked: std::collections::BTreeSet<std::net::IpAddr>,
+    /// What was last copied, and when, for the pill at the foot of the window.
+    copied: Option<(String, std::time::Instant)>,
+    /// Devices waiting for a port scan, in order.
+    ///
+    /// **A queue rather than a set of threads**, because the rate limiter is
+    /// global: two scans at once would each get half the budget and both would
+    /// report a machine as more filtered than it is. `ports::State` owns that
+    /// rule and this is what lets an action over twenty devices honour it.
+    port_queue: std::collections::VecDeque<std::net::IpAddr>,
     /// The update check and the dialog it raises.
     ///
     /// Its two settings are loaded from [`prefs`] at start-up and written back
@@ -176,8 +188,10 @@ impl App {
             settings: settings::State::default(),
             prefs: saved.clone(),
             system_mode,
-            ping: None,
-            pinged: None,
+            ping: ping::State::default(),
+            marked: std::collections::BTreeSet::new(),
+            copied: None,
+            port_queue: std::collections::VecDeque::new(),
             updates,
         };
         apply_for(&cc.egui_ctx, Palette::of(app.mode), app.mode);
@@ -226,8 +240,10 @@ impl App {
             settings: settings::State::default(),
             prefs: prefs::Prefs::default(),
             system_mode: mode,
-            ping: None,
-            pinged: None,
+            ping: ping::State::default(),
+            marked: std::collections::BTreeSet::new(),
+            copied: None,
+            port_queue: std::collections::VecDeque::new(),
             updates,
         }
     }
@@ -245,54 +261,19 @@ impl App {
             .any(|local| local.contains(prefix.network()))
     }
 
-    /// Ask one device again, on a thread.
+    /// Ask one device again, on a thread. The panel's own Ping button.
     fn start_ping(&mut self, address: std::net::IpAddr) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let on_link = self.target.is_some_and(|p| self.on_link(p));
-        std::thread::spawn(move || {
-            let opts = if on_link {
-                muster_net::discover::Options::on_link()
-            } else {
-                muster_net::discover::Options::default()
-            };
-            let found = muster_net::discover::recheck(
-                address,
-                &muster_net::platform::Host,
-                &muster_net::rate::Bucket::polite(),
-                opts,
-            );
-            let _ = tx.send(found);
-        });
-        self.ping = Some((address, rx));
+        self.start_pings(vec![address], false);
     }
 
-    /// Take a ping's answer if it has arrived. True when something changed.
-    fn poll_ping(&mut self) -> bool {
-        let Some((address, rx)) = &self.ping else {
-            return false;
-        };
-        match rx.try_recv() {
-            Ok(answer) => {
-                self.pinged = Some((*address, answer));
-                self.ping = None;
-                true
-            }
-            // The worker ended without answering, which can only be a panic in
-            // it. Stop waiting rather than leaving "asking…" on screen, and say
-            // that the probe itself failed rather than blaming the device.
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.pinged = Some((
-                    *address,
-                    muster_net::discover::Recheck {
-                        found: None,
-                        not_done: vec!["the probe did not finish".into()],
-                    },
-                ));
-                self.ping = None;
-                true
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => false,
-        }
+    /// Ask several devices again, once or until stopped.
+    ///
+    /// One entry point for the panel's button and the table's action menu, so
+    /// there is one place that decides what a re-check is and the two cannot
+    /// ask differently.
+    fn start_pings(&mut self, targets: Vec<std::net::IpAddr>, looping: bool) {
+        let on_link = self.target.is_some_and(|p| self.on_link(p));
+        self.ping.start(targets, looping, on_link);
     }
 
     /// Open the settings page, for `examples/docs-images.rs`.
@@ -368,6 +349,19 @@ impl App {
         }
     }
 
+    /// Take the next device off the port-scan queue, if nothing is running.
+    ///
+    /// Called where a scan could have finished as well as where one is asked
+    /// for, so a queue drains without anything having to watch it.
+    fn start_next_port_scan(&mut self) {
+        if self.ports.is_running() {
+            return;
+        }
+        if let Some(address) = self.port_queue.pop_front() {
+            self.ports = ports::State::start(address, muster_net::portscan::Ports::common());
+        }
+    }
+
     /// What a scan is asked to do, out of the settings.
     fn scan_options(&self) -> scan::Options {
         scan::Options {
@@ -375,6 +369,9 @@ impl App {
             identify: self.prefs.identify,
             dns: self.prefs.scan_dns,
             dhcp: self.prefs.scan_dhcp,
+            smb: self.prefs.scan_smb,
+            nfs: self.prefs.scan_nfs,
+            ssh: self.prefs.scan_ssh,
         }
     }
 }
@@ -405,11 +402,23 @@ impl eframe::App for App {
                 self.scan.record_open_ports(address, &open);
             }
         }
+        // A finished scan has been folded into its device above, so the next
+        // one may start. Outside the `if` on purpose: the queue has to drain on
+        // the frame after a scan ends, and that frame has nothing new to poll.
+        self.start_next_port_scan();
+        if !self.port_queue.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
         if self.dhcp.poll() || self.dhcp.is_running() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
-        if self.poll_ping() || self.ping.is_some() {
+        if self.ping.poll() || self.ping.is_running() {
             ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        }
+        // The pill at the foot fades on a clock rather than on an event, so
+        // the frame that takes it away has to be asked for.
+        if self.copied.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
 
         // The startup check, once, and only once the notice has been answered.
@@ -445,6 +454,9 @@ impl eframe::App for App {
         let p = self.palette();
         top_bar(ctx, p, self);
         status_bar(ctx, p, self);
+        // Over everything, in the corner §7.17 gives a toast, and after the
+        // status bar so it sits above it rather than under it.
+        copied_pill(ctx, p, self);
         sidebar(ctx, p, self);
 
         let view = self.view;
@@ -534,120 +546,20 @@ fn top_bar(ctx: &egui::Context, p: Palette, app: &mut App) {
                         .color(p.text_strong),
                 );
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // §6.2 keeps navigation out of the top bar, and a gear is
-                    // navigation: it went to the settings page from the one
-                    // corner of the window furthest from every other way of
-                    // getting somewhere. It is a row at the foot of the
-                    // sidebar now, beside About, which is where the rest of
-                    // the family keeps both. See [`sidebar`].
-                    //
-                    // The scan control used to sit here too, and it belongs in
-                    // the options strip with the range it acts on — a control
-                    // in one strip acting on a field in another is how a
-                    // reader loses the connection between them.
-                    //
-                    // What a scan *does*, as against where it goes. The range
-                    // is a field in the strip above the table because it
-                    // changes with every scan; these change once and are then
-                    // remembered, so they live behind a menu rather than
-                    // spending width on the densest screen in the application.
-                    scan_menu(ui, p, app);
-                });
+                // **Nothing else lives up here, and that is the whole of §6.2.**
+                // The gear was in this corner once, which put navigation in the
+                // one place furthest from every other way of getting somewhere;
+                // it is a row at the foot of the sidebar now, beside About.
+                //
+                // The scan control was here too, and then what a scan *asks*
+                // was here as a menu of its own after the control had moved
+                // down to the options strip — which left a menu in one strip
+                // governing a button in another. Both are in the strip above
+                // the table now, and they are one control: see
+                // [`scan_control`], where the arrow at the button's right end
+                // opens exactly what that menu carried.
             });
         });
-}
-
-/// The scan menu: what a scan asks, and how hard.
-///
-/// A §7.17 popover hung off the top bar. Everything in it writes
-/// [`crate::prefs::Prefs`] and is saved as it changes, so this and the settings
-/// page's Scanning pane are two views of one set of values rather than two sets
-/// that can drift apart.
-///
-/// **A running scan does not read these again.** [`scan::Options`] is taken
-/// once at the start, so moving a control here changes the *next* scan and
-/// never the one on screen. The note at the foot says so rather than leaving
-/// somebody to wonder why nothing happened.
-fn scan_menu(ui: &mut egui::Ui, p: Palette, app: &mut App) {
-    let response = menu_button(ui, p, "Scan");
-    let mut changed = false;
-    let mode = app.mode;
-    egui::Popup::menu(&response)
-        .gap(metrics::S1)
-        .frame(
-            egui::Frame::NONE
-                .fill(p.popover.to_opaque())
-                .stroke(Stroke::new(metrics::HAIRLINE, p.line_popover))
-                .corner_radius(metrics::RADIUS_MODAL)
-                .inner_margin(egui::Margin::same(metrics::PAD_PANEL as i8))
-                .shadow(theme::shadow::menu(mode)),
-        )
-        .show(|ui| {
-            ui.set_width(SCAN_MENU_WIDTH);
-            ui.label(
-                RichText::new("WHAT A SCAN ASKS")
-                    .size(text::EYEBROW)
-                    .color(p.placeholder),
-            );
-            ui.add_space(metrics::S2);
-
-            for (label, explain, value) in [
-                (
-                    "Identify devices",
-                    "mDNS, SSDP and NetBIOS, and the model a device names for itself.",
-                    &mut app.prefs.identify,
-                ),
-                (
-                    "Find name servers",
-                    "One DNS query per device that answered.",
-                    &mut app.prefs.scan_dns,
-                ),
-                (
-                    "Find DHCP servers",
-                    "Broadcasts a DISCOVER and keeps every offer. Nothing is accepted.",
-                    &mut app.prefs.scan_dhcp,
-                ),
-            ] {
-                changed |= menu_toggle(ui, p, label, explain, value);
-            }
-
-            ui.add_space(metrics::S2);
-            ui.label(
-                RichText::new("RATE")
-                    .size(text::EYEBROW)
-                    .color(p.placeholder),
-            );
-            ui.add_space(metrics::S2);
-            ui.horizontal(|ui| {
-                let mut value = app.prefs.rate as f32;
-                crate::settings::slider(ui, p, &mut value, 50.0, 5000.0, 50.0);
-                if value as u32 != app.prefs.rate {
-                    app.prefs.rate = value as u32;
-                    changed = true;
-                }
-                ui.add_space(metrics::S2);
-                ui.label(
-                    RichText::new(format!("{} /s", app.prefs.rate))
-                        .size(text::TINY)
-                        .monospace()
-                        .color(p.text_muted),
-                );
-            });
-
-            if app.scan.is_running() {
-                ui.add_space(metrics::S2);
-                ui.label(
-                    RichText::new("The scan running now keeps the settings it started with.")
-                        .size(text::TINY)
-                        .color(p.text_dim),
-                );
-            }
-        });
-
-    if changed {
-        prefs::save(&app.prefs);
-    }
 }
 
 /// How wide the scan menu is: enough for its longest sentence on one line.
@@ -683,79 +595,348 @@ fn menu_toggle(
     changed
 }
 
-/// A button that opens a menu: §7.6's secondary with a chevron after the label.
+/// Start or stop, and beside it what the next scan will ask.
 ///
-/// Icon-only controls need a tooltip and this one is not icon-only, but the
-/// chevron is the only thing saying it opens rather than acts, so it carries
-/// the cursor change that says the same.
-fn menu_button(ui: &mut egui::Ui, p: Palette, label: &str) -> egui::Response {
-    let font = FontId::proportional(text::CONTROL);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_string(), font.clone(), p.text);
-    let width = galley.size().x + metrics::S3 * 2.0 + CHEVRON;
-    let (rect, response) = ui.allocate_exact_size(vec2(width, metrics::BUTTON), Sense::click());
-    let fill = if response.hovered() {
-        p.control_hover
-    } else {
-        p.control
-    };
-    ui.painter().rect_filled(rect, metrics::RADIUS, fill);
-    ui.painter().text(
-        pos2(rect.left() + metrics::S3, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        label,
-        font,
-        p.text,
-    );
-
-    // Two strokes, from the same set as the close mark and the gear, rather
-    // than a letter pretending to be an icon.
-    let c = pos2(rect.right() - metrics::S3 - CHEVRON / 2.0, rect.center().y);
-    let (w, h) = (CHEVRON * 0.34, CHEVRON * 0.18);
-    let ink = if response.hovered() {
-        p.text_strong
-    } else {
-        p.text_muted
-    };
-    for arm in [-w, w] {
-        ui.painter().line_segment(
-            [pos2(c.x + arm, c.y - h), pos2(c.x, c.y + h)],
-            Stroke::new(1.4_f32, ink),
-        );
-    }
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// The chevron's box on a menu button.
-const CHEVRON: f32 = 12.0;
-
-/// Start, or stop. Cancelling is available throughout a scan and takes effect
-/// at the next probe, so the control never has to be disabled mid-run.
+/// **A split control**, which is new to §7.6 and is here for a reason the
+/// alternatives could not meet. What a scan asks used to be a menu of its own
+/// in the top bar, and the button that acts on those settings was down here
+/// beside the range it sweeps: a control in one strip governing a menu in
+/// another is how a reader loses the connection between them. Folding the menu
+/// into the button's own right-hand end puts the question and the answer in one
+/// place, and leaves the top bar to the mark, which is §6.2's whole argument.
+///
+/// Cancelling is available throughout a scan and takes effect at the next
+/// probe, so the acting half never has to be disabled mid-run. The arrow is
+/// never disabled at all: a scan that is running is exactly when somebody wants
+/// to set up the next one.
 fn scan_control(ui: &mut egui::Ui, p: Palette, app: &mut App) {
-    if app.scan.is_running() {
-        if button(ui, p, "Stop", Kind::Secondary, true).clicked() {
-            app.scan.cancel();
-        }
-        return;
-    }
-
-    let can = app.target.is_some();
-    let label = match app.scan {
-        State::Finished(_) => "Scan again",
+    let running = app.scan.is_running();
+    let can = running || app.target.is_some();
+    let label = match (running, &app.scan) {
+        (true, _) => "Stop",
+        (_, State::Finished(_)) => "Scan again",
         _ => "Scan",
     };
-    let response = button(ui, p, label, Kind::Primary, can);
+    let kind = if running {
+        Kind::Secondary
+    } else {
+        Kind::Primary
+    };
+
+    let split = split_button(ui, p, label, kind, can);
     if !can {
         // A control that cannot act says why rather than being mysteriously
         // dead. `CLAUDE.md`: nothing claims what the app cannot do.
-        response.clone().on_hover_text(
+        split.act.clone().on_hover_text(
             "No local network small enough to sweep. Run `muster survey` to see what \
              this machine knows.",
         );
     }
-    if response.clicked() && can {
+    if split.act.clicked() && can {
+        if running {
+            app.scan.cancel();
+        } else {
+            app.start_scan();
+        }
+    }
+
+    scan_options(ui, p, app, &split);
+}
+
+/// The two halves of a split button, and the whole it was drawn in.
+struct Split {
+    /// The label's half: the thing the button does.
+    act: egui::Response,
+    /// The arrow's half: the thing it opens.
+    more: egui::Response,
+    /// Both together, which is what a popover hangs off. Anchoring to the arrow
+    /// alone would hang a 320 px panel off a 26 px control and leave it looking
+    /// like it belonged to nothing.
+    whole: Rect,
+}
+
+/// §7.6's button with an arrow fenced off at its right end.
+///
+/// One fill, one radius and one hairline between the halves, so it reads as one
+/// control that can be pressed in two places rather than as two controls that
+/// happen to touch. The hovered half is the one that lights up, which is the
+/// only thing that tells somebody which of the two they are about to press.
+fn split_button(ui: &mut egui::Ui, p: Palette, label: &str, kind: Kind, enabled: bool) -> Split {
+    let font = match kind {
+        Kind::Primary => theme::strong(text::CONTROL),
+        _ => FontId::proportional(text::CONTROL),
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font, Color32::PLACEHOLDER);
+    let width = galley.size().x + metrics::PAD_PANEL * 2.0 + ARROW_HALF;
+    let (whole, _) = ui.allocate_exact_size(vec2(width, metrics::BUTTON), Sense::hover());
+    let (left, right) = whole.split_left_right_at_x(whole.right() - ARROW_HALF);
+
+    let id = ui.id().with("split");
+    let act = ui.interact(
+        left,
+        id.with("act"),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    // Never disabled: see [`scan_control`].
+    let more = ui.interact(right, id.with("more"), Sense::click());
+
+    let hovered = enabled && (act.hovered() || more.hovered());
+    // **The fill is taken unhovered on purpose**, and the border and the ink
+    // are not. A filled kind lights up half of itself below, so a base fill
+    // that had already lit the whole control would make the half that is
+    // actually under the pointer indistinguishable from the half that is not.
+    // A border and an ink belong to the control as a whole and follow it.
+    let (fill, _, _) = skin(p, kind, false);
+    let (_, border, ink) = skin(p, kind, hovered);
+    let dim = |c: Color32| {
+        if enabled { c } else { c.gamma_multiply(0.45) }
+    };
+
+    if let Some(fill) = fill {
+        ui.painter().rect_filled(whole, metrics::RADIUS, dim(fill));
+    }
+    if let Some(border) = border {
+        ui.painter().rect_stroke(
+            whole,
+            metrics::RADIUS,
+            Stroke::new(metrics::HAIRLINE, dim(border)),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    // The half under the pointer, rounded on its own outer side only, so the
+    // highlight stops at the fence rather than at a corner of its own. The
+    // primary keeps its accent under the pointer, exactly as [`button`] does.
+    if enabled && fill.is_some() && kind != Kind::Primary {
+        let r = metrics::RADIUS as u8;
+        let ends = |outer_left: bool| {
+            if outer_left {
+                egui::CornerRadius {
+                    nw: r,
+                    sw: r,
+                    ne: 0,
+                    se: 0,
+                }
+            } else {
+                egui::CornerRadius {
+                    nw: 0,
+                    sw: 0,
+                    ne: r,
+                    se: r,
+                }
+            }
+        };
+        if act.hovered() {
+            ui.painter().rect_filled(left, ends(true), p.control_hover);
+        } else if more.hovered() {
+            ui.painter()
+                .rect_filled(right, ends(false), p.control_hover);
+        }
+    }
+
+    ui.painter().galley(
+        pos2(
+            left.center().x - galley.size().x / 2.0,
+            left.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        dim(ink),
+    );
+
+    // The fence. Drawn in the ink the label is drawn in, at a fraction of it,
+    // so it belongs to the control in both themes: there is no line token that
+    // reads as a border on an accent fill.
+    let inset = metrics::S1;
+    ui.painter().line_segment(
+        [
+            pos2(right.left(), whole.top() + inset),
+            pos2(right.left(), whole.bottom() - inset),
+        ],
+        Stroke::new(metrics::HAIRLINE, dim(ink.gamma_multiply(0.35))),
+    );
+
+    // Two strokes, from the same set as the close mark and the gear, rather
+    // than a letter pretending to be an icon.
+    let c = right.center();
+    let (w, h) = (CHEVRON * 0.34, CHEVRON * 0.18);
+    let point = if more.hovered() {
+        ink
+    } else {
+        ink.gamma_multiply(0.8)
+    };
+    for arm in [-w, w] {
+        ui.painter().line_segment(
+            [pos2(c.x + arm, c.y - h), pos2(c.x, c.y + h)],
+            Stroke::new(1.4_f32, dim(point)),
+        );
+    }
+
+    let act = if enabled {
+        act.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        act
+    };
+    // §11: an icon-only control carries a tooltip. This one is a chevron and
+    // nothing else, so it says what it opens.
+    let more = more
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("What the next scan asks");
+    Split { act, more, whole }
+}
+
+/// The arrow's half of a split button. Its own target, and no wider than it
+/// needs to be: the width belongs to the label.
+const ARROW_HALF: f32 = 26.0;
+
+/// The chevron's box.
+const CHEVRON: f32 = 12.0;
+
+/// What a scan asks, hung off the arrow.
+///
+/// A §7.17 popover. Everything in it writes [`crate::prefs::Prefs`] and is saved
+/// as it changes, so this and the settings page's Scanning pane are two views of
+/// one set of values rather than two sets that can drift apart.
+///
+/// **It stays open until it is dismissed.** A menu closes on the first click,
+/// which is right for a menu and wrong for a panel of switches: somebody
+/// turning two things on had to reopen it between them. So the ways out are a
+/// click outside it, escape, and the Scan button at its foot, which is the same
+/// set a dialog has.
+///
+/// **A running scan does not read these again.** [`scan::Options`] is taken once
+/// at the start, so moving a control here changes the *next* scan and never the
+/// one on screen. The note at the foot says so rather than leaving somebody to
+/// wonder why nothing happened.
+fn scan_options(ui: &mut egui::Ui, p: Palette, app: &mut App, split: &Split) {
+    let mut changed = false;
+    let mut go = false;
+    let mode = app.mode;
+    let id = egui::Popup::default_response_id(&split.more);
+
+    egui::Popup::from_toggle_button_response(&split.more)
+        .anchor(split.whole)
+        .kind(egui::PopupKind::Menu)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .gap(metrics::S1)
+        .frame(
+            egui::Frame::NONE
+                .fill(p.popover.to_opaque())
+                .stroke(Stroke::new(metrics::HAIRLINE, p.line_popover))
+                .corner_radius(metrics::RADIUS_MODAL)
+                .inner_margin(egui::Margin::same(metrics::PAD_PANEL as i8))
+                .shadow(theme::shadow::menu(mode)),
+        )
+        .show(|ui| {
+            ui.set_width(SCAN_MENU_WIDTH);
+            ui.label(
+                RichText::new("WHAT A SCAN ASKS")
+                    .size(text::EYEBROW)
+                    .color(p.placeholder),
+            );
+            ui.add_space(metrics::S2);
+
+            for (label, explain, value) in [
+                (
+                    "Identify devices",
+                    "mDNS, SSDP and NetBIOS, and the model a device names for itself.",
+                    &mut app.prefs.identify,
+                ),
+                (
+                    "Find name servers",
+                    "One DNS query per device that answered.",
+                    &mut app.prefs.scan_dns,
+                ),
+                (
+                    "Find DHCP servers",
+                    "Broadcasts a DISCOVER and keeps every offer. Nothing is accepted.",
+                    &mut app.prefs.scan_dhcp,
+                ),
+                (
+                    "Find file shares",
+                    "The negotiate an SMB client sends first, on port 445. Nothing is opened.",
+                    &mut app.prefs.scan_smb,
+                ),
+                (
+                    "Find NFS exports",
+                    "The null call the protocol defines for it, on port 2049. Nothing is read.",
+                    &mut app.prefs.scan_nfs,
+                ),
+                (
+                    "Read SSH greetings",
+                    "Listens to what a server says on port 22. Nothing is sent to it.",
+                    &mut app.prefs.scan_ssh,
+                ),
+            ] {
+                changed |= menu_toggle(ui, p, label, explain, value);
+            }
+
+            ui.add_space(metrics::S2);
+            ui.label(
+                RichText::new("RATE")
+                    .size(text::EYEBROW)
+                    .color(p.placeholder),
+            );
+            ui.add_space(metrics::S2);
+            ui.horizontal(|ui| {
+                let mut value = app.prefs.rate as f32;
+                crate::settings::slider(ui, p, &mut value, 50.0, 5000.0, 50.0);
+                if value as u32 != app.prefs.rate {
+                    app.prefs.rate = value as u32;
+                    changed = true;
+                }
+                ui.add_space(metrics::S2);
+                ui.label(
+                    RichText::new(format!("{} /s", app.prefs.rate))
+                        .size(text::TINY)
+                        .monospace()
+                        .color(p.text_muted),
+                );
+            });
+
+            ui.add_space(metrics::S3);
+            let (line, _) =
+                ui.allocate_exact_size(vec2(SCAN_MENU_WIDTH, metrics::HAIRLINE), Sense::hover());
+            ui.painter().rect_filled(line, 0.0, p.line_popover);
+            ui.add_space(metrics::S2);
+
+            if app.scan.is_running() {
+                ui.label(
+                    RichText::new("The scan running now keeps the settings it started with.")
+                        .size(text::TINY)
+                        .color(p.text_dim),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("These take effect on the next scan.")
+                            .size(text::TINY)
+                            .color(p.text_dim),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let can = app.target.is_some();
+                        if button(ui, p, "Scan", Kind::Primary, can).clicked() && can {
+                            go = true;
+                        }
+                    });
+                });
+            }
+        });
+
+    if changed {
+        prefs::save(&app.prefs);
+    }
+    // The one way out that also acts. Closed by hand rather than by the popover
+    // itself: the click landed inside it, which is exactly the click this
+    // popover is configured to ignore.
+    if go {
         app.start_scan();
+        egui::Popup::close_id(ui.ctx(), id);
     }
 }
 
@@ -777,6 +958,33 @@ pub(crate) enum Kind {
     Outlined,
     /// Cancel and tertiary. No fill, no border.
     Ghost,
+}
+
+/// What each of §7.6's kinds is made of: a fill, a border, and the ink on it.
+///
+/// One table, read by both [`button`] and [`split_button`]. It was inside
+/// `button` while `button` was the only thing that drew one, and the split
+/// control is what made a second reader of it: two copies of this table would
+/// be two buttons that stopped matching the first time a token moved.
+fn skin(p: Palette, kind: Kind, hovered: bool) -> (Option<Color32>, Option<Color32>, Color32) {
+    match kind {
+        Kind::Primary => (Some(p.accent), None, p.accent_ink),
+        Kind::Secondary => (
+            Some(if hovered { p.control_hover } else { p.control }),
+            None,
+            p.text,
+        ),
+        Kind::Outlined => (
+            None,
+            Some(if hovered { p.line_dashed } else { p.line }),
+            p.text,
+        ),
+        Kind::Ghost => (
+            None,
+            None,
+            if hovered { p.text_strong } else { p.text_muted },
+        ),
+    }
 }
 
 /// A button, drawn to §7.6.
@@ -809,25 +1017,7 @@ pub(crate) fn button(
         },
     );
 
-    let hovered = enabled && response.hovered();
-    let (fill, border, ink) = match kind {
-        Kind::Primary => (Some(p.accent), None, p.accent_ink),
-        Kind::Secondary => (
-            Some(if hovered { p.control_hover } else { p.control }),
-            None,
-            p.text,
-        ),
-        Kind::Outlined => (
-            None,
-            Some(if hovered { p.line_dashed } else { p.line }),
-            p.text,
-        ),
-        Kind::Ghost => (
-            None,
-            None,
-            if hovered { p.text_strong } else { p.text_muted },
-        ),
-    };
+    let (fill, border, ink) = skin(p, kind, enabled && response.hovered());
 
     // 45 % opacity on the *whole* control, which is what makes a disabled
     // button read as unavailable rather than as merely quiet.
@@ -1018,6 +1208,26 @@ fn status_bar(ctx: &egui::Context, p: Palette, app: &App) {
                 };
                 ui.label(RichText::new(message).size(text::TINY).color(p.text_dim));
 
+                // A ping that keeps going has to be visible from outside the
+                // table it is filling: the Ping column says "asking" on the
+                // rows in front of the reader, and this says how many rows
+                // there are and which time round it is. A loop nothing on
+                // screen mentions is a loop somebody leaves running.
+                if let Some((done, total, pass)) = app.ping.progress() {
+                    let mut line = format!(" · pinging {done} of {total}");
+                    if pass > 1 {
+                        line.push_str(&format!(", round {pass}"));
+                    }
+                    ui.label(RichText::new(line).size(text::TINY).color(p.text_dim));
+                }
+                if !app.port_queue.is_empty() {
+                    ui.label(
+                        RichText::new(format!(" · {} more to port scan", app.port_queue.len()))
+                            .size(text::TINY)
+                            .color(p.text_dim),
+                    );
+                }
+
                 if let State::Running { phase, .. } = &app.scan {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         progress(ui, p, phase.fraction());
@@ -1061,8 +1271,21 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
     let survey = app.survey.clone();
 
     // Above the empty state as well as above the table: a scan that found
-    // nothing is exactly when somebody wants to change the range.
-    devices_toolbar(ui, p, app);
+    // nothing is exactly when somebody wants to change the range. It is drawn
+    // after the rows have been decided rather than before, because the two
+    // menus in it act on exactly the rows the filter is showing.
+    let shown = shown_rows(app, &devices, &names, &survey);
+    devices_toolbar(
+        ui,
+        p,
+        app,
+        Table {
+            devices: &devices,
+            names: &names,
+            survey: &survey,
+            shown: &shown,
+        },
+    );
 
     if devices.is_empty() {
         let (message, action) = match &app.scan {
@@ -1076,9 +1299,87 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
         return;
     }
 
-    // The order to draw in, as a list of indices into the two parallel
-    // vectors. Sorting the devices themselves would break that pairing, and
-    // sorting pairs would copy an identity per row per frame.
+    let marked_here = shown
+        .iter()
+        .filter(|i| app.marked.contains(&devices[**i].address))
+        .count();
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add_space(metrics::S2);
+            if let Some(mark_all) =
+                table_header(ui, p, &mut app.sort, Marks::of(marked_here, shown.len()))
+            {
+                for i in &shown {
+                    let address = devices[*i].address;
+                    if mark_all {
+                        app.marked.insert(address);
+                    } else {
+                        app.marked.remove(&address);
+                    }
+                }
+            }
+            let mode = app.mode;
+            for i in &shown {
+                let host = &devices[*i];
+                let named = names.get(*i);
+                let vantage = survey.vantage(host.address);
+                let selected = app.selected == Some(host.address);
+                let marked = app.marked.contains(&host.address);
+                let ping = if app.ping.waiting_for(host.address) {
+                    PingCell::Waiting
+                } else {
+                    match app.ping.answer_for(host.address) {
+                        Some(answer) => PingCell::Answer(answer),
+                        None => PingCell::Never,
+                    }
+                };
+                let row = device_row(
+                    ui,
+                    p,
+                    host,
+                    RowInput {
+                        mode,
+                        named,
+                        vantage,
+                        selected,
+                        marked,
+                        ping,
+                    },
+                );
+                if row.marked {
+                    if marked {
+                        app.marked.remove(&host.address);
+                    } else {
+                        app.marked.insert(host.address);
+                    }
+                }
+                if row.clicked {
+                    // Clicking the open row shuts the window, which is the way
+                    // back to the table without reaching for a close button.
+                    app.selected = if selected { None } else { Some(host.address) };
+                }
+            }
+            if shown.is_empty() {
+                empty_state(ui, p, "Nothing here matches that.", None);
+            }
+            ui.add_space(metrics::S2);
+        });
+}
+
+/// The rows to draw, sorted and filtered, as indices into the scan's own
+/// vectors.
+///
+/// Indices rather than devices: the devices and the names are two parallel
+/// vectors and sorting either one would break the pairing, while sorting pairs
+/// would copy an identity per row per frame.
+fn shown_rows(
+    app: &App,
+    devices: &[muster_net::discover::Found],
+    names: &[Identity],
+    survey: &Survey,
+) -> Vec<usize> {
     let empty = Identity::default();
     let mut order: Vec<usize> = (0..devices.len()).collect();
     let sort = app.sort;
@@ -1088,7 +1389,13 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
             let named = names.get(i);
             let vantage = survey.vantage(host.address);
             let kind = muster_net::kind::kind_of(host, named.unwrap_or(&empty), vantage);
-            sort_key(sort.column, host, named, kind)
+            sort_key(
+                sort.column,
+                host,
+                named,
+                kind,
+                app.ping.rtt_for(host.address),
+            )
         };
         let (left, right) = (key(*a), key(*b));
         // The emptiness flag is the first element of the key and is compared
@@ -1099,36 +1406,19 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
             if sort.ascending { rest } else { rest.reverse() }
         })
     });
-
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.add_space(metrics::S2);
-            table_header(ui, p, &mut app.sort);
-            let mode = app.mode;
-            let mut shown = 0usize;
-            for i in order {
-                let host = &devices[i];
-                let named = names.get(i);
-                let vantage = survey.vantage(host.address);
-                let kind = muster_net::kind::kind_of(host, named.unwrap_or(&empty), vantage);
-                if !matches(&app.search, host, named, kind) {
-                    continue;
-                }
-                shown += 1;
-                let selected = app.selected == Some(host.address);
-                let response = device_row(ui, p, mode, host, named, vantage, selected);
-                if response.clicked() {
-                    // Clicking the open row shuts the window, which is the way
-                    // back to the table without reaching for a close button.
-                    app.selected = if selected { None } else { Some(host.address) };
-                }
-            }
-            if shown == 0 {
-                empty_state(ui, p, "Nothing here matches that.", None);
-            }
-            ui.add_space(metrics::S2);
-        });
+    // Which rows the filter leaves. The header's box and both menus act on
+    // exactly these: "everything" means everything in front of the reader,
+    // never forty devices a search has hidden.
+    order
+        .into_iter()
+        .filter(|i| {
+            let host = &devices[*i];
+            let named = names.get(*i);
+            let vantage = survey.vantage(host.address);
+            let kind = muster_net::kind::kind_of(host, named.unwrap_or(&empty), vantage);
+            matches(&app.search, host, named, kind)
+        })
+        .collect()
 }
 
 /// The device-kind icon's column. Narrow: it carries a picture and no text,
@@ -1152,12 +1442,30 @@ const TABLE_SELECTION_RADIUS: f32 = 0.0;
 /// where `art`'s optical sizing would drop the glyph.
 const MARK_TEXTURE: u32 = 64;
 
-const COL_ADDRESS: f32 = 130.0;
-const COL_NAME: f32 = 190.0;
-const COL_MAC: f32 = 150.0;
-const COL_TIME: f32 = 64.0;
-/// The badges: what a device serves the network. Two fit side by side.
-const COL_SERVES: f32 = 84.0;
+/// The mark's column: §7.12's 16 px box in an 18 px hit area, plus the air
+/// that keeps it off the window's edge. Fixed, so every box in the table lines
+/// up under the one in the header.
+const COL_MARK: f32 = 24.0;
+
+const COL_ADDRESS: f32 = 116.0;
+const COL_NAME: f32 = 174.0;
+const COL_MAC: f32 = 124.0;
+/// The sweep's round trip: what the scan measured when it found the device.
+const COL_TIME: f32 = 58.0;
+/// The last re-check's round trip, which is a different fact from the sweep's
+/// and is why it is a column of its own rather than a number that overwrites
+/// one taken ten minutes ago.
+const COL_PING: f32 = 62.0;
+/// The open ports known about this device: what the sweep's knock found, and
+/// whatever a port scan of it has added since. Wide enough for four, and what
+/// does not fit is counted. See [`ports_cell`].
+const COL_PORTS: f32 = 120.0;
+/// The badges: what a device serves the network.
+///
+/// Wide enough for four of the five, which is every combination a real device
+/// has turned up with: a router is DHCP and DNS, a NAS is SMB, NFS and SSH.
+/// What does not fit is counted rather than dropped. See [`badges`].
+const COL_SERVES: f32 = 132.0;
 
 /// Which column the table is ordered by.
 ///
@@ -1176,7 +1484,14 @@ pub enum Column {
     Name,
     Mac,
     Time,
+    /// The last re-check. Blank until one has been asked for, which is what
+    /// makes it different from [`Column::Time`] rather than a second copy of
+    /// it.
+    Ping,
     Serves,
+    /// What answered a connection: the sweep's own knock, and a port scan
+    /// where one has been run.
+    Ports,
     Vendor,
 }
 
@@ -1228,6 +1543,7 @@ fn sort_key(
     host: &muster_net::discover::Found,
     named: Option<&Identity>,
     kind: muster_net::Kind,
+    ping: Option<std::time::Duration>,
 ) -> (bool, String, u128) {
     let text = |value: String| (value.is_empty(), value.to_ascii_lowercase(), 0u128);
     match column {
@@ -1267,12 +1583,59 @@ fn sort_key(
                 roles.len() as u128,
             )
         }
+        // The same shape as the sweep's time, over the other reading. A
+        // device that has never been pinged has no time here rather than a
+        // time of zero, so the whole unpinged half of the table stays at the
+        // bottom whichever way the column points.
+        Column::Ping => (
+            ping.is_none(),
+            String::new(),
+            ping.map_or(0, |t| t.as_micros()),
+        ),
+        // Most open ports first when descending, and the port numbers break
+        // the ties. A device nothing was found open on sorts as blank, which
+        // includes every device no port scan has reached: "none found" and
+        // "not looked for" are the same cell here, and the tooltip is where
+        // the difference is said.
+        Column::Ports => {
+            let open = open_ports(host);
+            (
+                open.is_empty(),
+                open.iter()
+                    .map(|port| format!("{port:05}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                open.len() as u128,
+            )
+        }
         Column::Vendor => text(match host.mac.map(muster_net::vendor::lookup) {
             Some(muster_net::vendor::Origin::Randomised) => "randomised address".to_string(),
             Some(other) => other.label().to_string(),
             None => String::new(),
         }),
     }
+}
+
+/// The ports known open on one device, ascending and without duplicates.
+///
+/// Read out of the device's own evidence rather than out of the port scanner,
+/// and that is what makes the column outlive a scan of one device: the sweep's
+/// knock records what it found, `scan::State::record_open_ports` folds a port
+/// scan's result back in, and both arrive here as the same fact about the same
+/// device. A refused port is deliberately not among them — it proves the host
+/// is there and it proves the port is shut.
+fn open_ports(host: &muster_net::discover::Found) -> Vec<u16> {
+    let mut open: Vec<u16> = host
+        .evidence
+        .iter()
+        .filter_map(|e| match e {
+            muster_net::discover::Evidence::TcpOpen(port) => Some(*port),
+            _ => None,
+        })
+        .collect();
+    open.sort_unstable();
+    open.dedup();
+    open
 }
 
 /// An address as one number, so both families order sensibly and v4 sorts
@@ -1284,18 +1647,48 @@ fn address_key(address: std::net::IpAddr) -> u128 {
     }
 }
 
-/// The table's headings, which are also its sort controls.
+/// The table's headings, which are also its sort controls, and the box that
+/// marks every row at once.
 ///
 /// Every heading is a click target, including the icon column's, whose label is
 /// deliberately empty: "Kind" over a column of pictures labels the obvious and
 /// adds a word to the densest screen in the application. It still sorts, and
 /// the caret is what says so.
-fn table_header(ui: &mut egui::Ui, p: Palette, sort: &mut Sort) {
+///
+/// **The box at the left is not a sort control**, and it is the one thing in
+/// this row that is not. It sits in the column the row boxes sit in, which is
+/// §7.12's rule and the reason it reads as "one of these" rather than as a
+/// heading with a decoration.
+///
+/// Returns what the box was asked to do, where it was pressed: [`Some(true)`]
+/// to mark everything shown and [`Some(false)`] to clear it. The caller owns
+/// the marks and knows which rows the filter is showing; this only draws the
+/// three states and reports the press.
+fn table_header(ui: &mut egui::Ui, p: Palette, sort: &mut Sort, marks: Marks) -> Option<bool> {
     // §7.16: a table header is a 26 px row in `text_dim`. It was 20 px in
     // `placeholder`, which is the eyebrow's colour and a different rank.
     let (rect, _) =
         ui.allocate_exact_size(vec2(ui.available_width(), metrics::ROW), Sense::hover());
     let mut x = rect.left() + metrics::PAD_PANEL;
+
+    // Mark everything, or nothing. The dash is the state that says "some", and
+    // pressing it from there takes the rest rather than clearing what is
+    // already marked: the reading of a half-filled box is "not finished".
+    let box_rect = Rect::from_center_size(
+        pos2(x + CHECK / 2.0, rect.center().y),
+        Vec2::splat(CHECK_HIT),
+    );
+    let response = ui.interact(box_rect, ui.id().with("mark-all"), Sense::click());
+    checkbox(ui, p, box_rect, marks, response.hovered());
+    let pressed = response.clicked().then_some(marks != Marks::All);
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(match marks {
+            Marks::All => "Clear every mark",
+            _ => "Mark every device shown",
+        });
+    x += COL_MARK;
+
     let last = rect.right() - metrics::PAD_PANEL;
     for (label, width, column) in [
         ("", COL_KIND, Column::Kind),
@@ -1303,7 +1696,9 @@ fn table_header(ui: &mut egui::Ui, p: Palette, sort: &mut Sort) {
         ("Name", COL_NAME, Column::Name),
         ("Hardware", COL_MAC, Column::Mac),
         ("Time", COL_TIME, Column::Time),
+        ("Ping", COL_PING, Column::Ping),
         ("Serves", COL_SERVES, Column::Serves),
+        ("Ports", COL_PORTS, Column::Ports),
         ("Made by", 0.0, Column::Vendor),
     ] {
         let span = if width > 0.0 { width } else { last - x };
@@ -1328,7 +1723,7 @@ fn table_header(ui: &mut egui::Ui, p: Palette, sort: &mut Sort) {
             pos2(x, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
-            FontId::proportional(text::TINY),
+            FontId::proportional(HEADING_SIZE),
             ink,
         );
         if active {
@@ -1337,7 +1732,7 @@ fn table_header(ui: &mut egui::Ui, p: Palette, sort: &mut Sort) {
             // whose content is right-aligned.
             let after = ui
                 .painter()
-                .layout_no_wrap(label.to_string(), FontId::proportional(text::TINY), ink)
+                .layout_no_wrap(label.to_string(), FontId::proportional(HEADING_SIZE), ink)
                 .size()
                 .x;
             caret(
@@ -1355,7 +1750,97 @@ fn table_header(ui: &mut egui::Ui, p: Palette, sort: &mut Sort) {
     // `line`, not `line_soft`: this is the edge of a strip, and `line_soft`
     // belongs between rows inside a list.
     hairline_strip(ui, p, rect.bottom());
+    pressed
 }
+
+/// The heading's size: §4's `CONTROL`, one rank above the figures under it.
+///
+/// It was `TINY`, the same size as the addresses in the column, which left the
+/// heading reading as another row of the table rather than as its label. One
+/// rank is the whole change: §4 has four of them and a heading that reached for
+/// `BODY` would outweigh the data it names.
+const HEADING_SIZE: f32 = text::CONTROL;
+
+/// How much of a table is marked. §7.12's three states, named rather than left
+/// as a pair of booleans the header would have to reason about twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Marks {
+    None,
+    Some,
+    All,
+}
+
+impl Marks {
+    /// The state of a box over `shown` rows of which `marked` are marked.
+    ///
+    /// An empty table is [`Marks::None`] rather than "all of nothing", which is
+    /// the reading that would draw a ticked box over no rows.
+    fn of(marked: usize, shown: usize) -> Self {
+        match marked {
+            0 => Self::None,
+            n if n >= shown && shown > 0 => Self::All,
+            _ => Self::Some,
+        }
+    }
+}
+
+/// §7.12's box: 16 px, radius 3, a `line` edge on `field`; ticked it is an
+/// accent fill with an `accent_ink` tick, and half-filled it is the same fill
+/// with a dash.
+///
+/// Drawn rather than lettered, for the reason every other mark in this
+/// application is: a glyph would be the font's idea of a tick and would change
+/// with the font.
+fn checkbox(ui: &egui::Ui, p: Palette, hit: Rect, state: Marks, hovered: bool) {
+    let rect = Rect::from_center_size(hit.center(), Vec2::splat(CHECK));
+    match state {
+        Marks::None => {
+            ui.painter()
+                .rect_filled(rect, metrics::RADIUS_TIGHT, p.field);
+            ui.painter().rect_stroke(
+                rect,
+                metrics::RADIUS_TIGHT,
+                Stroke::new(
+                    metrics::HAIRLINE,
+                    if hovered { p.line_dashed } else { p.line },
+                ),
+                egui::StrokeKind::Inside,
+            );
+        }
+        Marks::Some | Marks::All => {
+            ui.painter()
+                .rect_filled(rect, metrics::RADIUS_TIGHT, p.accent);
+            let ink = p.accent_ink;
+            if state == Marks::All {
+                // A tick, in two strokes: down to the low corner, then up.
+                let a = pos2(rect.left() + rect.width() * 0.24, rect.center().y);
+                let b = pos2(
+                    rect.center().x - rect.width() * 0.04,
+                    rect.bottom() - rect.height() * 0.28,
+                );
+                let c = pos2(
+                    rect.right() - rect.width() * 0.20,
+                    rect.top() + rect.height() * 0.30,
+                );
+                ui.painter().line_segment([a, b], Stroke::new(1.6_f32, ink));
+                ui.painter().line_segment([b, c], Stroke::new(1.6_f32, ink));
+            } else {
+                let y = rect.center().y;
+                ui.painter().line_segment(
+                    [
+                        pos2(rect.left() + rect.width() * 0.24, y),
+                        pos2(rect.right() - rect.width() * 0.24, y),
+                    ],
+                    Stroke::new(2.0_f32, ink),
+                );
+            }
+        }
+    }
+}
+
+/// §7.12's box, and the 18 px hit area a box inside a row gets.
+const CHECK: f32 = 16.0;
+const CHECK_HIT: f32 = 18.0;
 
 /// The sort caret's box.
 const CARET: f32 = 8.0;
@@ -1383,29 +1868,62 @@ fn caret(ui: &mut egui::Ui, centre: egui::Pos2, up: bool, ink: Color32) {
 /// is what keeps them from reading as warnings. The kind icon beside them is
 /// the one coloured thing in the row and it stays that way.
 fn badges(ui: &egui::Ui, p: Palette, rect: Rect, roles: &[muster_net::identify::Role]) {
-    let font = FontId::proportional(text::TINY);
     let mut x = rect.left();
-    for role in roles {
-        let galley =
-            ui.painter()
-                .layout_no_wrap(role.label().to_string(), font.clone(), p.text_strong);
-        let width = galley.size().x + metrics::S1 * 2.0;
+    let mut last = 0.0;
+    for (i, role) in roles.iter().enumerate() {
+        let width = pill_width(ui, role.label());
         if x + width > rect.right() {
+            // **What did not fit is counted, never dropped.** A column that
+            // quietly loses a badge shows a device serving less than it does,
+            // which is the one thing a badge must not be able to do. The count
+            // takes the place of the badge before it where it has to, because
+            // "+2" says more than a third label that is not the last one, and
+            // the row's tooltip names every role in full either way.
+            let mut left = roles.len() - i;
+            let mut at = x;
+            if at + pill_width(ui, &format!("+{left}")) > rect.right() && last > 0.0 {
+                at -= last;
+                left += 1;
+            }
+            let more = format!("+{left}");
+            if at + pill_width(ui, &more) <= rect.right() {
+                pill(ui, p, rect, at, &more);
+            }
             return;
         }
-        let pill =
-            Rect::from_center_size(pos2(x + width / 2.0, rect.center().y), vec2(width, BADGE_H));
-        ui.painter()
-            .rect_filled(pill, metrics::RADIUS_TIGHT, p.control);
-        ui.painter().text(
-            pill.center(),
-            egui::Align2::CENTER_CENTER,
-            role.label(),
-            font.clone(),
-            p.text_strong,
-        );
-        x += width + metrics::S1;
+        pill(ui, p, rect, x, role.label());
+        last = width + metrics::S1;
+        x += last;
     }
+}
+
+/// The face of one badge: a neutral fill, strong text, tight radius.
+fn pill(ui: &egui::Ui, p: Palette, row: Rect, x: f32, label: &str) {
+    let width = pill_width(ui, label);
+    let rect = Rect::from_center_size(pos2(x + width / 2.0, row.center().y), vec2(width, BADGE_H));
+    ui.painter()
+        .rect_filled(rect, metrics::RADIUS_TIGHT, p.control);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(text::TINY),
+        p.text_strong,
+    );
+}
+
+/// How much room a badge for `label` wants, measured rather than guessed: the
+/// labels are three and four letters and the difference decides how many fit.
+fn pill_width(ui: &egui::Ui, label: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            label.to_string(),
+            FontId::proportional(text::TINY),
+            Color32::PLACEHOLDER,
+        )
+        .size()
+        .x
+        + metrics::S1 * 2.0
 }
 
 /// A badge's height. Short enough to sit inside a 20 px row with air above and
@@ -1420,12 +1938,17 @@ const BADGE_H: f32 = 14.0;
 fn device_row(
     ui: &mut egui::Ui,
     p: Palette,
-    mode: Mode,
     host: &muster_net::discover::Found,
-    named: Option<&Identity>,
-    vantage: muster_net::kind::Vantage,
-    selected: bool,
-) -> egui::Response {
+    row: RowInput<'_>,
+) -> Row {
+    let RowInput {
+        mode,
+        named,
+        vantage,
+        selected,
+        marked,
+        ping,
+    } = row;
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), metrics::ROW), Sense::click());
     // Selection is a **neutral** fill plus strong text plus a small accent
@@ -1447,6 +1970,23 @@ fn device_row(
     let figure = FontId::monospace(text::TINY);
     let mut x = rect.left() + metrics::PAD_PANEL;
     let y = rect.center().y;
+
+    // The mark, in the column the header's box sits in. Interacted *after* the
+    // row, so it is the box that takes a click landing on it rather than the
+    // row underneath opening the panel: the later widget is the one on top.
+    let box_rect = Rect::from_center_size(pos2(x + CHECK / 2.0, y), Vec2::splat(CHECK_HIT));
+    let mark = ui.interact(box_rect, response.id.with("mark"), Sense::click());
+    checkbox(
+        ui,
+        p,
+        box_rect,
+        if marked { Marks::All } else { Marks::None },
+        mark.hovered(),
+    );
+    if mark.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    x += COL_MARK;
 
     // What this device appears to be, and why. The guess is `muster-net`'s;
     // this file only decides how big to draw it.
@@ -1518,10 +2058,35 @@ fn device_row(
     );
     x += COL_TIME;
 
+    // The last re-check, which is blank until one has been asked for. Amber
+    // where the probe could not be sent, because that is a fact about this
+    // machine and not a reading of the device: `CLAUDE.md`'s rule that a
+    // question never asked is never reported as silence reaches into the table
+    // and not only into the panel.
+    let (ping_text, ping_ink) = match ping {
+        PingCell::Waiting => ("asking…".to_string(), p.text_dim),
+        PingCell::Answer(r) if unasked(r) => ("not asked".to_string(), p.caution),
+        PingCell::Answer(r) => match r.found.as_ref().and_then(|f| f.rtt) {
+            Some(t) if t.as_millis() > 0 => (format!("{} ms", t.as_millis()), p.text),
+            Some(_) => ("<1 ms".to_string(), p.text),
+            None => ("no reply".to_string(), p.text_dim),
+        },
+        PingCell::Never => (String::new(), p.text_dim),
+    };
+    ui.painter().text(
+        pos2(x + COL_PING - metrics::S2, y),
+        egui::Align2::RIGHT_CENTER,
+        &ping_text,
+        FontId::monospace(text::TINY),
+        ping_ink,
+    );
+    x += COL_PING;
+
     // What this device serves the network, as against what it is. The icon
     // says the one and these say the other; a router that is also the name
     // server shows both, which no single label could.
     let roles = named.map(Identity::roles).unwrap_or_default();
+    let open = open_ports(host);
     badges(
         ui,
         p,
@@ -1529,6 +2094,14 @@ fn device_row(
         &roles,
     );
     x += COL_SERVES;
+
+    ports_cell(
+        ui,
+        p,
+        Rect::from_min_max(pos2(x, rect.top()), pos2(x + COL_PORTS, rect.bottom())),
+        &open,
+    );
+    x += COL_PORTS;
 
     // The vendor, and the one thing that is *not* a vendor: a randomised
     // address is reported as randomised rather than as an unknown maker, which
@@ -1576,71 +2149,391 @@ fn device_row(
             let others = named.map(Identity::other_names).unwrap_or_default();
             tip.push_str(&format!("\nAlso called {}", others.join(", ")));
         }
+        // What the ports cell cannot say in its width, and the one thing it
+        // must not be read as saying: a blank cell is "nothing has looked",
+        // not "nothing is open".
+        if open.is_empty() {
+            tip.push_str("\nNo open port found yet. Scan its ports to look.");
+        } else {
+            tip.push_str(&format!(
+                "\nOpen: {}",
+                open.iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let PingCell::Answer(r) = ping {
+            tip.push_str(&format!("\nLast ping: {}", ping_line(r)));
+        }
         response.clone().on_hover_text(tip);
     }
-    response
+    Row {
+        clicked: response.clicked() && !mark.clicked(),
+        marked: mark.clicked(),
+    }
+}
+
+/// What a row needs that it cannot read off the device itself.
+///
+/// A struct rather than six more parameters: the row already takes the device
+/// and the palette, and a drawing function with nine arguments is one whose
+/// call site nobody can read.
+struct RowInput<'a> {
+    mode: Mode,
+    named: Option<&'a Identity>,
+    vantage: muster_net::kind::Vantage,
+    /// Its panel is open.
+    selected: bool,
+    /// It is marked for the toolbar's menus.
+    marked: bool,
+    ping: PingCell<'a>,
+}
+
+/// What a device row was asked to do.
+///
+/// Two presses rather than one response, because the mark and the row mean
+/// different things and a caller that had to tell them apart by position would
+/// be doing the hit test twice.
+struct Row {
+    /// The row itself: open or close this device's panel.
+    clicked: bool,
+    /// The box at its left: mark or unmark this device.
+    marked: bool,
+}
+
+/// What the Ping column has to show about one device.
+///
+/// Three states and not two, which is the whole reason this is an enum: a
+/// device that has never been asked, a device being asked now, and an answer —
+/// and an answer is itself allowed to say "the question could not be sent".
+#[derive(Clone, Copy)]
+enum PingCell<'a> {
+    Never,
+    Waiting,
+    Answer(&'a muster_net::discover::Recheck),
+}
+
+/// The open ports, as many as the column can hold and a count of the rest.
+///
+/// The same rule the badges follow: **what does not fit is counted, never
+/// dropped.** A cell that quietly stopped at three would show a device with
+/// fewer open ports than it has, and the row's tooltip lists them all.
+fn ports_cell(ui: &egui::Ui, p: Palette, rect: Rect, open: &[u16]) {
+    if open.is_empty() {
+        return;
+    }
+    let font = FontId::monospace(text::TINY);
+    let mut x = rect.left();
+    let width = |ui: &egui::Ui, text: &str| {
+        ui.painter()
+            .layout_no_wrap(text.to_string(), font.clone(), Color32::PLACEHOLDER)
+            .size()
+            .x
+    };
+    for (i, port) in open.iter().enumerate() {
+        let label = port.to_string();
+        let w = width(ui, &label);
+        let left = open.len() - i;
+        if x + w > rect.right() {
+            let more = format!("+{left}");
+            if x + width(ui, &more) <= rect.right() {
+                ui.painter().text(
+                    pos2(x, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &more,
+                    font,
+                    p.text_dim,
+                );
+            }
+            return;
+        }
+        ui.painter().text(
+            pos2(x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &label,
+            font.clone(),
+            p.text_muted,
+        );
+        x += w + metrics::S2;
+    }
 }
 
 /// What the machine knows without sending anything.
+///
+/// **One card per network, and every card answers the same four questions.**
+/// It was one long column of eyebrows — every address, then every gateway, then
+/// every resolver, then every lease — which is the shape the survey happens to
+/// be in rather than the shape the question is in. On a machine with a VPN up,
+/// or a laptop on wifi and Ethernet at once, that column could not say which
+/// gateway belonged to which link, and that is exactly what somebody opening
+/// this page wants to know.
+///
+/// So the interface an address is configured on is the heading, and the
+/// gateway, the resolvers and the DHCP server are read *for that interface*
+/// where the platform records them per interface, which Windows does. Where it
+/// does not — Unix keeps one resolver list for the machine — the card says the
+/// list is the machine's rather than pretending it is the link's.
 fn network_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
     let s = &app.survey.clone();
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(metrics::S3);
-            for iface in s.interfaces.iter().filter(|i| i.is_scannable()) {
-                section(ui, p, &iface.friendly);
-                for addr in &iface.addresses {
-                    fact(
+
+            let live: Vec<&muster_net::sysinfo::Interface> =
+                s.interfaces.iter().filter(|i| i.is_scannable()).collect();
+            if live.is_empty() {
+                // A machine with no usable interface is a real state, and it is
+                // the one that makes every other card on this page empty. Say
+                // it once rather than drawing four blank cards.
+                card(ui, p, "No network", None, |ui| {
+                    card_note(
                         ui,
                         p,
-                        "Address",
-                        &format!("{} in {}", addr.address, addr.prefix),
+                        "",
+                        "No interface is up with an address on it, so there is nothing to scan.",
                     );
-                }
-                if let Some(mac) = iface.mac {
-                    fact(ui, p, "Hardware", &mac.to_string());
-                }
+                });
+            }
+            for iface in live {
+                network_card(ui, p, s, iface);
             }
 
-            section(ui, p, "Gateway");
-            if !s.has(muster_net::survey::Reading::Routes) {
-                // The rule that matters most in this whole view: a reading that
-                // failed is said to have failed, never drawn as an absence.
-                note(ui, p, "", "could not be read");
-            } else if s.gateways.is_empty() {
-                note(ui, p, "", "none, there is no default route");
-            } else {
-                for g in &s.gateways {
-                    fact(ui, p, "", &g.address.to_string());
-                }
-            }
-
-            section(ui, p, "DNS");
-            if s.resolvers.is_empty() {
-                note(ui, p, "", "none configured");
-            }
-            for r in &s.resolvers {
-                fact(ui, p, "", &r.to_string());
-            }
-
-            section(ui, p, "DHCP");
-            if s.dhcp_servers.is_empty() {
-                note(ui, p, "", "no lease recorded");
-            }
-            for d in &s.dhcp_servers {
-                fact(ui, p, "", &d.to_string());
-            }
-            dhcp_check(ui, p, app);
+            card(
+                ui,
+                p,
+                "Who hands out addresses",
+                Some("Asked, not read"),
+                |ui| {
+                    card_note(
+                        ui,
+                        p,
+                        "",
+                        "The servers above come from this machine's own lease. This asks the \
+                     link itself, and keeps every offer: two servers answering is a fault \
+                     worth finding.",
+                    );
+                    ui.add_space(metrics::S2);
+                    dhcp_check(ui, p, app);
+                },
+            );
 
             if !s.gaps.is_empty() {
-                section(ui, p, "Could not read");
-                for gap in &s.gaps {
-                    note(ui, p, &gap.reading.to_string(), &gap.because);
-                }
+                // The rule that matters most in this whole view: a reading that
+                // failed is said to have failed, never drawn as an absence.
+                card(ui, p, "Could not read", None, |ui| {
+                    for gap in &s.gaps {
+                        card_note(ui, p, &gap.reading.to_string(), &gap.because);
+                    }
+                });
             }
             ui.add_space(metrics::S4);
         });
+}
+
+/// One interface, and the four things a network is.
+fn network_card(
+    ui: &mut egui::Ui,
+    p: Palette,
+    survey: &Survey,
+    iface: &muster_net::sysinfo::Interface,
+) {
+    // The subtitle is what the card is *of*, in the words the rest of the
+    // world uses: the link kind, and the kernel's own name for it where that
+    // is not already the title.
+    let mut subtitle = vec![link_kind(iface.kind).to_string()];
+    if iface.name != iface.friendly && iface.name.len() <= NAME_IS_A_NAME {
+        subtitle.push(iface.name.clone());
+    }
+    if iface.flags.point_to_point {
+        subtitle.push("point to point".into());
+    }
+
+    card(ui, p, &iface.friendly, Some(&subtitle.join(" · ")), |ui| {
+        card_facts(
+            ui,
+            p,
+            "Address",
+            &iface
+                .addresses
+                .iter()
+                .map(|a| format!("{} in {}", a.address, a.prefix))
+                .collect::<Vec<_>>(),
+        );
+
+        // The gateway *for this link*, which is what the interface index on
+        // a default route is for. A card that showed the machine's gateway
+        // list would say the same thing on every card and answer nothing.
+        let gateways: Vec<String> = survey
+            .gateways
+            .iter()
+            .filter(|g| g.interface_index == iface.index)
+            .map(|g| g.address.to_string())
+            .collect();
+        if !survey.has(muster_net::survey::Reading::Routes) {
+            card_note(ui, p, "Gateway", "could not be read");
+        } else if gateways.is_empty() {
+            card_note(ui, p, "Gateway", "none, nothing routes out of here");
+        } else {
+            card_facts(ui, p, "Gateway", &gateways);
+        }
+
+        // Windows reports resolvers per adapter, which is the truthful
+        // answer on a machine with a VPN up. Unix has one list for the
+        // machine, and the card says so rather than claiming the link's.
+        if iface.dns.is_empty() {
+            if survey.resolvers.is_empty() {
+                card_note(ui, p, "DNS", "none configured");
+            } else {
+                card_facts(
+                    ui,
+                    p,
+                    "DNS",
+                    &survey
+                        .resolvers
+                        .iter()
+                        .map(|r| format!("{r}  (this machine's list)"))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        } else {
+            card_facts(
+                ui,
+                p,
+                "DNS",
+                &iface.dns.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+            );
+        }
+
+        match iface.dhcp_server {
+            Some(server) => card_facts(ui, p, "DHCP", &[server.to_string()]),
+            None => card_note(ui, p, "DHCP", "no lease recorded on this interface"),
+        }
+
+        if let Some(mac) = iface.mac {
+            card_facts(ui, p, "Hardware", &[mac.to_string()]);
+        }
+    });
+}
+
+/// How long an interface name can be and still be a name.
+///
+/// Windows calls an adapter by its GUID in `Interface::name`, which is 38
+/// characters of nothing anybody wants under a heading; `eth0` and `wlp3s0`
+/// are worth having. The length is the only thing that tells them apart
+/// without matching a shape, and it is a caption either way.
+const NAME_IS_A_NAME: usize = 16;
+
+/// What kind of link, in a word.
+const fn link_kind(kind: muster_net::sysinfo::LinkKind) -> &'static str {
+    use muster_net::sysinfo::LinkKind;
+    match kind {
+        LinkKind::Ethernet => "Ethernet",
+        LinkKind::Wireless => "Wireless",
+        LinkKind::Loopback => "Loopback",
+        LinkKind::Tunnel => "Tunnel",
+        LinkKind::Unknown => "Link",
+    }
+}
+
+/// §7.14's card: a `chrome` surface with a `line` edge, a title, and rows.
+///
+/// The one container this application draws. A page that is a list of groups
+/// wants the groups to *look* like groups, and an eyebrow over a run of rows
+/// only says where a group starts — never where it ends, which is what leaves
+/// a reader attaching the last row to the wrong heading.
+fn card<R>(
+    ui: &mut egui::Ui,
+    p: Palette,
+    title: &str,
+    subtitle: Option<&str>,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    ui.horizontal(|ui| {
+        ui.add_space(metrics::PAD_PANEL);
+        let width = (ui.available_width() - metrics::PAD_PANEL).min(CARD_WIDTH);
+        // **Top down, said out loud.** The card is placed inside a horizontal
+        // layout to indent it, and a child inherits its parent's direction: the
+        // first draft laid every row of every card out along one line, which is
+        // a thing that looks like a bug in the card and is a bug in the
+        // arrangement around it.
+        ui.allocate_ui_with_layout(vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
+            egui::Frame::NONE
+                .fill(p.chrome)
+                .stroke(Stroke::new(metrics::HAIRLINE, p.line))
+                .corner_radius(metrics::RADIUS_CARD)
+                .inner_margin(egui::Margin::same(metrics::PAD_PANEL as i8))
+                .show(ui, |ui| {
+                    ui.set_width(width - metrics::PAD_PANEL * 2.0);
+                    ui.label(
+                        RichText::new(title)
+                            .font(theme::strong(text::HEADING))
+                            .color(p.text_strong),
+                    );
+                    if let Some(subtitle) = subtitle.filter(|s| !s.is_empty()) {
+                        ui.label(RichText::new(subtitle).size(text::TINY).color(p.text_dim));
+                    }
+                    ui.add_space(metrics::S2);
+                    content(ui);
+                });
+        });
+    });
+    ui.add_space(metrics::S3);
+}
+
+/// How wide a card grows. Wide enough for an IPv6 address and its prefix on one
+/// line, and no wider: a card the width of a maximised window is a stripe.
+const CARD_WIDTH: f32 = 520.0;
+
+/// The key column inside a card, so every value in it starts at the same x.
+const CARD_KEY: f32 = 84.0;
+
+/// One key and its values, as **figures**: §4's monospaced, tabular face, so a
+/// column of addresses lines up under itself.
+///
+/// The key is drawn once however many values there are, because "Address" three
+/// times over three addresses is the same word asked three times.
+fn card_facts(ui: &mut egui::Ui, p: Palette, key: &str, values: &[String]) {
+    for (i, value) in values.iter().enumerate() {
+        card_line(ui, p, if i == 0 { key } else { "" }, value, true);
+    }
+}
+
+/// One key and a **sentence**, which is the other half of the same rule: "none
+/// configured" set in the figure face reads as though it were a number.
+fn card_note(ui: &mut egui::Ui, p: Palette, key: &str, value: &str) {
+    card_line(ui, p, key, value, false);
+}
+
+fn card_line(ui: &mut egui::Ui, p: Palette, key: &str, value: &str, figure: bool) {
+    // Top aligned, because a sentence long enough to wrap must not drag its own
+    // key down the card with it.
+    ui.horizontal_top(|ui| {
+        if !key.is_empty() || figure {
+            let (rect, _) =
+                ui.allocate_exact_size(vec2(CARD_KEY, metrics::ROW_PLAIN), Sense::hover());
+            if !key.is_empty() {
+                // Aligned to the *top* of the row and not its middle, so the
+                // key sits on the first line of its value rather than three
+                // pixels below it. The two are set at the same size, so their
+                // tops are the one thing that lines up whatever the value is.
+                ui.painter().text(
+                    pos2(rect.left(), rect.top()),
+                    egui::Align2::LEFT_TOP,
+                    key,
+                    FontId::proportional(text::SMALL),
+                    p.text_dim,
+                );
+            }
+        }
+        let body = RichText::new(value).size(text::SMALL).color(p.text);
+        let body = if figure { body.monospace() } else { body };
+        // **Wrapped.** A note is a sentence, and a sentence that does not wrap
+        // pushes the card out past the window rather than taking a second
+        // line. A figure is short by construction and wraps for free.
+        ui.add(egui::Label::new(body).wrap());
+    });
 }
 
 fn about_view(ui: &mut egui::Ui, p: Palette, updates: &mut Updates) {
@@ -1732,48 +2625,6 @@ fn updates_section(ui: &mut egui::Ui, p: Palette, updates: &mut Updates) {
             .size(text::TINY)
             .color(p.text_dim),
     );
-}
-
-fn section(ui: &mut egui::Ui, p: Palette, title: &str) {
-    ui.add_space(metrics::S3);
-    ui.horizontal(|ui| {
-        ui.add_space(metrics::PAD_PANEL);
-        ui.label(
-            RichText::new(title.to_uppercase())
-                .size(text::TINY)
-                .color(p.placeholder),
-        );
-    });
-    ui.add_space(metrics::S1);
-}
-
-/// One `key  value` line, where the value is a **figure**.
-///
-/// §4: figures are monospaced and tabular so columns line up and a value does
-/// not jitter as it changes. Addresses, hardware addresses and counts are
-/// figures.
-fn fact(ui: &mut egui::Ui, p: Palette, key: &str, value: &str) {
-    fact_of(ui, p, key, value, true)
-}
-
-/// One `key  value` line, where the value is a **sentence**.
-///
-/// The other half of the same rule, and the half that was missing: every value
-/// went through `monospace()`, so "could not be read" and "none configured"
-/// came out set as though they were numbers.
-fn note(ui: &mut egui::Ui, p: Palette, key: &str, value: &str) {
-    fact_of(ui, p, key, value, false)
-}
-
-fn fact_of(ui: &mut egui::Ui, p: Palette, key: &str, value: &str, figure: bool) {
-    ui.horizontal(|ui| {
-        ui.add_space(metrics::PAD_PANEL);
-        if !key.is_empty() {
-            ui.label(RichText::new(key).size(text::SMALL).color(p.text_dim));
-        }
-        let body = RichText::new(value).size(text::SMALL).color(p.text);
-        ui.label(if figure { body.monospace() } else { body });
-    });
 }
 
 /// §7.19's empty state: what is not here, and the way out of it.
@@ -2110,6 +2961,15 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
                 };
                 fact_row(ui, p, "Name server", &what);
             }
+            // The greeting, which is the software in the device's own words and
+            // is worth a row of its own for the same reason the resolver's
+            // version is. SMB and NFS get no row here: both answered a question
+            // and neither volunteered anything to print, so the badge and its
+            // reason are the whole of what is known, and inventing a line for
+            // them would be padding a panel with what a badge already said.
+            if let Some(greeting) = &named.serves.ssh {
+                fact_row(ui, p, "SSH", greeting);
+            }
             fact_row(
                 ui,
                 p,
@@ -2155,44 +3015,18 @@ fn ping_section(
     swept_rtt: Option<std::time::Duration>,
 ) {
     ui.horizontal(|ui| {
-        let waiting = app.ping.as_ref().is_some_and(|(a, _)| *a == address);
+        let waiting = app.ping.waiting_for(address);
         if button(ui, p, "Ping", Kind::Secondary, !waiting).clicked() && !waiting {
             app.start_ping(address);
         }
         ui.add_space(metrics::S2);
 
-        let answer = app.pinged.as_ref().filter(|(a, _)| *a == address);
+        let answer = app.ping.answer_for(address);
         let line = if waiting {
             "asking…".to_string()
         } else {
             match answer {
-                Some((_, r)) => match r.found.as_ref().and_then(|f| f.rtt) {
-                    Some(rtt) => format!("answered in {} ms", rtt.as_millis()),
-                    // A gap first, and it is the whole point of the change: a
-                    // probe that never ran has nothing to say about the
-                    // device, so it says something about this machine
-                    // instead.
-                    None if !r.not_done.is_empty() => {
-                        format!("no time to report: {}", r.not_done.join("; "))
-                    }
-                    // It answered something, just not an echo, so the line
-                    // names what did answer. "Nothing came back" about a
-                    // device that answered ARP a moment ago is the same lie in
-                    // a smaller way.
-                    None if r.found.is_some() => {
-                        let how: Vec<String> = r
-                            .found
-                            .iter()
-                            .flat_map(|f| f.evidence.iter())
-                            .map(muster_net::discover::Evidence::reason)
-                            .collect();
-                        format!("still there ({}), but no ICMP reply", how.join(", "))
-                    }
-                    // **Not "it is gone".** Silence is a device that is off, a
-                    // device that drops, or a probe that was rate limited into
-                    // the next second. The sweep's own rule, kept here.
-                    None => "nothing came back this time".to_string(),
-                },
+                Some(r) => ping_line(r),
                 None => match swept_rtt {
                     Some(rtt) => format!("{} ms when it was swept", rtt.as_millis()),
                     None => String::new(),
@@ -2202,15 +3036,55 @@ fn ping_section(
         // Amber where the machine could not ask, because that is a state the
         // reader has to act on rather than a reading of the network.
         let ink = match answer {
-            Some((_, r))
-                if !r.not_done.is_empty() && r.found.as_ref().is_none_or(|f| f.rtt.is_none()) =>
-            {
-                p.caution
-            }
+            Some(r) if unasked(r) => p.caution,
             _ => p.text_dim,
         };
         ui.label(RichText::new(line).size(text::TINY).color(ink));
     });
+}
+
+/// What one re-check says, in a sentence.
+///
+/// Pulled out of the panel because the table's Ping column asks the same
+/// question of the same answer, and two readings of one `Recheck` would be two
+/// chances to say "nothing came back" about a probe that was never sent.
+fn ping_line(r: &muster_net::discover::Recheck) -> String {
+    match r.found.as_ref().and_then(|f| f.rtt) {
+        Some(rtt) => format!("answered in {} ms", rtt.as_millis()),
+        // No round trip, so the line is made of the two things that are true
+        // independently: what did answer, and what was never asked. A probe
+        // that could not run has nothing to say about the device, and a device
+        // that answered ARP a second ago is not gone — reporting either one
+        // alone was how "nothing came back this time" came to be printed about
+        // a machine sitting there answering.
+        None => {
+            let how: Vec<String> = r
+                .found
+                .iter()
+                .flat_map(|f| f.evidence.iter())
+                .map(muster_net::discover::Evidence::reason)
+                .collect();
+            let there = (!how.is_empty()).then(|| format!("still there ({})", how.join(", ")));
+            let gaps = (!r.not_done.is_empty()).then(|| r.not_done.join("; "));
+            match (there, gaps) {
+                (Some(there), Some(gaps)) => format!("{there}, and {gaps}"),
+                (Some(there), None) => format!("{there}, but no ICMP reply"),
+                (None, Some(gaps)) => format!("no time to report: {gaps}"),
+                // **Not "it is gone".** Silence is a device that is off, a
+                // device that drops, or a probe that was rate limited into the
+                // next second. The sweep's own rule, kept here.
+                (None, None) => "nothing came back this time".to_string(),
+            }
+        }
+    }
+}
+
+/// Did this answer come from a probe that could not be sent?
+///
+/// The one state the interface colours amber, because it is a fact about this
+/// machine rather than a reading of the network, and the reader can act on it.
+fn unasked(r: &muster_net::discover::Recheck) -> bool {
+    !r.not_done.is_empty() && r.found.as_ref().is_none_or(|f| f.rtt.is_none())
 }
 
 /// One `label  value` line with a control that copies the value.
@@ -2408,9 +3282,7 @@ fn dhcp_check(ui: &mut egui::Ui, p: Palette, app: &mut App) {
         .find(|i| i.is_scannable())
         .and_then(|i| i.mac);
 
-    ui.add_space(metrics::S2);
     ui.horizontal(|ui| {
-        ui.add_space(metrics::PAD_PANEL);
         if app.dhcp.is_running() {
             ui.label(
                 RichText::new("Listening for offers…")
@@ -2457,15 +3329,12 @@ fn dhcp_check(ui: &mut egui::Ui, p: Palette, app: &mut App) {
     } else {
         p.text
     };
-    ui.add_space(metrics::S1);
-    ui.horizontal(|ui| {
-        ui.add_space(metrics::PAD_PANEL);
-        ui.label(
-            RichText::new(probe.verdict())
-                .size(text::SMALL)
-                .color(colour),
-        );
-    });
+    ui.add_space(metrics::S2);
+    ui.label(
+        RichText::new(probe.verdict())
+            .size(text::SMALL)
+            .color(colour),
+    );
 
     for offer in probe.distinct_offers() {
         let mut detail = format!("offered {}", offer.offered);
@@ -2475,7 +3344,7 @@ fn dhcp_check(ui: &mut egui::Ui, p: Palette, app: &mut App) {
         if let Some(lease) = offer.lease {
             detail.push_str(&format!(", {} h lease", lease.as_secs() / 3600));
         }
-        fact(ui, p, &offer.server.to_string(), &detail);
+        card_note(ui, p, &offer.server.to_string(), &detail);
     }
 }
 
@@ -2483,7 +3352,7 @@ fn dhcp_check(ui: &mut egui::Ui, p: Palette, app: &mut App) {
 ///
 /// §7.2's options strip. It carries the two things a scan needs from the user
 /// and nothing else: the range to sweep, and a filter over what came back.
-fn devices_toolbar(ui: &mut egui::Ui, p: Palette, app: &mut App) {
+fn devices_toolbar(ui: &mut egui::Ui, p: Palette, app: &mut App, table: Table<'_>) {
     // §7.2: an options strip is `chrome`, 36 px, with a hairline under it. It
     // was drawn straight onto the window with no ground of its own, so the
     // fields floated in the table's own surface.
@@ -2546,6 +3415,16 @@ fn devices_toolbar(ui: &mut egui::Ui, p: Palette, app: &mut App) {
             // The one thing to do on this view, beside the range it acts on.
             scan_control(ui, p, app);
 
+            // And what to do with what came back. Both act on the marked
+            // devices, or on everything the filter is showing when nothing is
+            // marked; [`Targets`] decides that once so the two menus cannot
+            // disagree about what "these" means.
+            let targets = Targets::of(app, &table);
+            ui.add_space(metrics::S2);
+            copy_menu(ui, p, app, &table, &targets);
+            ui.add_space(metrics::S1);
+            actions_menu(ui, p, app, &targets);
+
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(metrics::PAD_PANEL);
                 if !app.search.is_empty() && button(ui, p, "Clear", Kind::Ghost, true).clicked() {
@@ -2558,6 +3437,603 @@ fn devices_toolbar(ui: &mut egui::Ui, p: Palette, app: &mut App) {
     });
     ui.add_space(metrics::S2);
 }
+
+/// The rows the table is showing, and everything needed to read a value out of
+/// one.
+///
+/// Handed to the toolbar rather than rebuilt there: the filter and the sort
+/// have already been applied in [`devices_view`], and a menu that worked out
+/// "which devices" for itself would be a second answer to a question that has
+/// one.
+pub(crate) struct Table<'a> {
+    devices: &'a [muster_net::discover::Found],
+    names: &'a [Identity],
+    survey: &'a Survey,
+    /// Indices into `devices`, in the order the rows are drawn.
+    shown: &'a [usize],
+}
+
+/// Which devices an action or a copy is about, and what to call them.
+struct Targets {
+    addresses: Vec<std::net::IpAddr>,
+    /// The marks decided this, rather than the filter.
+    from_marks: bool,
+    /// Devices are marked, and the filter is hiding every one of them.
+    ///
+    /// Its own state because it is the one case where doing the obvious thing
+    /// would be a trap: falling back to "everything shown" there would act on
+    /// rows the reader had deliberately marked *around*.
+    marked_but_hidden: bool,
+}
+
+impl Targets {
+    fn of(app: &App, table: &Table<'_>) -> Self {
+        let shown: Vec<std::net::IpAddr> = table
+            .shown
+            .iter()
+            .map(|i| table.devices[*i].address)
+            .collect();
+        let marked: Vec<std::net::IpAddr> = shown
+            .iter()
+            .copied()
+            .filter(|a| app.marked.contains(a))
+            .collect();
+        if !marked.is_empty() {
+            return Self {
+                addresses: marked,
+                from_marks: true,
+                marked_but_hidden: false,
+            };
+        }
+        if !app.marked.is_empty() {
+            return Self {
+                addresses: Vec::new(),
+                from_marks: true,
+                marked_but_hidden: true,
+            };
+        }
+        Self {
+            addresses: shown,
+            from_marks: false,
+            marked_but_hidden: false,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.addresses.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.addresses.is_empty()
+    }
+
+    /// What the menu says it is about, before anything is chosen.
+    fn describe(&self) -> String {
+        if self.marked_but_hidden {
+            return "Nothing marked is on screen".to_string();
+        }
+        let n = self.len();
+        let noun = if n == 1 { "device" } else { "devices" };
+        if self.from_marks {
+            format!("{n} marked {noun}")
+        } else {
+            format!("{n} {noun} shown")
+        }
+    }
+}
+
+/// A column somebody is about to paste somewhere.
+///
+/// Every field on this list is one already on screen. §11's rule for the
+/// device panel — every field is copyable, because every field is something
+/// about to be pasted — applied to the table, where the thing wanted is
+/// usually the *column* rather than the cell: the addresses for a firewall
+/// rule, the hardware addresses for a set of DHCP reservations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Address,
+    Name,
+    Mac,
+    Vendor,
+    Kind,
+    Serves,
+    Ping,
+    Ports,
+    /// Every column above, tab separated, one device per line. What a
+    /// spreadsheet and a ticket both take.
+    Row,
+}
+
+impl Field {
+    const ALL: [Field; 9] = [
+        Field::Address,
+        Field::Name,
+        Field::Mac,
+        Field::Vendor,
+        Field::Kind,
+        Field::Serves,
+        Field::Ping,
+        Field::Ports,
+        Field::Row,
+    ];
+
+    /// The menu's word for it, which is the table heading it copies.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Address => "Address",
+            Self::Name => "Name",
+            Self::Mac => "Hardware address",
+            Self::Vendor => "Made by",
+            Self::Kind => "What it is",
+            Self::Serves => "What it serves",
+            Self::Ping => "Ping",
+            Self::Ports => "Open ports",
+            Self::Row => "The whole row",
+        }
+    }
+
+    /// What the pill calls what was copied. Singular where one was.
+    fn noun(self, n: usize) -> &'static str {
+        let one = n == 1;
+        match self {
+            Self::Address => {
+                if one {
+                    "address"
+                } else {
+                    "addresses"
+                }
+            }
+            Self::Name => {
+                if one {
+                    "name"
+                } else {
+                    "names"
+                }
+            }
+            Self::Mac => {
+                if one {
+                    "hardware address"
+                } else {
+                    "hardware addresses"
+                }
+            }
+            Self::Vendor => {
+                if one {
+                    "vendor"
+                } else {
+                    "vendors"
+                }
+            }
+            Self::Kind => {
+                if one {
+                    "kind"
+                } else {
+                    "kinds"
+                }
+            }
+            Self::Serves => {
+                if one {
+                    "role list"
+                } else {
+                    "role lists"
+                }
+            }
+            Self::Ping => {
+                if one {
+                    "ping"
+                } else {
+                    "pings"
+                }
+            }
+            Self::Ports => {
+                if one {
+                    "port list"
+                } else {
+                    "port lists"
+                }
+            }
+            Self::Row => {
+                if one {
+                    "row"
+                } else {
+                    "rows"
+                }
+            }
+        }
+    }
+}
+
+/// One field of one device, as text.
+///
+/// Empty where the device has nothing in that column, and the caller drops
+/// those rather than pasting a run of blank lines: a count that includes
+/// twelve devices with no name would be a count of nothing.
+fn field_value(
+    field: Field,
+    host: &muster_net::discover::Found,
+    named: Option<&Identity>,
+    kind: muster_net::Kind,
+    ping: Option<&muster_net::discover::Recheck>,
+) -> String {
+    match field {
+        Field::Address => host.address.to_string(),
+        Field::Name => named
+            .and_then(Identity::best)
+            .map(|n| n.value.clone())
+            .unwrap_or_default(),
+        Field::Mac => host.mac.map(|m| m.to_string()).unwrap_or_default(),
+        Field::Vendor => match host.mac.map(muster_net::vendor::lookup) {
+            // The one thing that is not a vendor stays not a vendor here too.
+            Some(muster_net::vendor::Origin::Randomised) => "randomised address".to_string(),
+            Some(other) => other.label().to_string(),
+            None => String::new(),
+        },
+        Field::Kind => match kind {
+            muster_net::Kind::Unknown => String::new(),
+            known => known.label().to_string(),
+        },
+        Field::Serves => named
+            .map(Identity::roles)
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r.label())
+            .collect::<Vec<_>>()
+            .join(" "),
+        // The measurement, not the sentence about it: a column of "12 ms" is
+        // what somebody is pasting, and "still there (answered ARP)" is not.
+        Field::Ping => match ping.and_then(|r| r.found.as_ref()?.rtt) {
+            Some(t) => format!("{} ms", t.as_millis()),
+            None => String::new(),
+        },
+        Field::Ports => open_ports(host)
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(" "),
+        Field::Row => {
+            let mut line = Vec::new();
+            for one in Field::ALL {
+                if one == Field::Row {
+                    continue;
+                }
+                line.push(field_value(one, host, named, kind, ping));
+            }
+            // Tabs, and every column kept even where it is empty, because a
+            // row pasted into a spreadsheet has to keep its shape.
+            line.join("\t")
+        }
+    }
+}
+
+/// Copy a column of the table, and say what was copied.
+fn copy_menu(ui: &mut egui::Ui, p: Palette, app: &mut App, table: &Table<'_>, targets: &Targets) {
+    let response = menu_button(ui, p, "Copy", !targets.is_empty());
+    let mode = app.mode;
+    let mut chosen = None;
+    popover(&response, p, mode, MENU_WIDTH, |ui| {
+        ui.label(
+            RichText::new(targets.describe().to_uppercase())
+                .size(text::EYEBROW)
+                .color(p.placeholder),
+        );
+        ui.add_space(metrics::S1);
+        for field in Field::ALL {
+            if field == Field::Row {
+                menu_separator(ui, p);
+            }
+            if menu_row(ui, p, field.label(), None, true) {
+                chosen = Some(field);
+            }
+        }
+    });
+
+    let Some(field) = chosen else {
+        return;
+    };
+    let empty = Identity::default();
+    let mut lines = Vec::new();
+    for address in &targets.addresses {
+        let Some(i) = table
+            .shown
+            .iter()
+            .find(|i| table.devices[**i].address == *address)
+        else {
+            continue;
+        };
+        let host = &table.devices[*i];
+        let named = table.names.get(*i);
+        let kind = muster_net::kind::kind_of(
+            host,
+            named.unwrap_or(&empty),
+            table.survey.vantage(host.address),
+        );
+        let value = field_value(field, host, named, kind, app.ping.answer_for(host.address));
+        // A blank line is not a value. The count has to be what was actually
+        // put on the clipboard or the pill is claiming more than it did.
+        if !value.trim().is_empty() {
+            lines.push(value);
+        }
+    }
+    let count = lines.len();
+    ui.ctx().copy_text(lines.join("\n"));
+    app.copied = Some((
+        format!("Copied {count} {}", field.noun(count)),
+        std::time::Instant::now(),
+    ));
+}
+
+/// What to do to the marked devices.
+fn actions_menu(ui: &mut egui::Ui, p: Palette, app: &mut App, targets: &Targets) {
+    let response = menu_button(ui, p, "Actions", !targets.is_empty());
+    let mode = app.mode;
+    let looping = app.ping.is_looping();
+    let scanning = app.ports.is_running() || !app.port_queue.is_empty();
+    let mut act = None;
+    popover(&response, p, mode, MENU_WIDTH, |ui| {
+        ui.label(
+            RichText::new(targets.describe().to_uppercase())
+                .size(text::EYEBROW)
+                .color(p.placeholder),
+        );
+        ui.add_space(metrics::S1);
+        if menu_row(ui, p, "Ping", Some("Once, and fill the Ping column."), true) {
+            act = Some(Action::Ping);
+        }
+        if looping {
+            if menu_row(ui, p, "Stop pinging", Some("The loop is running."), true) {
+                act = Some(Action::StopPing);
+            }
+        } else if menu_row(
+            ui,
+            p,
+            "Ping until stopped",
+            Some("Round and round, at the polite rate."),
+            true,
+        ) {
+            act = Some(Action::LoopPing);
+        }
+        menu_separator(ui, p);
+        if scanning {
+            if menu_row(ui, p, "Stop scanning ports", None, true) {
+                act = Some(Action::StopPorts);
+            }
+        } else if menu_row(
+            ui,
+            p,
+            "Scan ports",
+            Some("One device at a time, the common list."),
+            true,
+        ) {
+            act = Some(Action::ScanPorts);
+        }
+    });
+
+    match act {
+        Some(Action::Ping) => app.start_pings(targets.addresses.clone(), false),
+        Some(Action::LoopPing) => app.start_pings(targets.addresses.clone(), true),
+        Some(Action::StopPing) => app.ping.cancel(),
+        // **A queue, because the rate limiter is global.** Two port scans at
+        // once would each get half the budget and both would look broken, so
+        // the devices are lined up and taken one at a time; see
+        // `ports::State`, which is the module that owns that rule.
+        Some(Action::ScanPorts) => {
+            app.port_queue = targets.addresses.iter().copied().collect();
+            app.start_next_port_scan();
+        }
+        Some(Action::StopPorts) => {
+            app.port_queue.clear();
+            app.ports.cancel();
+        }
+        None => {}
+    }
+}
+
+/// What the actions menu was asked for. Read once, after the popover has been
+/// drawn, because acting inside it would borrow the app twice.
+enum Action {
+    Ping,
+    LoopPing,
+    StopPing,
+    ScanPorts,
+    StopPorts,
+}
+
+/// How wide the two table menus are: enough for their longest sentence.
+const MENU_WIDTH: f32 = 240.0;
+
+/// A §7.17 popover hung off a menu button, drawn in the family's frame.
+///
+/// The frame is the one [`scan_options`] uses, and it is here so the three
+/// menus in this window cannot drift into three shapes. Unlike that one this
+/// **is** a menu — every row is a choice that acts — so a click closes it,
+/// which is §7.7's behaviour and what a reader expects of a list of verbs.
+fn popover<R>(
+    response: &egui::Response,
+    p: Palette,
+    mode: Mode,
+    width: f32,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    egui::Popup::menu(response)
+        .gap(metrics::S1)
+        .frame(
+            egui::Frame::NONE
+                .fill(p.popover.to_opaque())
+                .stroke(Stroke::new(metrics::HAIRLINE, p.line_popover))
+                .corner_radius(metrics::RADIUS_MODAL)
+                .inner_margin(egui::Margin::same(metrics::PAD_PANEL as i8))
+                .shadow(theme::shadow::menu(mode)),
+        )
+        .show(|ui| {
+            ui.set_width(width);
+            content(ui);
+        });
+}
+
+/// One choice in a menu: a label, an optional sentence under it, a hover fill.
+fn menu_row(ui: &mut egui::Ui, p: Palette, label: &str, note: Option<&str>, enabled: bool) -> bool {
+    let height = if note.is_some() {
+        metrics::ROW + metrics::S3
+    } else {
+        metrics::ROW
+    };
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), height),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    if enabled && response.hovered() {
+        ui.painter().rect_filled(
+            rect.expand2(vec2(metrics::S1, 0.0)),
+            metrics::RADIUS,
+            p.control_hover,
+        );
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let ink = if enabled { p.text } else { p.text_dim };
+    let top = match note {
+        Some(_) => rect.top() + metrics::ROW / 2.0 - 1.0,
+        None => rect.center().y,
+    };
+    ui.painter().text(
+        pos2(rect.left(), top),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(text::CONTROL),
+        ink,
+    );
+    if let Some(note) = note {
+        ui.painter().text(
+            pos2(rect.left(), rect.bottom() - metrics::S3 / 2.0 - 1.0),
+            egui::Align2::LEFT_CENTER,
+            note,
+            FontId::proportional(text::TINY),
+            p.text_dim,
+        );
+    }
+    enabled && response.clicked()
+}
+
+/// The hairline between two groups of menu rows.
+fn menu_separator(ui: &mut egui::Ui, p: Palette) {
+    ui.add_space(metrics::S1);
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(ui.available_width(), metrics::HAIRLINE),
+        Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 0.0, p.line_popover);
+    ui.add_space(metrics::S1);
+}
+
+/// A button that opens a menu: §7.6's secondary with a chevron after the label.
+///
+/// The chevron is the only thing saying it opens rather than acts, so it also
+/// carries the cursor that says the same. Disabled where there is nothing for
+/// the menu to be about, with a tooltip saying so rather than a list of verbs
+/// that would all do nothing.
+fn menu_button(ui: &mut egui::Ui, p: Palette, label: &str, enabled: bool) -> egui::Response {
+    let font = FontId::proportional(text::CONTROL);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font.clone(), p.text);
+    let width = galley.size().x + metrics::S3 * 2.0 + CHEVRON;
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(width, metrics::BUTTON),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let dim = |c: Color32| {
+        if enabled { c } else { c.gamma_multiply(0.45) }
+    };
+    let fill = if enabled && response.hovered() {
+        p.control_hover
+    } else {
+        p.control
+    };
+    ui.painter().rect_filled(rect, metrics::RADIUS, dim(fill));
+    ui.painter().text(
+        pos2(rect.left() + metrics::S3, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font,
+        dim(p.text),
+    );
+
+    let c = pos2(rect.right() - metrics::S3 - CHEVRON / 2.0, rect.center().y);
+    let (w, h) = (CHEVRON * 0.34, CHEVRON * 0.18);
+    let ink = if enabled && response.hovered() {
+        p.text_strong
+    } else {
+        p.text_muted
+    };
+    for arm in [-w, w] {
+        ui.painter().line_segment(
+            [pos2(c.x + arm, c.y - h), pos2(c.x, c.y + h)],
+            Stroke::new(1.4_f32, dim(ink)),
+        );
+    }
+    if !enabled {
+        return response.on_hover_text("Nothing to act on: mark some devices, or scan.");
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The pill at the foot of the window: what was just copied.
+///
+/// §7.17's toast, in the corner it names and above the status bar rather than
+/// over it. One sentence, no action, and gone in six seconds — a confirmation
+/// that has to be dismissed is a confirmation that interrupted.
+fn copied_pill(ctx: &egui::Context, p: Palette, app: &mut App) {
+    let Some((message, at)) = &app.copied else {
+        return;
+    };
+    let age = at.elapsed();
+    if age > TOAST_LIFE {
+        app.copied = None;
+        return;
+    }
+    // The last half second is a fade rather than a disappearance, which is the
+    // one thing that keeps it from reading as a glitch at the edge of vision.
+    let fade = ((TOAST_LIFE.as_secs_f32() - age.as_secs_f32()) / 0.5).clamp(0.0, 1.0);
+    let message = message.clone();
+    egui::Area::new(egui::Id::new("copied-pill"))
+        .order(egui::Order::Foreground)
+        .anchor(
+            egui::Align2::RIGHT_BOTTOM,
+            vec2(-metrics::PAD_STRIP, -(metrics::STATUS_BAR + metrics::S3)),
+        )
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::NONE
+                .fill(p.popover.to_opaque().gamma_multiply(fade))
+                .stroke(Stroke::new(
+                    metrics::HAIRLINE,
+                    p.line_popover.gamma_multiply(fade),
+                ))
+                .corner_radius(metrics::RADIUS_MODAL)
+                .inner_margin(egui::Margin::symmetric(
+                    metrics::PAD_PANEL as i8,
+                    metrics::S2 as i8,
+                ))
+                .shadow(theme::shadow::menu(app.mode))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(message)
+                            .size(text::SMALL)
+                            .color(p.text.gamma_multiply(fade)),
+                    );
+                });
+        });
+}
+
+/// How long the pill stays. §7.17's six seconds.
+const TOAST_LIFE: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// A text field, drawn to §7.11 rather than egui's own.
 pub(crate) fn field(
@@ -2727,12 +4203,14 @@ mod tests {
             &at("192.0.2.1"),
             Some(&named),
             muster_net::Kind::Unknown,
+            None,
         );
         let without = sort_key(
             Column::Name,
             &at("192.0.2.2"),
             None,
             muster_net::Kind::Unknown,
+            None,
         );
         assert!(!with.0 && without.0, "emptiness is the first key");
     }
@@ -2772,18 +4250,21 @@ mod tests {
             &at("192.0.2.1"),
             Some(&router),
             muster_net::Kind::Router,
+            None,
         );
         let one = sort_key(
             Column::Serves,
             &at("192.0.2.2"),
             Some(&resolver),
             muster_net::Kind::Server,
+            None,
         );
         let none = sort_key(
             Column::Serves,
             &at("192.0.2.3"),
             None,
             muster_net::Kind::Unknown,
+            None,
         );
         assert!(both.2 > one.2);
         assert!(!one.0 && none.0, "and a device serving nothing is blank");
@@ -2818,6 +4299,39 @@ mod tests {
     /// what catches a column added to one and not the other.
     #[test]
     fn the_table_columns_are_one_set_of_numbers() {
-        assert_eq!(COL_ADDRESS + COL_NAME + COL_MAC + COL_TIME, 534.0);
+        assert_eq!(FIXED_COLUMNS, 836.0);
     }
+
+    /// And they have to fit the window Muster opens at, beside the sidebar,
+    /// with room left for the vendor column that takes what is left.
+    ///
+    /// This is the assertion that has teeth. A column added without widening
+    /// the window pushes "Made by" off the right edge, where nothing scrolls
+    /// sideways to reach it — and the person who finds out is on a laptop.
+    #[test]
+    fn the_columns_fit_the_window_with_room_for_the_last_one() {
+        let taken = FIXED_COLUMNS + metrics::PAD_PANEL * 2.0 + metrics::SIDEBAR;
+        assert!(
+            taken + VENDOR_ROOM <= crate::WINDOW[0],
+            "the table wants {taken} px and the window has {}",
+            crate::WINDOW[0]
+        );
+    }
+
+    /// Every column with a fixed width, in the order the header and the row
+    /// both walk them. "Made by" is the flexible one and is deliberately not
+    /// here.
+    const FIXED_COLUMNS: f32 = COL_MARK
+        + COL_KIND
+        + COL_ADDRESS
+        + COL_NAME
+        + COL_MAC
+        + COL_TIME
+        + COL_PING
+        + COL_SERVES
+        + COL_PORTS;
+
+    /// What "Made by" needs to be worth having: enough for the longest vendor
+    /// name a real network has turned up, which is about twenty characters.
+    const VENDOR_ROOM: f32 = 160.0;
 }

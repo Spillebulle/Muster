@@ -105,12 +105,24 @@ impl Source {
 /// **Every role here is a service that answered.** Not a port that was open,
 /// not a vendor that usually runs one: the device was asked a question in the
 /// protocol and replied in it.
+///
+/// The order is the badge order, and it is the network's own infrastructure
+/// first: what hands out addresses, what resolves names, then what serves
+/// files, then what accepts a shell. Two devices with the same roles therefore
+/// show the same badges in the same sequence, and a row does not reshuffle
+/// itself between scans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Role {
     /// It offered an address in reply to a DHCP DISCOVER.
     Dhcp,
     /// It answered a DNS query.
     Dns,
+    /// It answered an SMB negotiate: a Windows share, a NAS, or Samba.
+    Smb,
+    /// It answered an NFS null call.
+    Nfs,
+    /// It greeted an SSH connection.
+    Ssh,
 }
 
 impl Role {
@@ -119,6 +131,9 @@ impl Role {
         match self {
             Self::Dhcp => "DHCP",
             Self::Dns => "DNS",
+            Self::Smb => "SMB",
+            Self::Nfs => "NFS",
+            Self::Ssh => "SSH",
         }
     }
 
@@ -128,6 +143,9 @@ impl Role {
         match self {
             Self::Dhcp => "it offered this network an address",
             Self::Dns => "it answered a DNS query",
+            Self::Smb => "it answered an SMB negotiate, so it serves files",
+            Self::Nfs => "it answered an NFS null call, so it exports a file system",
+            Self::Ssh => "it greeted an SSH connection",
         }
     }
 }
@@ -205,6 +223,12 @@ pub struct Identity {
     /// with a name Muster already had is still a machine saying it speaks a
     /// protocol only general-purpose computers speak.
     pub llmnr: bool,
+    /// What it answered over a connection: SMB, NFS, the SSH greeting.
+    ///
+    /// Filled in by the caller from [`crate::service`] rather than by [`one`],
+    /// for the same reason [`Self::dhcp`] is: those questions are asked over
+    /// TCP and this phase is a UDP phase. See [`Self::serves`].
+    pub serves: crate::service::Serves,
 }
 
 impl Identity {
@@ -218,6 +242,7 @@ impl Identity {
             && self.resolver.is_none()
             && !self.dhcp
             && !self.llmnr
+            && self.serves.is_empty()
     }
 
     /// The name to show. The highest-priority source wins; ties keep the first.
@@ -266,12 +291,33 @@ impl Identity {
         if self.resolver.is_some() {
             out.push(Role::Dns);
         }
+        if self.serves.smb {
+            out.push(Role::Smb);
+        }
+        if self.serves.nfs {
+            out.push(Role::Nfs);
+        }
+        if self.serves.ssh.is_some() {
+            out.push(Role::Ssh);
+        }
         out
     }
 
     /// Records that this device answered a DHCP DISCOVER.
     pub fn offers_addresses(&mut self) {
         self.dhcp = true;
+    }
+
+    /// Records what this device answered over a connection.
+    ///
+    /// A merge rather than an assignment: a scan that asked only about SMB must
+    /// not wipe what an earlier answer said about the rest.
+    pub fn serves(&mut self, serves: &crate::service::Serves) {
+        self.serves.smb |= serves.smb;
+        self.serves.nfs |= serves.nfs;
+        if self.serves.ssh.is_none() {
+            self.serves.ssh.clone_from(&serves.ssh);
+        }
     }
 
     /// Folds in what a link-wide question learned about this same device.
@@ -1437,6 +1483,29 @@ SERVER: TP-LINK/TP-LINK UPnP/1.1 MiniUPnPd/2.2.2
         };
         identity.offers_addresses();
         assert_eq!(identity.roles(), vec![Role::Dhcp, Role::Dns]);
+    }
+
+    /// The connected half of the same rule: what a device serves over TCP is
+    /// folded in, and it comes out in the enum's order beside the rest.
+    #[test]
+    fn what_a_device_serves_over_a_connection_is_badged_too() {
+        let mut identity = Identity::default();
+        identity.serves(&crate::service::Serves {
+            nfs: true,
+            ssh: Some("SSH-2.0-OpenSSH_9.6".into()),
+            ..Default::default()
+        });
+        // A second pass that learned only about SMB adds to what is known
+        // rather than replacing it.
+        identity.serves(&crate::service::Serves {
+            smb: true,
+            ..Default::default()
+        });
+        assert_eq!(identity.roles(), vec![Role::Smb, Role::Nfs, Role::Ssh]);
+        assert!(
+            !identity.is_empty(),
+            "a service answered, so it is not empty"
+        );
     }
 
     /// A responder on 5355 is the flag, whether or not it gave a new name.

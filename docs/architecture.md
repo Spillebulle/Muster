@@ -16,8 +16,8 @@ crate naming no operating-system socket is what makes it testable at all.**
 Packet send and receive, the routing table, the neighbour table and the resolver
 configuration all sit behind traits: `sysinfo::SystemProbe` for what the machine
 knows, `discover::Transport` for the sweep, `identify::Ask` for the questions
-asked over UDP. The real implementations live in one platform module, and the
-tests drive recorded ones.
+asked over UDP, `service::Speak` for the ones that need a connection. The real
+implementations live in one platform module, and the tests drive recorded ones.
 
 That is why `cargo test -p muster-net` runs in under a tenth of a second on a
 machine with no network worth scanning, and why **no test in this repository
@@ -39,7 +39,11 @@ this layout exists to avoid.
 3. **Port scan.** Where the performance is, and where it is not yet.
 4. **Identify.** Only for hosts that answered. Hundreds of short exchanges
    rather than millions of packets, which is a different shape from phase three
-   and does not belong in its loop.
+   and does not belong in its loop. It is in two halves for the same reason:
+   `identify` asks what a device *is* over UDP, and `service` asks what it
+   *serves* over a connection, because SMB, NFS and SSH cannot be asked any
+   other way. Each of those sends the protocol's own opening move and reads the
+   protocol's own answer, so a badge is never an open port.
 
 ## What is settled
 

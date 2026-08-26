@@ -42,6 +42,7 @@ pub mod platform;
 pub mod portscan;
 pub mod prefix;
 pub mod rate;
+pub mod service;
 pub mod siphash;
 pub mod ssdp;
 pub mod survey;

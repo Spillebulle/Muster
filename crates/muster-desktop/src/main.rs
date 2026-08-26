@@ -111,7 +111,21 @@ fn main() {
             // has to be argued with.
             let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
             let dhcp = rest.contains(&"--dhcp");
-            scan(rest.into_iter().find(|a| !a.starts_with("--")), dhcp);
+            // The three questions that need a connection rather than a
+            // datagram, named one at a time rather than behind one switch: they
+            // are three different things to ask a network, and the window asks
+            // them one at a time too.
+            let serves = muster_net::service::Options {
+                smb: rest.contains(&"--smb"),
+                nfs: rest.contains(&"--nfs"),
+                ssh: rest.contains(&"--ssh"),
+                ..Default::default()
+            };
+            scan(
+                rest.into_iter().find(|a| !a.starts_with("--")),
+                dhcp,
+                serves,
+            );
         }
         "ports" => portcmd::run(
             args.get(1).map(String::as_str),
@@ -133,6 +147,7 @@ fn usage() {
            muster survey                 what this machine knows, no packets sent\n  \
            muster scan [prefix]          sweep the local network for devices\n  \
            muster scan --dhcp            and ask who hands out addresses\n  \
+           muster scan --smb --nfs --ssh  and ask what each device serves\n  \
            muster ports <host> [ports]   which ports are open on one host\n  \
            muster --help                 this\n\n\
          None of these needs administrator rights. With no prefix, the scan\n\
@@ -142,6 +157,11 @@ fn usage() {
          asks each one whether it is a name server. `--dhcp` adds a DISCOVER\n\
          broadcast, which finds every server willing to hand out an address:\n\
          two is a fault worth knowing about. Nothing ever accepts an offer.\n\n\
+         `--smb`, `--nfs` and `--ssh` open a connection to each device that\n\
+         answered and speak that protocol's own opening move: the negotiate an\n\
+         SMB client sends first, the null call NFS defines, and for SSH nothing\n\
+         at all, because a server greets whoever connects. Nothing is opened,\n\
+         listed or authenticated.\n\n\
          Devices are identified by hardware vendor, and by name where they\n\
          answer reverse DNS, mDNS or NetBIOS. The port scan uses connect(),\n\
          which is slower than the SYN scan it will use once raw packet access\n\
@@ -158,7 +178,7 @@ fn usage() {
 /// range somebody typed. A prefix given on the command line is the deliberate
 /// act, and it is checked against the local networks so that reaching beyond
 /// the link is something the user is told they are doing.
-fn scan(target: Option<&str>, dhcp: bool) {
+fn scan(target: Option<&str>, dhcp: bool, serves: muster_net::service::Options) {
     let survey = muster_net::survey();
 
     let prefixes: Vec<Prefix> = match target {
@@ -294,6 +314,32 @@ fn scan(target: Option<&str>, dhcp: bool) {
         }
 
         let mut names = names;
+
+        // What they serve, over a connection. After identification and only for
+        // what answered, and skipped entirely unless a flag asked: see
+        // `muster_net::service`.
+        if serves.any() {
+            let serving = muster_net::service::many(
+                &addresses,
+                &muster_net::platform::tcp::Stream,
+                &rate,
+                serves,
+                &cancel,
+                &|done, total| {
+                    if live {
+                        eprint!("\r  asking {done} of {total} what they serve   ");
+                        let _ = std::io::stderr().flush();
+                    }
+                },
+            );
+            if live {
+                eprint!("\r{:<48}\r", "");
+            }
+            for (identity, found) in names.iter_mut().zip(serving.iter()) {
+                identity.serves(found);
+            }
+        }
+
         let offers = offers.and_then(|handle| handle.join().ok());
         if let Some(probe) = &offers {
             for server in probe.servers() {

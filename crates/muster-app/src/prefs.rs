@@ -125,6 +125,22 @@ pub struct Prefs {
     /// question somebody scanning a network most often has after "what is
     /// here" — which of these is the network's own infrastructure.
     pub scan_dns: bool,
+
+    /// Ask each device that answered whether it serves files over SMB.
+    ///
+    /// **Off by default, and the three below it are off for one reason.** These
+    /// are the questions that can only be asked over a connection, and a
+    /// connection is a thing the far end writes down: a Samba log gets a line,
+    /// an SSH server notes a client that never identified itself. A datagram to
+    /// port 53 leaves no such trace. So the same rule `scan_dhcp` follows
+    /// applies — anything past looking is switched on deliberately, and then it
+    /// is remembered.
+    pub scan_smb: bool,
+    /// The same question over NFS.
+    pub scan_nfs: bool,
+    /// Read the greeting an SSH server volunteers, which costs it a connection
+    /// and this machine nothing to send: see `muster_net::service`.
+    pub scan_ssh: bool,
 }
 
 impl Default for Prefs {
@@ -145,6 +161,9 @@ impl Default for Prefs {
             identify: true,
             scan_dhcp: false,
             scan_dns: true,
+            scan_smb: false,
+            scan_nfs: false,
+            scan_ssh: false,
         }
     }
 }
@@ -217,6 +236,9 @@ pub fn parse(text: &str) -> Prefs {
             "identify" => prefs.identify = flag,
             "scan_dhcp" => prefs.scan_dhcp = flag,
             "scan_dns" => prefs.scan_dns = flag,
+            "scan_smb" => prefs.scan_smb = flag,
+            "scan_nfs" => prefs.scan_nfs = flag,
+            "scan_ssh" => prefs.scan_ssh = flag,
             // A file written by a newer Muster. Ignored rather than refused:
             // the alternative is a downgrade wiping settings it did not
             // understand.
@@ -244,6 +266,9 @@ pub fn render(prefs: &Prefs) -> String {
     out.push_str(&format!("identify = {}\n", prefs.identify));
     out.push_str(&format!("scan_dhcp = {}\n", prefs.scan_dhcp));
     out.push_str(&format!("scan_dns = {}\n", prefs.scan_dns));
+    out.push_str(&format!("scan_smb = {}\n", prefs.scan_smb));
+    out.push_str(&format!("scan_nfs = {}\n", prefs.scan_nfs));
+    out.push_str(&format!("scan_ssh = {}\n", prefs.scan_ssh));
     if !prefs.port_list.is_empty() {
         out.push_str(&format!("port_list = {}\n", prefs.port_list));
     }
@@ -299,6 +324,9 @@ mod tests {
             identify: false,
             scan_dhcp: true,
             scan_dns: false,
+            scan_smb: true,
+            scan_nfs: false,
+            scan_ssh: true,
         };
         assert_eq!(parse(&render(&prefs)), prefs);
     }

@@ -28,21 +28,21 @@ naming what the sweep could not do](docs/images/window.png)
 
 ## Install
 
-**Muster 0.0.9.** Take the file for your system, or browse the
+**Muster 0.0.10.** Take the file for your system, or browse the
 [release itself](https://github.com/Spillebulle/muster/releases/latest) for the
 notes and the checksums.
 
 | Your system | x86-64 | ARM64 |
 |---|---|---|
-| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster-setup-0.0.9-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster-setup-0.0.9-arm64.exe) |
-| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster_0.0.9_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster_0.0.9_arm64.deb) |
-| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster-0.0.9-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster-0.0.9-1.aarch64.rpm) |
-| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster-bin-0.0.9-1-x86_64.pkg.tar.zst) | not built |
-| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.9/Muster-0.0.9-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.9/Muster-0.0.9-aarch64.AppImage) |
-| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster-0.0.9-x86_64.flatpak) | not built |
-| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster-0.0.9-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster-0.0.9-arm64.msi) |
-| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster-0.0.9-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster-0.0.9-aarch64-pc-windows-msvc.zip) |
-| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster-0.0.9-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.9/muster-0.0.9-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-setup-0.0.10-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-setup-0.0.10-arm64.exe) |
+| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster_0.0.10_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster_0.0.10_arm64.deb) |
+| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-1.aarch64.rpm) |
+| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-bin-0.0.10-1-x86_64.pkg.tar.zst) | not built |
+| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.10/Muster-0.0.10-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.10/Muster-0.0.10-aarch64.AppImage) |
+| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-x86_64.flatpak) | not built |
+| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-arm64.msi) |
+| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-aarch64-pc-windows-msvc.zip) |
+| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-aarch64-unknown-linux-gnu.tar.gz) |
 
 The `.deb` and `.rpm` add the [Spillebulle archive](https://spillebulle.github.io/packages/)
 as they install, so `apt upgrade` or your usual system update carries Muster along
@@ -92,14 +92,22 @@ opened a great deal more often than that.
 
 ## The device list
 
-<img src="docs/images/window.png" alt="The device table: address, name,
-hardware address, response time and vendor, with two rows reading randomised
-address" align="right" width="380">
+<img src="docs/images/window.png" alt="The device table: a mark box, kind
+icon, address, name, hardware address, sweep time, ping, service badges, open
+ports and vendor, with two rows reading randomised address" align="right"
+width="380">
 
 This is the application. Every device the sweep found, with the name it gave for
-itself, how long it took to answer, and who made its network hardware. Figures
-are monospaced and the columns line up, because the point of a table of
-addresses is reading down it.
+itself, how long it took to answer, what it serves, what it has open, and who
+made its network hardware. Figures are monospaced and the columns line up,
+because the point of a table of addresses is reading down it.
+
+| Column | What it holds |
+|---|---|
+| Time | How long the device took to answer the sweep that found it. |
+| Ping | The last re-check's round trip. Blank until you ask for one, so it never claims a measurement it did not take. |
+| Serves | What answered a service question: see [What a device serves](#what-a-device-serves). |
+| Ports | Every port known open: what the sweep's own knock found, and whatever a port scan has added since. A blank cell means nothing has looked, not that nothing is open. |
 
 The vendor comes from the IEEE registry compiled into the binary, so it works
 with no internet connection and no lookup service. **A randomised hardware
@@ -146,28 +154,37 @@ server and also the resolver, and no single label says all three.
 
 | Badge | What earned it |
 |---|---|
-| `DNS` | It answered a DNS query. The device window adds the software where it named itself — `dnsmasq-pi-hole-v2.93` — and whether it resolves for clients or serves its own zones only. |
 | `DHCP` | It offered an address in reply to a DISCOVER. |
+| `DNS` | It answered a DNS query. The device window adds the software where it named itself — `dnsmasq-pi-hole-v2.93` — and whether it resolves for clients or serves its own zones only. |
+| `SMB` | It answered the negotiate an SMB client sends first, on port 445: a Windows share, a NAS, or Samba. |
+| `NFS` | It answered an NFS null call on port 2049 — the no-op the protocol defines, which asks a server to do nothing and reply. |
+| `SSH` | It greeted a connection on port 22. The device window shows the greeting, which is the software in the server's own words. |
 
-**Both are services that answered**, not open ports and not guesses from a
-vendor. The DNS question is `version.bind`, which a name server answers out of
+**Every one is a service that answered**, not an open port and not a guess from
+a vendor. The DNS question is `version.bind`, which a name server answers out of
 itself; where a server ignores that, the fallback asks for `localhost` and
 nothing else, because a question put to somebody else's resolver must not carry
-anything about the network being scanned.
-
-Finding DHCP servers is off until you turn it on, under **Scan** in the top bar.
-A DISCOVER asks every server on the link to reserve an address — nothing takes
-the offer and it is given back within seconds — and asking is a thing to decide
-rather than a thing that happens. Two servers answering is the fault this
-finds, and it is one of the hardest faults on a network to see by hand.
+anything about the network being scanned. Nothing is opened, listed or
+authenticated: the SMB and NFS questions are each protocol's own opening move,
+and the SSH one sends nothing at all and reads the line the server volunteers.
 
 ## What a scan asks
 
-The **Scan** menu in the top bar holds what a scan does, as against where it
-goes: whether to identify devices, whether to look for name servers, whether to
-look for DHCP servers, and how many probes a second. They are remembered, they
-are the same settings as the Scanning page under **Settings**, at the foot of
-the sidebar, and a scan already running keeps the settings it started with.
+The arrow at the right of the **Scan** button opens what a scan does, as against
+where it goes: whether to identify devices, and which of the services above to
+ask about, and how many probes a second. It stays open while you set it, and
+closes when you click outside it or press **Scan** at its foot.
+
+Everything past identification is off until you turn it on. A DISCOVER asks
+every server on the link to reserve an address — nothing takes the offer and it
+is given back within seconds — and the three connected questions leave a line in
+somebody's log where a datagram does not. Asking is a thing to decide rather
+than a thing that happens. Two DHCP servers answering is the fault this finds,
+and it is one of the hardest faults on a network to see by hand.
+
+The settings are remembered, they are the same settings as the Scanning page
+under **Settings** at the foot of the sidebar, and a scan already running keeps
+the settings it started with.
 
 ## Sorting
 
@@ -177,6 +194,30 @@ printers"; sorting by what a device serves brings the network's own
 infrastructure to the top. Addresses sort as numbers rather than as text, so
 `.9` comes before `.10`, and a row with nothing in the sorted column stays at
 the bottom either way.
+
+## Marking devices, and doing something with them
+
+Every row has a box at its left, and the box in the heading marks everything the
+filter is showing. Filter to `printer`, tick the heading, and you have marked
+the printers.
+
+**Copy** takes one column of the marked devices to the clipboard, one value per
+line: the addresses for a firewall rule, the hardware addresses for a set of
+DHCP reservations, or the whole row tab separated for a spreadsheet. A pill at
+the foot of the window says how many of what was copied.
+
+**Actions** does something to them:
+
+- **Ping**, once, which fills the Ping column for every marked device.
+- **Ping until stopped**, which goes round and round at the polite rate until
+  you stop it. The status bar says which round it is on.
+- **Scan ports**, one device at a time. That is the rate limiter's rule rather
+  than a shortage of threads: two scans at once would each get half the budget
+  and both would report a machine as more filtered than it is. What each scan
+  finds lands in that device's Ports column and stays there.
+
+With nothing marked, both menus act on every device the filter is showing, and
+they say which above the list so it is never a guess.
 
 ## One device, in full
 
@@ -225,12 +266,18 @@ packaged Muster can ask. A tarball, an AppImage or a development build cannot,
 and the fix is one command:
 
 ```sh
-sudo setcap cap_net_bind_service=+ep /path/to/muster
+sudo setcap cap_net_bind_service,cap_net_raw=+ep /path/to/muster
 ```
 
-On Windows the port is usually held by the system's own DHCP client and Muster
-cannot share it yet. Where it cannot have the port, it says so, and says which
-of the two happened, rather than reporting that nothing was found.
+`cap_net_raw` is in the same command because `setcap` replaces a binary's
+capabilities rather than adding to them, and it is the one the ICMP echo falls
+back to; granting the port alone would take the echo away.
+
+The machine's own DHCP client is usually on port 68 already. Muster asks to
+share it, which the Linux clients allow; on Windows the port belongs to the
+DHCP Client service and Muster will not take it from the service this machine's
+address depends on. Where it cannot have the port, it says so, and says which of
+the reasons it was, rather than reporting that nobody answered.
 
 ## What counts as found
 
@@ -246,14 +293,22 @@ presenting a short list as the whole answer.
 
 ## This network
 
-<img src="docs/images/network.png" alt="The This network view: the Wi-Fi
-interface with its address and hardware address, then the gateway, DNS and DHCP
-servers" align="right" width="380">
+<img src="docs/images/network.png" alt="The This network view: a card for the
+Wi-Fi interface holding its address, gateway, DNS, DHCP server and hardware
+address, and under it the card that asks the link who hands out addresses"
+align="right" width="380">
 
 Everything the machine already knows, read straight from the operating system
-with no packets sent and no privileges needed. Your address and prefix, the
-gateway, the resolvers you are actually using and the server that gave you the
-lease.
+with no packets sent and no privileges needed. **One card per network**, and
+every card answers the same questions: the address and the prefix it sits in,
+the gateway out of that link, the resolvers, the server that gave you the lease,
+and the hardware address.
+
+Per network rather than one long list, because on a laptop with a VPN up, or one
+on wifi and Ethernet at once, "which gateway belongs to which link" is exactly
+what somebody is here to find out. Where the platform keeps a resolver list per
+interface — Windows does — the card shows that interface's; where it keeps one
+list for the machine, the card says so rather than claiming it is the link's.
 
 It answers "what is my gateway, what is my DNS" the moment the window opens, so
 it is useful on its own rather than as a preamble to a scan.
@@ -306,9 +361,11 @@ a closed port, is in [`docs/architecture.md`](docs/architecture.md).
   scan opens one connection per port: correct, unprivileged, and slower by a
   large factor. The result says which one produced it.
 - **The privileged engine generally.** No ARP sweep, no SYN scan, no passive
-  fingerprinting, no LLDP or CDP. The Linux packages therefore do not grant
-  `CAP_NET_RAW` yet: there is no code path that would use it. They do grant
-  `CAP_NET_BIND_SERVICE`, which is the one the DHCP check needs.
+  fingerprinting, no LLDP or CDP. The Linux packages grant `CAP_NET_RAW` for
+  the one thing that does spend it — the ICMP echo, below — and
+  `CAP_NET_BIND_SERVICE` for the DHCP check. Promiscuous mode, which the
+  passive half of that engine will want, needs `CAP_NET_ADMIN` beside them and
+  is not granted.
 - **IPv6 sweeping.** Addresses, routes and gateways are read and shown for both
   families, but a sweep walks IPv4 addresses. An IPv6 prefix is not swept
   address by address, and the scan says so instead of reporting nothing found.
@@ -322,10 +379,13 @@ a closed port, is in [`docs/architecture.md`](docs/architecture.md).
   never granted the capability to bind it. It says which, rather than reporting
   that nobody answered.
 - **ICMP echoes need the kernel's permission on Linux**, through
-  `net.ipv4.ping_group_range`. Most distributions open it to everybody; where
-  one has not, Muster sends no echoes at all, and both the scan and the Ping
-  button say so and name the sysctl. A device is never reported as silent for
-  a question that was not asked.
+  `net.ipv4.ping_group_range`. Debian, Ubuntu and Pop!_OS leave it shut, so
+  Muster falls back to a raw socket, which is what `CAP_NET_RAW` buys and what
+  the packages grant. An AppImage cannot hold a capability at all and a tarball
+  has not been granted one, so on those `sudo` is the difference between times
+  and none. Where neither is open, the scan and the Ping button say no echo was
+  sent and name the cure: a device is never reported as silent for a question
+  that was not asked.
 - **Saved scans and monitoring.** Nothing is written to disk, so two scans of
   the same network a week apart cannot yet be compared.
 - **macOS.** Not a target, and not planned.
@@ -343,4 +403,6 @@ cargo test                   # everything; no test touches a network
 
 GPL-3.0-or-later; see [LICENSE](LICENSE). The interface is set in
 [Archivo](https://github.com/Omnibus-Type/Archivo) under the SIL Open Font
-License. Hardware vendor names come from the IEEE MA-L, MA-M and MA-S registry.
+License, and its icons are [Lucide](https://lucide.dev), copyright Lucide Icons
+and Contributors, under the ISC licence. Hardware vendor names come from the
+IEEE MA-L, MA-M and MA-S registry.
