@@ -49,7 +49,7 @@ impl Image {
     /// An image filled with one opaque colour.
     pub fn filled(width: u32, height: u32, colour: Color32) -> Self {
         let mut image = Self::new(width, height);
-        for px in image.pixels.chunks_exact_mut(4) {
+        for px in image.pixels.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&[colour.r(), colour.g(), colour.b(), 255]);
         }
         image
@@ -340,7 +340,9 @@ mod tests {
             let image = mark(side, p);
             image
                 .pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|px| px[3] > 200 && [px[0], px[1], px[2]] == ink)
         };
         assert!(!has_ink(16), "16 px must carry no glyph");
@@ -396,7 +398,9 @@ mod tests {
         let image = mark(64, Palette::dark());
         let partial = image
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[3] > 0 && px[3] < 255)
             .count();
         assert!(partial > 20, "expected a soft edge, found {partial} pixels");

@@ -220,7 +220,17 @@ pub fn parse_offer(bytes: &[u8], xid: u32) -> Option<Offer> {
             OPT_SERVER_ID => server = ipv4(value),
             OPT_SUBNET_MASK => mask = ipv4(value),
             OPT_ROUTER => router = ipv4(value),
-            OPT_DNS => dns = value.chunks_exact(4).filter_map(ipv4).collect(),
+            // `as_chunks` drops any trailing bytes that are not a whole
+            // address, which is the same thing `chunks_exact` did and the
+            // right reading of a malformed option.
+            OPT_DNS => {
+                dns = value
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| Ipv4Addr::from(*b))
+                    .collect();
+            }
             OPT_DOMAIN => domain = String::from_utf8(value.to_vec()).ok(),
             OPT_LEASE => {
                 lease = value

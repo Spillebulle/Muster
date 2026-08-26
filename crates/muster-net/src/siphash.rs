@@ -44,8 +44,11 @@ impl SipHasher {
         let len = msg.len();
         let whole = len - (len % 8);
 
-        for chunk in msg[..whole].chunks_exact(8) {
-            let m = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        // `as_chunks` rather than `chunks_exact`: the size is a constant, so
+        // each block arrives as an array and `from_le_bytes` takes it without
+        // a fallible conversion in the middle of a hash loop.
+        for chunk in msg[..whole].as_chunks::<8>().0 {
+            let m = u64::from_le_bytes(*chunk);
             v3 ^= m;
             round(&mut v0, &mut v1, &mut v2, &mut v3);
             round(&mut v0, &mut v1, &mut v2, &mut v3);
