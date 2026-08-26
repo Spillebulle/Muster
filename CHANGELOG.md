@@ -3,6 +3,86 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.11
+
+Added
+
+- **Muster finds the devices that answer nothing.** A scan used to be a sweep:
+  ask every address, list what replies. That misses a whole class of device on
+  purpose — a Windows machine on the public firewall profile, a television that
+  drops every connection, a phone asleep behind a lease it took an hour ago.
+  Those devices are not silent. They announce themselves to the network, and
+  they ask it questions. Muster now listens to both, and anything that speaks
+  goes on the list with the reason it got there.
+- **WS-Discovery**, which is how Windows answers when it answers nothing else.
+  It is also how every network printer of the last fifteen years and every
+  ONVIF camera announce themselves, and the reply names what the device is:
+  `pub:Computer`, `wprt:PrintDeviceType`, `dn:NetworkVideoTransmitter`. Three
+  kinds of device that were hard to find any other way, from one datagram.
+- **Muster listens, and sends nothing to do it.** For the length of a scan it
+  sits on the four ports the discovery protocols use and writes down who
+  speaks. **A question identifies its asker exactly as well as an answer
+  does** — a phone looking for a Chromecast has just proved it is there — and
+  this is the only thing here that finds a device without sending it a packet.
+  It shares those ports rather than taking them, and it never replies to
+  anything.
+- **The link is asked by name as well as in general.** The mDNS question that
+  lists a device's services is one many small responders simply do not answer,
+  so Muster now also asks about thirty service types outright: the ESP-based
+  smart plugs, the Avahi machines that publish `_workstation._tcp` with their
+  hardware address in the name, HomeKit accessories, printers, scanners and
+  the rest. SSDP gained three searches beside `ssdp:all` for the responders —
+  Hue bridges among them — that answer only their own device type.
+- **NetBIOS is asked of the whole network**, not one machine at a time. One
+  broadcast, and every Windows and Samba host on the link answers with its
+  name, its workgroup and its hardware address.
+- **Muster asks your own router what it calls things.** One reverse lookup per
+  address, which names the devices that took a lease and then went to sleep.
+  It is sent only to a resolver on your own network, never to one beyond it,
+  and it gives up after a dozen questions if the router keeps no such records.
+- **Your machine already knew about some of this.** The neighbour table is now
+  read into the results, so a device the operating system has spoken to
+  recently is on the list even when it answers nothing today. It stays quiet
+  about the devices that answered for themselves, where it would only repeat
+  what ARP already said.
+- **Four more ports are knocked on** — AirPlay, iPhone `lockdownd`, the
+  Chromecast control channel and JetDirect — and only for an address that
+  answered none of the first four. They are chosen for what a device *listens*
+  on rather than what it refuses, because that is the only question a device
+  that drops everything will answer. On the network this was built against,
+  7000 was the only open port on either television.
+
+Fixed
+
+- **On Windows, a refused connection was being reported as silence.** Windows
+  does not hand a TCP reset straight to the program: it retransmits first, and
+  the refusal surfaces about two seconds later. Muster waited 400 ms, so every
+  refusal became "nothing came back" — on a network of eighteen devices,
+  seventeen of which refuse rather than drop, the same knock proved eleven
+  hosts before and eighteen after. The timeout is now per platform.
+- **A sleeping device's services were being credited to the machine covering
+  for it.** An Apple TV or a HomePod answers mDNS on behalf of devices that
+  have gone to sleep, and Muster read those answers as though the Apple TV had
+  made all the claims itself. It now reads which device a reply is *about*,
+  which both fixes the row and finds the sleeping machine.
+- Identification learned everything the link had said about a device and then
+  kept three fields of it. A device found only by the link now keeps its
+  product, its model, its workgroup and its device types too.
+
+Changed
+
+- **A reverse lookup is never sent to a resolver off your own network.** It
+  used to go to whichever resolver the machine had, which on a machine
+  pointed at a public one meant handing a stranger the addresses of devices on
+  your network. Where the resolver is not on your link the question is not
+  asked, and the scan says so.
+- The result says how many of the devices were heard rather than probed,
+  because "twenty-one devices" from a sweep of 254 addresses is a different
+  claim when three of them never answered anything sent to them.
+- Every new question has a switch in the scan menu, and the two that send
+  nothing to the devices themselves — listening, and asking your own router —
+  are on.
+
 ## 0.0.10
 
 Added

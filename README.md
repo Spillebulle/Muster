@@ -28,21 +28,21 @@ naming what the sweep could not do](docs/images/window.png)
 
 ## Install
 
-**Muster 0.0.10.** Take the file for your system, or browse the
+**Muster 0.0.11.** Take the file for your system, or browse the
 [release itself](https://github.com/Spillebulle/muster/releases/latest) for the
 notes and the checksums.
 
 | Your system | x86-64 | ARM64 |
 |---|---|---|
-| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-setup-0.0.10-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-setup-0.0.10-arm64.exe) |
-| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster_0.0.10_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster_0.0.10_arm64.deb) |
-| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-1.aarch64.rpm) |
-| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-bin-0.0.10-1-x86_64.pkg.tar.zst) | not built |
-| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.10/Muster-0.0.10-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.10/Muster-0.0.10-aarch64.AppImage) |
-| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-x86_64.flatpak) | not built |
-| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-arm64.msi) |
-| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-aarch64-pc-windows-msvc.zip) |
-| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.10/muster-0.0.10-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-setup-0.0.11-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-setup-0.0.11-arm64.exe) |
+| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster_0.0.11_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster_0.0.11_arm64.deb) |
+| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-1.aarch64.rpm) |
+| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-bin-0.0.11-1-x86_64.pkg.tar.zst) | not built |
+| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.11/Muster-0.0.11-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.11/Muster-0.0.11-aarch64.AppImage) |
+| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-x86_64.flatpak) | not built |
+| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-arm64.msi) |
+| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-aarch64-pc-windows-msvc.zip) |
+| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-aarch64-unknown-linux-gnu.tar.gz) |
 
 The `.deb` and `.rpm` add the [Spillebulle archive](https://spillebulle.github.io/packages/)
 as they install, so `apt upgrade` or your usual system update carries Muster along
@@ -175,12 +175,23 @@ where it goes: whether to identify devices, and which of the services above to
 ask about, and how many probes a second. It stays open while you set it, and
 closes when you click outside it or press **Scan** at its foot.
 
-Everything past identification is off until you turn it on. A DISCOVER asks
-every server on the link to reserve an address — nothing takes the offer and it
-is given back within seconds — and the three connected questions leave a line in
-somebody's log where a datagram does not. Asking is a thing to decide rather
-than a thing that happens. Two DHCP servers answering is the fault this finds,
-and it is one of the hardest faults on a network to see by hand.
+Everything that touches a device past identification is off until you turn it
+on. A DISCOVER asks every server on the link to reserve an address — nothing
+takes the offer and it is given back within seconds — and the three connected
+questions leave a line in somebody's log where a datagram does not. Asking is a
+thing to decide rather than a thing that happens. Two DHCP servers answering is
+the fault this finds, and it is one of the hardest faults on a network to see by
+hand.
+
+The two that ask nothing of the devices are on. **Listen for devices** sends
+nothing at all: it sits on the ports the discovery protocols use for the length
+of the scan and writes down who speaks, which is how the quiet ones are found —
+a phone looking for a Chromecast has proved it is there without ever answering
+anything. **Ask this network for names** puts one reverse lookup per address to
+your own router, which names the devices that took a lease and then went to
+sleep; it is never sent to a resolver beyond your own network, and where there
+is no such resolver the scan says so rather than finding less and staying quiet
+about it.
 
 The settings are remembered, they are the same settings as the Scanning page
 under **Settings** at the foot of the sidebar, and a scan already running keeps
@@ -285,11 +296,22 @@ A device that **refuses** a connection has proved it is there just as surely as
 one that accepts it. Muster counts both, which is how it sees the many machines
 that ignore ping and answer a knock with a refusal.
 
+**A device that speaks has proved it is there without being asked anything.**
+A television announcing itself over SSDP, a printer answering a WS-Discovery
+probe, a phone asking the network where its Chromecast is — each of those is a
+device, and each is one that a sweep of the addresses can miss completely.
+Muster puts them on the list with the protocol that found them written against
+the row, so a device that was heard is never presented as one that answered a
+probe.
+
 Silence is the opposite: it proves nothing at all. An address that never
 answered is not reported as empty, and a port that never answered is reported as
 filtered rather than closed. That distinction is the most common lie a scanner
 tells, and the status bar names anything the sweep could not do rather than
-presenting a short list as the whole answer.
+presenting a short list as the whole answer. A name is not a device either: a
+reverse lookup that returns `kitchen-pi` for an address proves only that your
+router remembers writing that down, so it names a device Muster found and never
+puts a row on the list by itself.
 
 ## This network
 
@@ -369,6 +391,15 @@ a closed port, is in [`docs/architecture.md`](docs/architecture.md).
 - **IPv6 sweeping.** Addresses, routes and gateways are read and shown for both
   families, but a sweep walks IPv4 addresses. An IPv6 prefix is not swept
   address by address, and the scan says so instead of reporting nothing found.
+  The link-wide questions and the listening are IPv4 too; on IPv6 they would be
+  the same questions sent to `ff02::fb` and `ff02::c`, which is a small change
+  and not yet made.
+- **Continuous monitoring.** The listening phase runs for the length of a scan
+  and then stops. Devices arrive steadily rather than all at once — on the
+  network this was measured against, half of them spoke only after the first
+  eighty seconds — so a listen that kept running is where "a new device
+  appeared on your network" comes from. Most of the machinery for it now
+  exists.
 - **The UPnP description, TLS certificates, UDP service probes.** SSDP now
   answers: Muster reads the headers a device replies with, which carry its
   product and the kinds of device it is. It does not yet fetch the XML
