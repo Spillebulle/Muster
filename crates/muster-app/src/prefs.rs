@@ -99,6 +99,14 @@ pub struct Prefs {
     pub rate: u32,
     /// Probes a second for a port scan of one device.
     pub port_rate: u32,
+    /// How long a continuous ping waits between passes, in milliseconds.
+    ///
+    /// **This setting exists because it was missing.** A loop had no interval
+    /// at all: the rate limiter was the only thing pacing it, so one device on
+    /// a fast link was re-probed as fast as the bucket refilled — over a
+    /// hundred times a second, which is a flood aimed at one address and tells
+    /// the reader nothing that twice a second does not.
+    pub ping_every: u32,
     /// Say so before sweeping a range this machine is not on.
     pub warn_off_link: bool,
     /// The port list. Empty means the built-in common list.
@@ -179,6 +187,7 @@ impl Default for Prefs {
             last_check: 0,
             rate: muster_net::rate::DEFAULT_RATE,
             port_rate: 400,
+            ping_every: crate::ping::EVERY.as_millis() as u32,
             warn_off_link: true,
             port_list: String::new(),
             columns: crate::app::Widths::default(),
@@ -252,6 +261,14 @@ pub fn parse(text: &str) -> Prefs {
                     prefs.rate = v.clamp(1, 100_000);
                 }
             }
+            "ping_every" => {
+                if let Ok(ms) = value.parse::<u32>() {
+                    prefs.ping_every = ms.clamp(
+                        crate::ping::FASTEST.as_millis() as u32,
+                        crate::ping::SLOWEST.as_millis() as u32,
+                    );
+                }
+            }
             "port_rate" => {
                 if let Ok(v) = value.parse::<u32>() {
                     prefs.port_rate = v.clamp(1, 100_000);
@@ -294,6 +311,11 @@ pub fn render(prefs: &Prefs) -> String {
     out.push_str(&format!("last_check = {}\n", prefs.last_check));
     out.push_str(&format!("rate = {}\n", prefs.rate));
     out.push_str(&format!("port_rate = {}\n", prefs.port_rate));
+    out.push_str(&format!(
+        "ping_every = {}
+",
+        prefs.ping_every
+    ));
     out.push_str(&format!("warn_off_link = {}\n", prefs.warn_off_link));
     out.push_str(&format!("identify = {}\n", prefs.identify));
     out.push_str(&format!("scan_dhcp = {}\n", prefs.scan_dhcp));
@@ -358,6 +380,7 @@ mod tests {
             last_check: 1_760_000_000,
             rate: 500,
             port_rate: 200,
+            ping_every: 1500,
             warn_off_link: false,
             port_list: "22,80,443".into(),
             identify: false,

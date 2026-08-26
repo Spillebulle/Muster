@@ -28,6 +28,52 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, Instant};
+
+/// How long a loop waits between passes, unless told otherwise.
+///
+/// **A loop used to have no interval at all**, which is not a detail: the rate
+/// limiter was the only thing pacing it, so one device on a fast link was
+/// re-probed as quickly as the bucket would refill — over a hundred times a
+/// second. That is a scan of one address at flood rate, it looks exactly like
+/// the thing `CLAUDE.md` says a scanner must never be mistaken for, and it
+/// tells the reader nothing a probe every half second does not.
+///
+/// Half a second is the interval between passes rather than between probes, so
+/// a loop over twenty devices that takes longer than this to get round simply
+/// goes again at once: the rule is "no faster than this", not "exactly this".
+pub const EVERY: Duration = Duration::from_millis(500);
+
+/// The shortest and longest a loop may be paced at.
+///
+/// The floor is not zero and never should be: this is the setting that used to
+/// be absent, and an interval of nothing is the defect it was added to fix.
+pub const FASTEST: Duration = Duration::from_millis(200);
+pub const SLOWEST: Duration = Duration::from_secs(10);
+
+/// How many results are kept per device.
+///
+/// Enough to fill the panel's history column several times over, so scrolling
+/// back through a loop that has been running a few minutes reaches something.
+/// Bounded because a loop left running overnight would otherwise be a leak.
+pub const REMEMBERED: usize = 512;
+
+/// One re-check, kept for the history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sample {
+    /// When it was taken, as the window's own clock reads.
+    pub at: Instant,
+    /// The round trip, where one was measured. [`None`] is a device that did
+    /// not answer *or* a probe that could not be sent, and the two are told
+    /// apart by [`Self::asked`].
+    pub rtt: Option<Duration>,
+    /// The probe actually went out. False is this machine's failing rather than
+    /// the device's, and the history must not draw it as a lost packet.
+    pub asked: bool,
+}
+
+/// How long a paced loop sleeps between looks at the cancel flag.
+const TICK: Duration = Duration::from_millis(25);
 
 /// How many devices are asked at once inside one run.
 ///
@@ -48,6 +94,9 @@ struct Run {
     answered: usize,
     /// How many times round it has been. One is a single pass.
     passes: usize,
+    /// Devices this run has heard from at all, so a row that has answered once
+    /// stops saying it is waiting. See [`State::waiting_for`].
+    heard: std::collections::BTreeSet<IpAddr>,
 }
 
 /// What the window holds: the last answer per device, and any run in flight.
@@ -60,6 +109,15 @@ pub struct State {
     /// column at the start of every pass would make a loop flicker rather than
     /// update.
     answers: BTreeMap<IpAddr, Recheck>,
+    /// Every result kept, per device, oldest first and capped at
+    /// [`REMEMBERED`].
+    ///
+    /// Kept beside `answers` rather than derived from it because the two answer
+    /// different questions: the table wants the latest reading and the panel
+    /// wants the shape of the last few minutes. A loop that has been running is
+    /// the only way to get the second, and throwing it away when the loop stops
+    /// would make the history useless exactly when somebody wants to read it.
+    history: BTreeMap<IpAddr, Vec<Sample>>,
     run: Option<Run>,
 }
 
@@ -70,10 +128,22 @@ impl State {
     /// menu's "Ping" usable while a loop is going: the newer question is the
     /// one that was asked.
     pub fn start(&mut self, targets: Vec<IpAddr>, looping: bool, on_link: bool) {
+        self.start_every(targets, looping, on_link, EVERY);
+    }
+
+    /// The same, paced at a stated interval. See [`EVERY`].
+    pub fn start_every(
+        &mut self,
+        targets: Vec<IpAddr>,
+        looping: bool,
+        on_link: bool,
+        every: Duration,
+    ) {
         if targets.is_empty() {
             return;
         }
         self.cancel();
+        let every = every.clamp(FASTEST, SLOWEST);
 
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = channel();
@@ -93,6 +163,7 @@ impl State {
             let transport = muster_net::platform::Host;
 
             loop {
+                let began = Instant::now();
                 let next = AtomicUsize::new(0);
                 std::thread::scope(|scope| {
                     for _ in 0..WORKERS.min(list.len()) {
@@ -121,6 +192,19 @@ impl State {
                 if !looping || worker_cancel.load(Ordering::Relaxed) {
                     break;
                 }
+                // **The pause that makes this a loop rather than a flood.**
+                // Measured from the start of the pass, so the interval is the
+                // period and not an extra delay on top of however long the
+                // probes took: a pass that already took longer than `every`
+                // goes again at once. Slept in slices, because a loop that
+                // ignores the cancel flag for half a second is a Stop button
+                // that does not feel like one.
+                while began.elapsed() < every {
+                    if worker_cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(TICK.min(every - began.elapsed()));
+                }
             }
         });
 
@@ -131,6 +215,7 @@ impl State {
             rx,
             answered: 0,
             passes: 1,
+            heard: Default::default(),
         });
     }
 
@@ -153,7 +238,24 @@ impl State {
         loop {
             match run.rx.try_recv() {
                 Ok((address, answer)) => {
+                    // Kept before it is moved into `answers`, so the history is
+                    // the same reading the table shows and cannot drift from
+                    // it.
+                    let sample = Sample {
+                        at: Instant::now(),
+                        rtt: answer.found.as_ref().and_then(|f| f.rtt),
+                        asked: answer.not_done.is_empty(),
+                    };
+                    let kept = self.history.entry(address).or_default();
+                    kept.push(sample);
+                    if kept.len() > REMEMBERED {
+                        // The oldest go first. A `Vec` rather than a deque
+                        // because the panel reads it as a slice and this
+                        // happens once every few hundred probes.
+                        kept.drain(..kept.len() - REMEMBERED);
+                    }
                     self.answers.insert(address, answer);
+                    run.heard.insert(address);
                     run.answered += 1;
                     if run.answered >= run.targets.len() {
                         // Round again, or done. A single pass ends here; a loop
@@ -207,11 +309,69 @@ impl State {
         Some((run.answered, run.targets.len(), run.passes))
     }
 
-    /// Is this device one the run is waiting on?
+    /// Is this device one the run has yet to hear from at all?
+    ///
+    /// **Only until its first answer, and that is the whole of the fix.** This
+    /// used to be true for every target for as long as the run lasted, so a
+    /// loop over twenty devices showed twenty rows saying "asking…" from the
+    /// first probe to the last — the answers were arriving and being written
+    /// down, and the column was covering them up. Two complaints came out of
+    /// one line: results that seemed to wait for the whole group, and a column
+    /// that never showed anything but "asking" once a loop was going.
+    ///
+    /// So a device is "waiting" only before it has said anything in this run.
+    /// After that its last reading stands, including "no reply", until the next
+    /// one replaces it. A row never goes backwards to a blank.
     pub fn waiting_for(&self, address: IpAddr) -> bool {
         self.run
             .as_ref()
-            .is_some_and(|r| r.targets.contains(&address))
+            .is_some_and(|r| r.targets.contains(&address) && !r.heard.contains(&address))
+    }
+
+    /// Is a loop running that includes this device?
+    ///
+    /// What the panel's button asks before deciding whether it offers to start
+    /// one or to stop one. A loop the table's menu started over twenty devices
+    /// counts: the reader is looking at one of the twenty, the button they can
+    /// see is stopping the thing that is happening, and a panel that offered to
+    /// "keep pinging" a device already being pinged would be lying about the
+    /// state of the machine.
+    pub fn loops_for(&self, address: IpAddr) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(|r| r.looping && r.targets.contains(&address))
+    }
+
+    /// Everything kept about one device, oldest first.
+    pub fn history_for(&self, address: IpAddr) -> &[Sample] {
+        self.history.get(&address).map_or(&[], Vec::as_slice)
+    }
+
+    /// Puts a made-up history in, for `examples/docs-images.rs`.
+    ///
+    /// The pictures in the README are taken by the real interface — see that
+    /// example's note — and a history is the one thing on the device window
+    /// that cannot be seeded by handing the app a finished scan, because it is
+    /// made by probing. Each entry is a round trip in milliseconds and whether
+    /// the probe went out at all; a zero round trip that *was* asked is a
+    /// device that did not answer.
+    pub fn seed(&mut self, address: IpAddr, samples: &[(u64, bool)]) {
+        let now = Instant::now();
+        let kept: Vec<Sample> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, &(ms, asked))| Sample {
+                at: now + Duration::from_millis(i as u64 * 500),
+                rtt: (ms > 0).then(|| Duration::from_millis(ms)),
+                asked,
+            })
+            .collect();
+        self.history.insert(address, kept);
+    }
+
+    /// Forgets one device's history, for the panel's own control.
+    pub fn forget(&mut self, address: IpAddr) {
+        self.history.remove(&address);
     }
 
     /// The last answer about one device.
@@ -258,6 +418,96 @@ mod tests {
         assert!(state.rtt_for(ip("192.168.0.1")).is_none());
         assert!(!state.waiting_for(ip("192.168.0.1")));
         assert_eq!(state.progress(), None);
+    }
+
+    /// **The defect that made a loop unreadable.** Every target used to be
+    /// "waiting" for as long as the run lasted, so the answers arrived, were
+    /// written down, and were covered up by a column saying "asking…". A device
+    /// is waiting only until it has said something.
+    #[test]
+    fn a_device_stops_waiting_once_it_has_answered() {
+        let mut state = State::default();
+        let one = ip("192.168.0.2");
+        let two = ip("192.168.0.3");
+        state.run = Some(Run {
+            targets: vec![one, two],
+            looping: true,
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx: channel().1,
+            answered: 0,
+            passes: 1,
+            heard: Default::default(),
+        });
+
+        assert!(state.waiting_for(one));
+        assert!(state.waiting_for(two));
+
+        if let Some(run) = &mut state.run {
+            run.heard.insert(one);
+        }
+        assert!(
+            !state.waiting_for(one),
+            "it has answered, so it is not waiting"
+        );
+        assert!(state.waiting_for(two), "and its neighbour still is");
+    }
+
+    /// A device nothing is asking about is not waiting for anything.
+    #[test]
+    fn a_device_no_run_is_about_is_never_waiting() {
+        let mut state = State::default();
+        state.run = Some(Run {
+            targets: vec![ip("192.168.0.2")],
+            looping: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx: channel().1,
+            answered: 0,
+            passes: 1,
+            heard: Default::default(),
+        });
+        assert!(!state.waiting_for(ip("192.168.0.9")));
+        assert!(
+            !state.loops_for(ip("192.168.0.2")),
+            "this run is not a loop"
+        );
+    }
+
+    /// An interval of nothing is what the flood was. The floor is not
+    /// negotiable, and neither is the ceiling.
+    #[test]
+    fn a_loop_is_never_paced_faster_than_the_floor() {
+        for asked in [Duration::ZERO, Duration::from_millis(1), FASTEST] {
+            assert_eq!(asked.clamp(FASTEST, SLOWEST), FASTEST, "{asked:?}");
+        }
+        assert_eq!(Duration::from_secs(600).clamp(FASTEST, SLOWEST), SLOWEST);
+        assert_eq!(
+            EVERY.clamp(FASTEST, SLOWEST),
+            EVERY,
+            "the default is inside"
+        );
+    }
+
+    /// History is kept per device, oldest first, and bounded.
+    #[test]
+    fn history_is_kept_per_device_and_bounded() {
+        let mut state = State::default();
+        let one = ip("192.168.0.2");
+        let two = ip("192.168.0.3");
+        state.seed(one, &[(1, true), (0, true), (3, false)]);
+        state.seed(two, &[(7, true)]);
+
+        let kept = state.history_for(one);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[0].rtt, Some(Duration::from_millis(1)));
+        assert_eq!(kept[1].rtt, None, "a zero round trip is no reply");
+        assert!(kept[1].asked, "and it was asked");
+        assert!(!kept[2].asked, "where this one was not");
+        assert_eq!(state.history_for(two).len(), 1);
+        assert!(state.history_for(ip("192.168.0.9")).is_empty());
+
+        state.forget(one);
+        assert!(state.history_for(one).is_empty());
+        assert_eq!(state.history_for(two).len(), 1, "and only that one");
     }
 
     /// Cancelling nothing is harmless: the control is drawn from the same state

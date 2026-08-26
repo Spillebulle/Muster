@@ -52,7 +52,10 @@ use std::time::Duration;
 /// narrow window instead. That is a real size the interface has to work at, so
 /// the picture is of the application rather than of a cut-out of it, and it is
 /// the width §17.3 asks a right-aligned picture to sit at.
-const SHOTS: [(&str, View, [f32; 2], Option<u8>); 5] = [
+const SHOTS: [(&str, View, [f32; 2], Option<u8>); 6] = [
+    // The device window with its history column open, which is the one picture
+    // that needs a history seeded into it: see `ping::State::seed`.
+    ("history.png", View::Devices, [1400.0, 560.0], Some(101)),
     ("settings.png", View::Devices, [1400.0, 700.0], Some(0)),
     ("window.png", View::Devices, [1400.0, 620.0], None),
     // The detail window, opened on the gateway: the device with the most to
@@ -62,6 +65,36 @@ const SHOTS: [(&str, View, [f32; 2], Option<u8>); 5] = [
     ("device.png", View::Devices, [1400.0, 520.0], Some(1)),
     ("network.png", View::Network, [720.0, 380.0], None),
     ("about.png", View::About, [720.0, 480.0], None),
+];
+
+/// A minute of round trips, as a real loop against a router produces them: a
+/// steady millisecond or two, one slow answer, and one probe that went out and
+/// got nothing back.
+const HISTORY: [(u64, bool); 24] = [
+    (1, true),
+    (2, true),
+    (1, true),
+    (1, true),
+    (3, true),
+    (2, true),
+    (1, true),
+    (1, true),
+    (2, true),
+    (9, true),
+    (4, true),
+    (2, true),
+    (1, true),
+    (1, true),
+    (0, true),
+    (2, true),
+    (1, true),
+    (3, true),
+    (2, true),
+    (1, true),
+    (1, true),
+    (2, true),
+    (1, true),
+    (1, true),
 ];
 
 fn main() {
@@ -107,6 +140,16 @@ fn shoot(path: PathBuf, view: View, window: [f32; 2], select: Option<u8>) {
                 // Zero is not a host: it means "open the settings page", which
                 // is the one picture that is not about a device.
                 Some(0) => app.open_settings(),
+                // Over a hundred is not a host either: it is a device with the
+                // ping history open, and the number is the host with 100 taken
+                // off. A /24 has no host 101 in this invented network, so the
+                // two cannot collide.
+                // Two hundred is the settings page on its Scanning pane.
+                Some(200) => app.open_scanning(),
+                Some(host) if host > 100 => {
+                    app.select(v4(192, 0, 2, host - 100));
+                    app.show_history(&HISTORY);
+                }
                 Some(host) => app.select(v4(192, 0, 2, host)),
                 None => {}
             }

@@ -79,6 +79,11 @@ pub struct State {
     /// The library, read once when the page opens rather than per frame.
     themes: Vec<CustomTheme>,
     problems: Vec<String>,
+    /// What is typed into the port list's own add field.
+    ///
+    /// Not a setting and not written anywhere: it is the half-finished thing in
+    /// somebody's hand, and it is cleared the moment it is accepted.
+    adding: String,
 }
 
 impl State {
@@ -150,7 +155,7 @@ pub fn show(
                         .max_height(size.y - 120.0)
                         .show(ui, |ui| match state.pane {
                             Pane::General => general(ui, p, state, prefs, updates, &mut out),
-                            Pane::Scanning => scanning(ui, p, prefs),
+                            Pane::Scanning => scanning(ui, p, state, prefs),
                             Pane::Themes => themes(ui, p, state, prefs),
                         });
                     ui.add_space(metrics::S3);
@@ -327,7 +332,7 @@ fn general(
     );
 }
 
-fn scanning(ui: &mut egui::Ui, p: Palette, prefs: &mut Prefs) {
+fn scanning(ui: &mut egui::Ui, p: Palette, state: &mut State, prefs: &mut Prefs) {
     // The same values the scan control's own popover carries, because they are
     // the same fields of `Prefs`. Somebody looking for what a scan does will
     // look in Settings, and a Settings page that does not have it is a page
@@ -372,6 +377,40 @@ fn scanning(ui: &mut egui::Ui, p: Palette, prefs: &mut Prefs) {
             }
         },
     );
+    // The two that ask nothing of the devices themselves, and are therefore on.
+    // **They belong here as well as in the scan menu**, which is the whole
+    // arrangement: the popover by the Scan button and this pane are two views
+    // of one set of values, and a switch that appears in only one of them is a
+    // setting somebody cannot find from the place they went looking.
+    row(
+        ui,
+        p,
+        "Listen for devices",
+        Some(
+            "Sends nothing. Hears the questions other devices ask, which is how the quiet ones are found.",
+        ),
+        |ui| {
+            let mut on = prefs.scan_listen;
+            if toggle(ui, p, &mut on) {
+                prefs.scan_listen = on;
+            }
+        },
+    );
+    row(
+        ui,
+        p,
+        "Ask this network for names",
+        Some(
+            "One reverse lookup per address, to this network's own router. It names the devices that are asleep.",
+        ),
+        |ui| {
+            let mut on = prefs.scan_reverse;
+            if toggle(ui, p, &mut on) {
+                prefs.scan_reverse = on;
+            }
+        },
+    );
+
     // The three questions that need a connection rather than a datagram. See
     // `prefs::Prefs::scan_smb` for why all three are off until they are asked
     // for, and `muster_net::service` for what each one sends.
@@ -479,46 +518,149 @@ fn scanning(ui: &mut egui::Ui, p: Palette, prefs: &mut Prefs) {
     eyebrow(ui, p, "PORTS");
     ui.label(
         RichText::new(
-            "Which ports a scan tries. Empty is the built-in list of the ones worth knowing \
-             about; otherwise something like 22,80,443 or 1-1024.",
+            "Which ports a scan tries. It starts as the built-in list; add to it or take from it, and Reset puts that list back.",
         )
         .size(text::TINY)
         .color(p.text_dim),
     );
-    ui.add_space(metrics::S1);
+    ui.add_space(metrics::S2);
+    port_list(ui, p, state, prefs);
+}
+
+/// The port list, as a list rather than as a line of text.
+///
+/// **It was a text field, and a text field made the common case impossible.**
+/// The setting is a specification — empty meaning the built-in list — so adding
+/// one port to the sixty-four already scanned meant knowing all sixty-four and
+/// typing them out. Nobody was going to, which meant in practice the list was
+/// either the built-in one or a short list somebody had written from scratch.
+///
+/// So the built-in list is *materialised* the first time anything is added or
+/// removed: empty still means the built-in list, and it stops being empty the
+/// moment somebody edits it, at which point what they are editing is the whole
+/// of what will be scanned. Reset makes it empty again, which is the way back.
+fn port_list(ui: &mut egui::Ui, p: Palette, state: &mut State, prefs: &mut Prefs) {
+    let current = effective(&prefs.port_list);
+    let mut ports = current.clone();
+    let mut changed = false;
+
     ui.horizontal(|ui| {
-        crate::app::field(ui, p, &mut prefs.port_list, 240.0, "the common list");
+        crate::app::field(ui, p, &mut state.adding, 120.0, "80, or 8000-8100");
         ui.add_space(metrics::S2);
-        // Parsed live, so the field says whether it is usable before a scan
-        // rather than failing after one.
-        match prefs.port_list.trim() {
-            "" => {
-                let n = muster_net::portscan::Ports::common().len();
-                ui.label(
-                    RichText::new(format!("{n} ports"))
-                        .size(text::TINY)
-                        .color(p.text_muted),
-                );
+        // What is typed, read before it is offered: a button that accepts
+        // nonsense and then complains is a button that should have been
+        // disabled.
+        let typed = state.adding.trim().to_string();
+        let parsed = typed.parse::<muster_net::portscan::Ports>();
+        let addable = parsed.as_ref().ok().map(|got| {
+            got.as_slice()
+                .iter()
+                .filter(|port| !ports.contains(port))
+                .count()
+        });
+        let ready = !typed.is_empty() && addable.is_some_and(|n| n > 0);
+        if crate::app::button(ui, p, "Add", crate::app::Kind::Secondary, ready).clicked()
+            && ready
+            && let Ok(got) = &parsed
+        {
+            {
+                for port in got.as_slice() {
+                    if !ports.contains(port) {
+                        ports.push(*port);
+                    }
+                }
+                ports.sort_unstable();
+                changed = true;
+                state.adding.clear();
             }
-            spec => match spec.parse::<muster_net::portscan::Ports>() {
-                Ok(ports) => {
-                    ui.label(
-                        RichText::new(format!("{} ports", ports.len()))
-                            .size(text::TINY)
-                            .color(p.text_muted),
-                    );
-                }
-                Err(e) => {
-                    // In the error's own words, never a red outline alone.
-                    ui.label(
-                        RichText::new(e.to_string())
-                            .size(text::TINY)
-                            .color(p.caution),
-                    );
-                }
-            },
         }
+        ui.add_space(metrics::S2);
+        if crate::app::button(
+            ui,
+            p,
+            "Reset",
+            crate::app::Kind::Ghost,
+            !prefs.port_list.trim().is_empty(),
+        )
+        .on_hover_text("Back to the built-in list")
+        .clicked()
+        {
+            prefs.port_list.clear();
+            state.adding.clear();
+        }
+        ui.add_space(metrics::S2);
+        // What the field says about itself, in the same place the old one did.
+        let (line, ink) = match (typed.is_empty(), &parsed, addable) {
+            (true, _, _) => (format!("{} ports", ports.len()), p.text_muted),
+            (_, Err(e), _) => (e.to_string(), p.caution),
+            (_, Ok(_), Some(0)) => ("already in the list".to_string(), p.text_dim),
+            (_, Ok(_), Some(1)) => ("adds 1".to_string(), p.text_muted),
+            (_, Ok(_), Some(n)) => (format!("adds {n}"), p.text_muted),
+            (_, Ok(_), None) => (format!("{} ports", ports.len()), p.text_muted),
+        };
+        ui.label(RichText::new(line).size(text::TINY).color(ink));
     });
+
+    ui.add_space(metrics::S2);
+    // **The rows go straight into the page's own scroll**, and that is not a
+    // shortcut. A `ScrollArea` here would be a vertical scroll inside the
+    // vertical scroll the pane already lives in, and two of those fight: the
+    // inner one collapsed to nothing and the whole list rendered as a gap
+    // under the heading. One scroll, and this is one long setting in it.
+    let mut remove = None;
+    for port in &ports {
+        ui.horizontal(|ui| {
+            ui.add_space(metrics::S1);
+            ui.label(
+                RichText::new(format!("{port:>6}"))
+                    .size(text::SMALL)
+                    .monospace()
+                    .color(p.text),
+            );
+            ui.add_space(metrics::S2);
+            // The convention, where there is one. Never invented: a port with
+            // no usual service says nothing rather than guessing at one.
+            if let Some(hint) = crate::ports::service_hint(*port) {
+                ui.label(RichText::new(hint).size(text::TINY).color(p.text_dim));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(metrics::S3);
+                if crate::app::button(ui, p, "Remove", crate::app::Kind::Ghost, true).clicked() {
+                    remove = Some(*port);
+                }
+            });
+        });
+    }
+
+    if let Some(port) = remove {
+        ports.retain(|kept| *kept != port);
+        changed = true;
+    }
+    if changed {
+        // **Written out in full**, which is what materialising the built-in
+        // list means: from here on the setting says what it scans rather than
+        // pointing at a list that could change under it in a later version.
+        prefs.port_list = ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+}
+
+/// The ports a scan would try, given the setting as it stands.
+///
+/// Empty is the built-in list, which is the whole reason this is a function:
+/// the editor has to show what *will* be scanned, and an empty setting shows
+/// sixty-four rows rather than none.
+fn effective(spec: &str) -> Vec<u16> {
+    match spec.trim() {
+        "" => muster_net::portscan::Ports::common().as_slice().to_vec(),
+        typed => typed
+            .parse::<muster_net::portscan::Ports>()
+            .map(|got| got.as_slice().to_vec())
+            .unwrap_or_default(),
+    }
 }
 
 fn themes(ui: &mut egui::Ui, p: Palette, state: &mut State, prefs: &mut Prefs) {

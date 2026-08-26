@@ -144,9 +144,10 @@ fn inside(x: f32, y: f32, side: f32, radius: f32) -> bool {
 
 /// Where the full glyph gives way to the compact one.
 ///
-/// The arms are the first thing to go. At 32 px an arm is two pixels wide with
-/// a pixel of accent either side of it, which is not a line joining two things,
-/// it is a smudge between them.
+/// Below this the hub and the satellites grow, the orbit widens and the arms
+/// get *heavier* rather than lighter. See [`glyph`] for why the arms survive
+/// down here at all: the version that dropped them shipped, and looked like
+/// three loose circles on a taskbar.
 const COMPACT_BELOW: u32 = 40;
 
 /// Where the glyph is dropped altogether and the mark is the bare square.
@@ -178,17 +179,23 @@ fn glyph(image: &mut Image, side: u32, ink: Color32) {
 
     let s = side as f32;
     let c = s / 2.0;
-    // The compact form is heavier everywhere and drops the arms: fewer, fatter
-    // shapes are what survive when a pixel is a large fraction of the drawing.
-    // The compact form's numbers are not the full form's scaled up. They are
-    // chosen so that the gap between the hub and a satellite is about 0.06 of
-    // the side: the first attempt kept the orbit near the full form's and made
-    // the discs fatter, which left a **0.6 px** gap at 32 px, so the four
-    // shapes fused into the blob the arms were removed to avoid. Discs that
-    // touch are one disc.
-    let hub = s * if compact { 0.135 } else { 0.115 };
+    // The compact form is heavier everywhere: fewer, fatter shapes are what
+    // survive when a pixel is a large fraction of the drawing. Its numbers are
+    // not the full form's scaled up.
+    //
+    // **It dropped the arms once, and that was the wrong trade.** The reasoning
+    // was that at 32 px an arm is two pixels wide with a pixel of accent either
+    // side, which is a smudge rather than a line. True, and beside the point:
+    // what was left was a hub and three satellites with nothing between them,
+    // and on a taskbar that does not read as a network at all — it reads as
+    // three loose circles, which is what somebody looking at it called it. A
+    // slightly heavy join says "these are connected" and a gap says nothing.
+    // So the compact form keeps its arms and makes them **fatter** than the
+    // full form's rather than thinner, because the one thing a two-pixel stroke
+    // cannot afford is to be antialiased down to nothing.
+    let hub = s * if compact { 0.140 } else { 0.115 };
     let node = s * if compact { 0.105 } else { 0.090 };
-    let arm = s * if compact { 0.0 } else { 0.062 };
+    let arm = s * if compact { 0.072 } else { 0.062 };
     let orbit = s * if compact { 0.300 } else { ORBIT };
 
     // Twelve, four and eight o'clock.
@@ -352,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn the_compact_form_drops_the_arms_and_keeps_the_discs_apart() {
+    fn every_size_that_carries_a_glyph_joins_the_hub_to_its_satellites() {
         let p = Palette::dark();
         let accent = [p.accent.r(), p.accent.g(), p.accent.b()];
 
@@ -367,7 +374,7 @@ mod tests {
             // centred. Measuring from the square's centre instead of the
             // glyph's is what made this test fail when the drop was added.
             let (hub, node, orbit) = if side < COMPACT_BELOW {
-                (0.135, 0.105, 0.300)
+                (0.140, 0.105, 0.300)
             } else {
                 (0.115, 0.090, ORBIT)
             };
@@ -379,10 +386,10 @@ mod tests {
             rgb_at(&image, side / 2, y)
         };
 
-        assert_eq!(
+        assert_ne!(
             probe(32),
             accent,
-            "the compact form has no arms, so this point is still the fill"
+            "without arms the compact form reads as three loose circles"
         );
         assert_ne!(
             probe(64),

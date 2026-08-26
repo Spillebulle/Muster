@@ -118,6 +118,12 @@ pub struct App {
     /// trip: a round trip cannot tell "it did not answer" from "the question
     /// was never asked".
     ping: ping::State,
+    /// The device window is showing its ping history beside the facts.
+    ///
+    /// Session state rather than a setting: it is a way of looking at the
+    /// device in front of you, and it stays on while you click from one device
+    /// to the next because that is the point of having opened it.
+    history_open: bool,
     /// The devices the user has marked, by address.
     ///
     /// By address for the same reason [`Self::selected`] is: a second scan
@@ -189,6 +195,7 @@ impl App {
             prefs: saved.clone(),
             system_mode,
             ping: ping::State::default(),
+            history_open: false,
             marked: std::collections::BTreeSet::new(),
             copied: None,
             port_queue: std::collections::VecDeque::new(),
@@ -241,6 +248,7 @@ impl App {
             prefs: prefs::Prefs::default(),
             system_mode: mode,
             ping: ping::State::default(),
+            history_open: false,
             marked: std::collections::BTreeSet::new(),
             copied: None,
             port_queue: std::collections::VecDeque::new(),
@@ -273,12 +281,20 @@ impl App {
     /// ask differently.
     fn start_pings(&mut self, targets: Vec<std::net::IpAddr>, looping: bool) {
         let on_link = self.target.is_some_and(|p| self.on_link(p));
-        self.ping.start(targets, looping, on_link);
+        let every = std::time::Duration::from_millis(self.prefs.ping_every.into());
+        self.ping.start_every(targets, looping, on_link, every);
     }
 
     /// Open the settings page, for `examples/docs-images.rs`.
     pub fn open_settings(&mut self) {
         self.settings.open();
+    }
+
+    /// Open the settings page on its Scanning pane, for
+    /// `examples/docs-images.rs`.
+    pub fn open_scanning(&mut self) {
+        self.settings.open();
+        self.settings.pane = settings::Pane::Scanning;
     }
 
     /// Open the detail window on one device.
@@ -287,6 +303,14 @@ impl App {
     /// outside this module sets the selection.
     pub fn select(&mut self, address: std::net::IpAddr) {
         self.selected = Some(address);
+    }
+
+    /// Open the device window's history column, for `examples/docs-images.rs`.
+    pub fn show_history(&mut self, samples: &[(u64, bool)]) {
+        self.history_open = true;
+        if let Some(address) = self.selected {
+            self.ping.seed(address, samples);
+        }
     }
 
     /// The theme in force: the chosen file, or the chosen mode, or the
@@ -2931,11 +2955,74 @@ fn about_view(ui: &mut egui::Ui, p: Palette, updates: &mut Updates) {
                 ui.label(RichText::new(line).size(text::BODY).color(p.text));
             }
 
+            ui.add_space(metrics::S3);
+            link_row(
+                ui,
+                p,
+                icons::Icon::Github,
+                "The source, the releases and the issues",
+                REPOSITORY,
+            );
+
             ui.add_space(metrics::S4);
             updates_section(ui, p, updates);
         });
     });
 }
+
+/// Where Muster lives. The one address in the application that is not a device.
+const REPOSITORY: &str = "https://github.com/Spillebulle/muster";
+
+/// An icon and a label that open something in the browser.
+///
+/// **The only thing in Muster that reaches the internet on purpose besides the
+/// update check**, and unlike that one it is not Muster making a request: it
+/// hands the address to the desktop and the desktop opens it, so nothing about
+/// this network is sent anywhere and nothing happens until somebody clicks.
+/// The address is shown under the label rather than hidden behind it, because a
+/// link whose destination you cannot read before following it is a link asking
+/// to be trusted.
+fn link_row(ui: &mut egui::Ui, p: Palette, icon: icons::Icon, label: &str, url: &str) {
+    let height = metrics::ROW;
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width().min(LINK_WIDTH), height),
+        Sense::click(),
+    );
+    let ink = if response.hovered() {
+        p.accent
+    } else {
+        p.text_muted
+    };
+    let mark = Rect::from_center_size(
+        pos2(rect.left() + metrics::ICON / 2.0, rect.center().y),
+        Vec2::splat(metrics::ICON),
+    );
+    icons::draw(ui.painter(), mark, icon, ink);
+    ui.painter().text(
+        pos2(mark.right() + metrics::S2, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(text::BODY),
+        ink,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if response.clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    }
+    response.on_hover_text(url);
+    ui.label(
+        RichText::new(url)
+            .size(text::TINY)
+            .monospace()
+            .color(p.text_dim),
+    );
+}
+
+/// How wide a link row's hit area is: the label and no more, so the whole page
+/// is not a click target.
+const LINK_WIDTH: f32 = 320.0;
 
 /// The update check, and what it reports.
 ///
@@ -3147,6 +3234,16 @@ pub(crate) fn apply_for(ctx: &egui::Context, p: Palette, mode: Mode) {
 /// How wide the device window is.
 const DETAIL_WIDTH: f32 = 320.0;
 
+/// How much wider it gets when the ping history is open.
+///
+/// The history is a *second column* rather than something the facts scroll
+/// past: a device's identity and its round trips are two different readings and
+/// putting one below the other would push the buttons off the bottom of a panel
+/// that is already tall. So the window grows sideways and the history fills
+/// what it grew by, which is also what makes closing it put everything back
+/// exactly where it was.
+const HISTORY_WIDTH: f32 = 260.0;
+
 /// The window for the selected device: what it is, why, and what it offers.
 ///
 /// A floating window rather than a docked panel, which is a change from how
@@ -3171,6 +3268,14 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
     let mode = app.mode;
 
     let mut open = true;
+    // Open, the history is a second column and the window grows by exactly what
+    // the column needs, so closing it puts everything back where it was.
+    let showing = app.history_open;
+    let panel = if showing {
+        DETAIL_WIDTH + metrics::S3 + HISTORY_WIDTH
+    } else {
+        DETAIL_WIDTH
+    };
     let title = named
         .best()
         .map(|n| n.value.clone())
@@ -3185,7 +3290,7 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .default_width(DETAIL_WIDTH)
+        .default_width(panel)
         .frame(
             egui::Frame::NONE
                 // §5's floating panel: `chrome`, radius 10, and the middle of
@@ -3199,158 +3304,188 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
                 .shadow(theme::shadow::floating(mode)),
         )
         .show(ctx, |ui| {
-            ui.set_width(DETAIL_WIDTH);
+            ui.set_width(panel);
 
             // Our own header: the name, and a close mark that is an icon
-            // button rather than a letter.
+            // button rather than a letter. Across the whole window, so the
+            // close mark stays in its corner when the history opens.
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(&title)
-                        .font(theme::strong(text::HEADING))
-                        .color(p.text_strong),
-                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if close_button(ui, p).clicked() {
                         open = false;
                     }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(&title)
+                                .font(theme::strong(text::HEADING))
+                                .color(p.text_strong),
+                        );
+                    });
                 });
             });
             ui.add_space(metrics::S1);
             hairline_across(ui, p, ui.min_rect().bottom());
             ui.add_space(metrics::S2);
 
-            ui.horizontal(|ui| {
-                let (icon, _) = ui.allocate_exact_size(Vec2::splat(metrics::ROW), Sense::hover());
-                deviceicon::draw(
-                    ui.painter(),
-                    Rect::from_center_size(icon.center(), Vec2::splat(metrics::ROW - 4.0)),
-                    kind,
-                    deviceicon::colour(kind, mode, p.text_dim),
-                    p.chrome,
-                );
-                ui.add_space(metrics::S1);
-                // The claim and its reason, together. An icon with no way to
-                // ask why is a guess wearing a confident face.
-                match guess {
-                    Some(g) => {
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(g.kind.label())
-                                    .size(text::CONTROL)
-                                    .color(deviceicon::colour(kind, mode, p.text_muted)),
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(DETAIL_WIDTH);
+
+                    ui.horizontal(|ui| {
+                        let (icon, _) =
+                            ui.allocate_exact_size(Vec2::splat(metrics::ROW), Sense::hover());
+                        deviceicon::draw(
+                            ui.painter(),
+                            Rect::from_center_size(icon.center(), Vec2::splat(metrics::ROW - 4.0)),
+                            kind,
+                            deviceicon::colour(kind, mode, p.text_dim),
+                            p.chrome,
+                        );
+                        ui.add_space(metrics::S1);
+                        // The claim and its reason, together. An icon with no way to
+                        // ask why is a guess wearing a confident face.
+                        match guess {
+                            Some(g) => {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new(g.kind.label())
+                                            .size(text::CONTROL)
+                                            .color(deviceicon::colour(kind, mode, p.text_muted)),
+                                    );
+                                    ui.label(
+                                        RichText::new(g.clue.reason())
+                                            .size(text::TINY)
+                                            .color(p.text_dim),
+                                    );
+                                });
+                            }
+                            None => {
+                                ui.label(
+                                    RichText::new("Nothing it said identifies what it is")
+                                        .size(text::TINY)
+                                        .color(p.text_dim),
+                                );
+                            }
+                        }
+                    });
+
+                    // What it serves the network, under the claim about what it is:
+                    // the two are independent, and a router that is also the name
+                    // server has to be able to say both.
+                    let roles = named.roles();
+                    if !roles.is_empty() {
+                        ui.add_space(metrics::S2);
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui.allocate_exact_size(
+                                vec2(DETAIL_WIDTH, metrics::ROW_PLAIN),
+                                Sense::hover(),
                             );
+                            badges(ui, p, rect, &roles);
+                        });
+                        for role in &roles {
                             ui.label(
-                                RichText::new(g.clue.reason())
+                                RichText::new(role.reason())
                                     .size(text::TINY)
                                     .color(p.text_dim),
                             );
-                        });
+                        }
                     }
-                    None => {
-                        ui.label(
-                            RichText::new("Nothing it said identifies what it is")
-                                .size(text::TINY)
-                                .color(p.text_dim),
-                        );
-                    }
-                }
-            });
 
-            // What it serves the network, under the claim about what it is:
-            // the two are independent, and a router that is also the name
-            // server has to be able to say both.
-            let roles = named.roles();
-            if !roles.is_empty() {
-                ui.add_space(metrics::S2);
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(
-                        vec2(DETAIL_WIDTH, metrics::ROW_PLAIN),
+                    ui.add_space(metrics::S2);
+                    fact_row(ui, p, "Address", &address.to_string());
+                    if let Some(mac) = host.mac {
+                        fact_row(ui, p, "Hardware", &mac.to_string());
+                        let vendor = match muster_net::vendor::lookup(mac) {
+                            muster_net::vendor::Origin::Randomised => {
+                                "randomised address".to_string()
+                            }
+                            other => other.label().to_string(),
+                        };
+                        fact_row(ui, p, "Made by", &vendor);
+                    }
+                    // The model the device named for itself, above the names other
+                    // people gave it: it is the most specific thing on the row and it
+                    // is what the guess above was usually made from.
+                    if let Some(model) = &named.model {
+                        fact_row(ui, p, "Model", model);
+                    }
+                    if let Some(workgroup) = &named.workgroup {
+                        fact_row(ui, p, "Workgroup", workgroup);
+                    }
+                    for name in &named.names {
+                        fact_row(ui, p, name.source.label(), &name.value);
+                    }
+                    if !named.services.is_empty() {
+                        fact_row(ui, p, "Advertises", &named.services.join(", "));
+                    }
+                    // The UPnP half, kept in its own row rather than folded in with the
+                    // mDNS services: they are two vocabularies, and one list holding
+                    // `_ipp._tcp` beside `urn:schemas-upnp-org:device:Printer:1` reads
+                    // as neither.
+                    if !named.upnp.is_empty() {
+                        fact_row(ui, p, "UPnP", &named.upnp.join(", "));
+                    }
+                    if let Some(product) = &named.product {
+                        fact_row(ui, p, "Announces", product);
+                    }
+                    if let Some(resolver) = &named.resolver {
+                        // What the server said about itself, and what it will do for a
+                        // client. A server that would not say has answered the
+                        // question all the same, and the row says which.
+                        let what = match (&resolver.version, resolver.recursive) {
+                            (Some(version), true) => format!("{version}, resolves for clients"),
+                            (Some(version), false) => format!("{version}, its own zones only"),
+                            (None, true) => {
+                                "would not name itself, resolves for clients".to_string()
+                            }
+                            (None, false) => "would not name itself".to_string(),
+                        };
+                        fact_row(ui, p, "Name server", &what);
+                    }
+                    // The greeting, which is the software in the device's own words and
+                    // is worth a row of its own for the same reason the resolver's
+                    // version is. SMB and NFS get no row here: both answered a question
+                    // and neither volunteered anything to print, so the badge and its
+                    // reason are the whole of what is known, and inventing a line for
+                    // them would be padding a panel with what a badge already said.
+                    if let Some(greeting) = &named.serves.ssh {
+                        fact_row(ui, p, "SSH", greeting);
+                    }
+                    fact_row(
+                        ui,
+                        p,
+                        "Answered",
+                        &host
+                            .evidence
+                            .iter()
+                            .map(muster_net::discover::Evidence::reason)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+
+                    ui.add_space(metrics::S3);
+                    ping_section(ui, p, app, address, host.rtt);
+
+                    ui.add_space(metrics::S3);
+                    ports_section(ui, p, app, address);
+                });
+
+                if showing {
+                    ui.add_space(metrics::S2);
+                    // The line between the two columns, which is what makes them
+                    // read as one panel divided rather than two panels touching.
+                    let (edge, _) = ui.allocate_exact_size(
+                        vec2(metrics::HAIRLINE, ui.available_height()),
                         Sense::hover(),
                     );
-                    badges(ui, p, rect, &roles);
-                });
-                for role in &roles {
-                    ui.label(
-                        RichText::new(role.reason())
-                            .size(text::TINY)
-                            .color(p.text_dim),
-                    );
+                    ui.painter().rect_filled(edge, 0.0, p.line);
+                    ui.add_space(metrics::S2);
+                    ui.vertical(|ui| {
+                        ui.set_width(HISTORY_WIDTH);
+                        history_column(ui, p, app, address);
+                    });
                 }
-            }
-
-            ui.add_space(metrics::S2);
-            fact_row(ui, p, "Address", &address.to_string());
-            if let Some(mac) = host.mac {
-                fact_row(ui, p, "Hardware", &mac.to_string());
-                let vendor = match muster_net::vendor::lookup(mac) {
-                    muster_net::vendor::Origin::Randomised => "randomised address".to_string(),
-                    other => other.label().to_string(),
-                };
-                fact_row(ui, p, "Made by", &vendor);
-            }
-            // The model the device named for itself, above the names other
-            // people gave it: it is the most specific thing on the row and it
-            // is what the guess above was usually made from.
-            if let Some(model) = &named.model {
-                fact_row(ui, p, "Model", model);
-            }
-            if let Some(workgroup) = &named.workgroup {
-                fact_row(ui, p, "Workgroup", workgroup);
-            }
-            for name in &named.names {
-                fact_row(ui, p, name.source.label(), &name.value);
-            }
-            if !named.services.is_empty() {
-                fact_row(ui, p, "Advertises", &named.services.join(", "));
-            }
-            // The UPnP half, kept in its own row rather than folded in with the
-            // mDNS services: they are two vocabularies, and one list holding
-            // `_ipp._tcp` beside `urn:schemas-upnp-org:device:Printer:1` reads
-            // as neither.
-            if !named.upnp.is_empty() {
-                fact_row(ui, p, "UPnP", &named.upnp.join(", "));
-            }
-            if let Some(product) = &named.product {
-                fact_row(ui, p, "Announces", product);
-            }
-            if let Some(resolver) = &named.resolver {
-                // What the server said about itself, and what it will do for a
-                // client. A server that would not say has answered the
-                // question all the same, and the row says which.
-                let what = match (&resolver.version, resolver.recursive) {
-                    (Some(version), true) => format!("{version}, resolves for clients"),
-                    (Some(version), false) => format!("{version}, its own zones only"),
-                    (None, true) => "would not name itself, resolves for clients".to_string(),
-                    (None, false) => "would not name itself".to_string(),
-                };
-                fact_row(ui, p, "Name server", &what);
-            }
-            // The greeting, which is the software in the device's own words and
-            // is worth a row of its own for the same reason the resolver's
-            // version is. SMB and NFS get no row here: both answered a question
-            // and neither volunteered anything to print, so the badge and its
-            // reason are the whole of what is known, and inventing a line for
-            // them would be padding a panel with what a badge already said.
-            if let Some(greeting) = &named.serves.ssh {
-                fact_row(ui, p, "SSH", greeting);
-            }
-            fact_row(
-                ui,
-                p,
-                "Answered",
-                &host
-                    .evidence
-                    .iter()
-                    .map(muster_net::discover::Evidence::reason)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
-
-            ui.add_space(metrics::S3);
-            ping_section(ui, p, app, address, host.rtt);
-
-            ui.add_space(metrics::S3);
-            ports_section(ui, p, app, address);
+            });
         });
 
     if !open {
@@ -3378,13 +3513,61 @@ fn ping_section(
     address: std::net::IpAddr,
     swept_rtt: Option<std::time::Duration>,
 ) {
+    let looping_here = app.ping.loops_for(address);
+
     ui.horizontal(|ui| {
         let waiting = app.ping.waiting_for(address);
         if button(ui, p, "Ping", Kind::Secondary, !waiting).clicked() && !waiting {
             app.start_ping(address);
         }
-        ui.add_space(metrics::S2);
+        ui.add_space(metrics::S1);
 
+        // **The loop, where the table's Actions menu already had one and the
+        // panel did not.** In front of one device is exactly where somebody
+        // wants to watch a round trip settle, so the control belongs here too.
+        // It is one button that changes what it says, rather than two of which
+        // one is always wrong: a loop that is running has nothing to offer but
+        // stopping.
+        if looping_here {
+            if button(ui, p, "Stop", Kind::Secondary, true)
+                .on_hover_text("Stops the ping that is running")
+                .clicked()
+            {
+                app.ping.cancel();
+            }
+        } else if button(ui, p, "Keep pinging", Kind::Secondary, true)
+            .on_hover_text(format!(
+                "Once every {:.1} s until you stop it. Settings has the interval.",
+                app.prefs.ping_every as f32 / 1000.0
+            ))
+            .clicked()
+        {
+            app.start_pings(vec![address], true);
+        }
+        ui.add_space(metrics::S1);
+
+        // The history is a way of looking at the same readings, so its control
+        // sits with the buttons that produce them rather than in a corner.
+        let kept = app.ping.history_for(address).len();
+        let label = if app.history_open {
+            "Hide history"
+        } else {
+            "History"
+        };
+        if button(ui, p, label, Kind::Ghost, true)
+            .on_hover_text(match kept {
+                0 => "Nothing kept yet: ping it and the results are remembered".to_string(),
+                1 => "1 result kept".to_string(),
+                n => format!("{n} results kept"),
+            })
+            .clicked()
+        {
+            app.history_open = !app.history_open;
+        }
+    });
+
+    ui.horizontal(|ui| {
+        let waiting = app.ping.waiting_for(address);
         let answer = app.ping.answer_for(address);
         let line = if waiting {
             "asking…".to_string()
@@ -3406,6 +3589,144 @@ fn ping_section(
         ui.label(RichText::new(line).size(text::TINY).color(ink));
     });
 }
+
+/// The ping history, as the second column of the device window.
+///
+/// **Two readings of the same thing, because they answer different questions.**
+/// The bars say what the last minute *looked like* — steady, climbing, gappy —
+/// which is the shape somebody is watching for and which no list of figures
+/// shows at a glance. The list underneath says what each individual probe
+/// actually returned, which is what gets quoted into a ticket.
+///
+/// A probe that could not be sent is drawn in `caution` and never as a lost
+/// packet: `CLAUDE.md`'s rule that a question never asked is not a silence
+/// reaches into the chart as much as into the column.
+fn history_column(ui: &mut egui::Ui, p: Palette, app: &mut App, address: std::net::IpAddr) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("PING HISTORY")
+                .size(text::EYEBROW)
+                .color(p.placeholder),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let kept = app.ping.history_for(address).len();
+            if button(ui, p, "Clear", Kind::Ghost, kept > 0).clicked() {
+                app.ping.forget(address);
+            }
+        });
+    });
+    ui.add_space(metrics::S2);
+
+    let samples = app.ping.history_for(address);
+    if samples.is_empty() {
+        ui.label(
+            RichText::new("Nothing yet. Ping it, or keep pinging, and every result is kept here.")
+                .size(text::TINY)
+                .color(p.text_dim),
+        );
+        return;
+    }
+
+    // The slowest answer in what is shown, which is what the bars are drawn
+    // against. Scaled to the data rather than to a fixed ceiling: a link where
+    // everything answers in a millisecond would otherwise draw a flat line at
+    // the bottom of the chart and say nothing.
+    let shown: Vec<&crate::ping::Sample> = samples.iter().rev().take(HISTORY_BARS).rev().collect();
+    let worst = shown
+        .iter()
+        .filter_map(|s| s.rtt)
+        .max()
+        .unwrap_or_default()
+        .as_secs_f32()
+        .max(0.001);
+
+    let (chart, _) = ui.allocate_exact_size(vec2(HISTORY_WIDTH, HISTORY_CHART), Sense::hover());
+    ui.painter()
+        .rect_filled(chart, metrics::RADIUS_TIGHT, p.field);
+    // **Newest at the right, and the bars fill the chart.** A fixed slot width
+    // left a short history huddled in the left third of an empty box, which
+    // reads as a chart that has gone wrong rather than as one with little in
+    // it. The floor stops three results becoming three fat slabs.
+    let slots = shown.len().clamp(HISTORY_LEAST, HISTORY_BARS);
+    let step = chart.width() / slots as f32;
+    for (i, sample) in shown.iter().enumerate() {
+        let left = chart.right() - (shown.len() - i) as f32 * step;
+        let (height, ink) = match (sample.rtt, sample.asked) {
+            // An answer: as tall a share of the chart as it is of the slowest.
+            (Some(rtt), _) => (
+                (rtt.as_secs_f32() / worst * (chart.height() - 4.0)).max(1.5),
+                p.accent,
+            ),
+            // Asked and nothing came back. Full height in the colour that means
+            // "look at this", because a gap is the thing being watched for.
+            (None, true) => (chart.height() - 4.0, p.critical),
+            // Never asked. Not the device's failing and not drawn as one.
+            (None, false) => (chart.height() - 4.0, p.caution),
+        };
+        ui.painter().rect_filled(
+            Rect::from_min_max(
+                pos2(left + 0.5, chart.bottom() - 2.0 - height),
+                pos2(left + step - 0.5, chart.bottom() - 2.0),
+            ),
+            0.0,
+            ink,
+        );
+    }
+
+    ui.add_space(metrics::S1);
+    ui.label(
+        RichText::new(format!(
+            "{} kept, worst {} ms",
+            samples.len(),
+            (worst * 1000.0).round() as u64
+        ))
+        .size(text::TINY)
+        .color(p.text_dim),
+    );
+    ui.add_space(metrics::S2);
+
+    // Newest first, because the reason somebody opened this is the one that
+    // just happened.
+    egui::ScrollArea::vertical()
+        .max_height(HISTORY_LIST)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let first = samples.first().map(|s| s.at);
+            for sample in samples.iter().rev() {
+                let since = first
+                    .map(|f| sample.at.saturating_duration_since(f))
+                    .unwrap_or_default();
+                let (what, ink) = match (sample.rtt, sample.asked) {
+                    (Some(rtt), _) => (format!("{} ms", rtt.as_millis()), p.text),
+                    (None, true) => ("no reply".to_string(), p.text_dim),
+                    (None, false) => ("not asked".to_string(), p.caution),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{:>6.1}s", since.as_secs_f32()))
+                            .size(text::TINY)
+                            .monospace()
+                            .color(p.text_dim),
+                    );
+                    ui.label(RichText::new(what).size(text::TINY).monospace().color(ink));
+                });
+            }
+        });
+}
+
+/// How many results the chart shows at once.
+///
+/// The chart is a shape rather than a record — the list under it is the record
+/// — so it holds what fits at a readable bar width and lets the rest scroll
+/// past underneath.
+const HISTORY_BARS: usize = 60;
+
+/// The fewest slots the chart is divided into, however little is in it.
+const HISTORY_LEAST: usize = 16;
+
+/// How tall the chart is, and how much of the column the list may take.
+const HISTORY_CHART: f32 = 64.0;
+const HISTORY_LIST: f32 = 260.0;
 
 /// What one re-check says, in a sentence.
 ///
