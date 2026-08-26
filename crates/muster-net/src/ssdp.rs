@@ -70,6 +70,17 @@ const MX: u8 = 2;
 /// be aimed at a single device, which the protocol allows and which almost
 /// nothing answers; see the module note.
 pub fn search(to: SocketAddr) -> Vec<u8> {
+    search_target(to, "ssdp:all")
+}
+
+/// The same request, aimed at one kind of device.
+///
+/// **A minority of responders answer their own type and ignore `ssdp:all`.**
+/// A Hue bridge is the clearest case, and some Roku and Sonos firmware behaves
+/// the same way; the specification does not permit it and the devices do it
+/// anyway. So [`crate::link`] sends a handful of these beside the search for
+/// everything, each aimed at a device that would otherwise be a blank row.
+pub fn search_target(to: SocketAddr, target: &str) -> Vec<u8> {
     // `MAN` is quoted, and the quotes are part of the token rather than
     // decoration: a responder comparing against `"ssdp:discover"` literally,
     // as the specification writes it, does not answer `ssdp:discover`.
@@ -78,7 +89,7 @@ pub fn search(to: SocketAddr) -> Vec<u8> {
          HOST: {to}\r\n\
          MAN: \"ssdp:discover\"\r\n\
          MX: {MX}\r\n\
-         ST: ssdp:all\r\n\
+         ST: {target}\r\n\
          \r\n"
     )
     .into_bytes()
@@ -102,8 +113,17 @@ const MOST: usize = 512;
 /// could not be sent both give an empty map, because neither is a fact about a
 /// device and the caller has nothing different to do about them.
 pub fn discover<A: Ask + ?Sized>(ask: &A, window: Duration) -> BTreeMap<IpAddr, Vec<Announcement>> {
+    collect(ask, &search(GROUP), window)
+}
+
+/// Sends one search and reads everything that answers it.
+fn collect<A: Ask + ?Sized>(
+    ask: &A,
+    request: &[u8],
+    window: Duration,
+) -> BTreeMap<IpAddr, Vec<Announcement>> {
     let mut found: BTreeMap<IpAddr, Vec<Announcement>> = BTreeMap::new();
-    let Ok(replies) = ask.ask_all(GROUP, &search(GROUP), window, MOST) else {
+    let Ok(replies) = ask.ask_all(GROUP, request, window, MOST) else {
         return found;
     };
     for (from, reply) in replies {
@@ -118,6 +138,19 @@ pub fn discover<A: Ask + ?Sized>(ask: &A, window: Duration) -> BTreeMap<IpAddr, 
         }
     }
     found
+}
+
+/// Searches the link for one kind of device, and returns what answered.
+///
+/// [`discover`] with an `ST` of its own. Separate rather than a parameter on
+/// `discover` because the two are asked for different reasons and the ordinary
+/// one should stay the ordinary one to call.
+pub fn search_for<A: Ask + ?Sized>(
+    ask: &A,
+    target: &str,
+    window: Duration,
+) -> BTreeMap<IpAddr, Vec<Announcement>> {
+    collect(ask, &search_target(GROUP, target), window)
 }
 
 /// What one SSDP datagram said about the device that sent it.

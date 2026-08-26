@@ -19,6 +19,7 @@
 
 use muster_net::discover::{self, Found};
 use muster_net::identify::{self, Identity};
+use muster_net::link;
 use muster_net::rate::Bucket;
 use muster_net::{Prefix, Survey};
 use std::net::IpAddr;
@@ -58,6 +59,16 @@ pub struct Options {
     pub nfs: bool,
     /// Read the greeting an SSH server volunteers. Nothing is sent.
     pub ssh: bool,
+    /// Ask this network's own resolver for a name for every address in it.
+    ///
+    /// Separate from [`Self::identify`] because it is a different kind of
+    /// question: the others are put to the devices, and this one is put to the
+    /// router about them. See [`muster_net::link`] for why it is asked only of
+    /// a resolver on this machine's own link.
+    pub reverse: bool,
+    /// Sit on the discovery ports for the length of the scan and write down
+    /// who speaks. See [`muster_net::listen`].
+    pub listen: bool,
 }
 
 impl Options {
@@ -88,6 +99,13 @@ impl Default for Options {
             smb: false,
             nfs: false,
             ssh: false,
+            // On, and it is the only new question here that is. It goes to one
+            // server that already holds the answers, it never leaves the link,
+            // and it is what names the devices that are asleep.
+            reverse: true,
+            // On, and it sends nothing at all. It is the only phase that finds
+            // a device by the questions the device itself asks.
+            listen: true,
         }
     }
 }
@@ -105,6 +123,18 @@ pub enum Update {
         /// true of the devices themselves rather than only of the counter.
         hit: Option<Box<Found>>,
     },
+    /// A device the *link* answered for, which the sweep never found.
+    ///
+    /// Sent between the sweep and identification, so the row appears as soon as
+    /// it is known rather than at the end of the scan. There is no progress in
+    /// it: the link phase counts nothing, because the number of devices that
+    /// are going to answer a multicast question is not knowable before they do.
+    Heard {
+        address: IpAddr,
+        /// Which question it answered, so the row shows the same reason the
+        /// finished scan will show.
+        protocol: muster_net::discover::Protocol,
+    },
     Identifying {
         done: usize,
         total: usize,
@@ -112,6 +142,10 @@ pub enum Update {
     Serving {
         done: usize,
         total: usize,
+    },
+    Listening {
+        left: Duration,
+        window: Duration,
     },
     /// The whole result. Sent once, at the end, cancelled or not.
     Done(Box<Outcome>),
@@ -149,6 +183,16 @@ pub enum Phase {
         done: usize,
         total: usize,
     },
+    /// Sitting on the discovery ports with nothing left to ask.
+    ///
+    /// It ran through every phase above it and this is only what is left of its
+    /// window, so the bar counts the seconds rather than the devices: how many
+    /// devices are going to speak is not knowable, and a bar over an unknown is
+    /// refused here as it is everywhere else.
+    Listening {
+        left: Duration,
+        window: Duration,
+    },
 }
 
 impl Phase {
@@ -165,6 +209,10 @@ impl Phase {
             Self::Identifying { done, total } | Self::Serving { done, total } if total > 0 => {
                 Some(done as f32 / total as f32)
             }
+            // The seconds are the total, and they are knowable.
+            Self::Listening { left, window } if !window.is_zero() => {
+                Some(1.0 - left.as_secs_f32() / window.as_secs_f32())
+            }
             _ => None,
         }
     }
@@ -175,6 +223,9 @@ impl Phase {
             Self::Identifying { done, total } => format!("Identifying {done} of {total}"),
             Self::Serving { done, total } => {
                 format!("Asking {done} of {total} what they serve")
+            }
+            Self::Listening { left, .. } => {
+                format!("Listening for {} more seconds", left.as_secs() + 1)
             }
         }
     }
@@ -209,7 +260,11 @@ impl State {
     pub fn start(survey: &Survey, prefix: Prefix, on_link: bool, opts: Options) -> Self {
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let resolver = survey.resolvers.iter().copied().find(|a| a.is_ipv4());
+        // **Only a resolver on this machine's own link is ever asked**, which
+        // is `CLAUDE.md`'s rule about somebody else's resolver and is enforced
+        // in one place rather than at each question. See
+        // `Survey::local_resolver`.
+        let resolver = survey.local_resolver();
         // The hardware address of the interface a scan would go out of. A
         // DISCOVER is answered to whoever sent it, so an address nothing on
         // this link owns collects nothing.
@@ -218,10 +273,41 @@ impl State {
             .iter()
             .find(|i| i.is_scannable())
             .and_then(|i| i.mac);
+        // What the operating system already knows about this network, read
+        // before anything is sent. Devices, at no cost, that no question could
+        // reach.
+        let neighbours: Vec<(IpAddr, muster_net::MacAddr)> = survey
+            .known_in(prefix)
+            .map(|n| (n.address, n.mac))
+            .collect();
+        // Every address this machine holds on a link worth scanning, which is
+        // what the listener joins its multicast groups on.
+        let own: Vec<std::net::Ipv4Addr> = survey
+            .interfaces
+            .iter()
+            .filter(|i| i.is_scannable())
+            .flat_map(|i| i.addresses.iter())
+            .filter_map(|a| match a.address {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
 
         {
             let cancel = Arc::clone(&cancel);
-            std::thread::spawn(move || run(prefix, on_link, resolver, mac, opts, cancel, tx));
+            std::thread::spawn(move || {
+                run(Job {
+                    prefix,
+                    on_link,
+                    resolver,
+                    mac,
+                    neighbours,
+                    own,
+                    opts,
+                    cancel,
+                    tx,
+                });
+            });
         }
 
         Self::Running {
@@ -265,12 +351,25 @@ impl State {
                         }
                         moved = true;
                     }
+                    Ok(Update::Heard { address, protocol }) => {
+                        // Kept in the same order the finished sweep will use,
+                        // so a row does not jump when the scan ends.
+                        if let Err(at) = devices.binary_search_by_key(&address, |d| d.address) {
+                            devices.insert(at, Found::announced(address, protocol));
+                            *found += 1;
+                        }
+                        moved = true;
+                    }
                     Ok(Update::Identifying { done, total }) => {
                         *phase = Phase::Identifying { done, total };
                         moved = true;
                     }
                     Ok(Update::Serving { done, total }) => {
                         *phase = Phase::Serving { done, total };
+                        moved = true;
+                    }
+                    Ok(Update::Listening { left, window }) => {
+                        *phase = Phase::Listening { left, window };
                         moved = true;
                     }
                     Ok(Update::Done(outcome)) => {
@@ -379,17 +478,60 @@ impl State {
     }
 }
 
-fn run(
+/// Everything one scan needs, so the thread takes one argument rather than
+/// eight and adding a source does not change a signature in three places.
+struct Job {
     prefix: Prefix,
     on_link: bool,
-    resolver: Option<std::net::IpAddr>,
+    /// The resolver, **already checked to be on this machine's own link**.
+    resolver: Option<IpAddr>,
     mac: Option<muster_net::MacAddr>,
+    /// What the neighbour table held before the scan started.
+    neighbours: Vec<(IpAddr, muster_net::MacAddr)>,
+    /// This machine's own IPv4 addresses, which is what a multicast group is
+    /// joined on. A machine with a VPN up has more than one, and joining the
+    /// wrong one listens to the wrong link.
+    own: Vec<std::net::Ipv4Addr>,
     opts: Options,
     cancel: Arc<AtomicBool>,
     tx: Sender<Update>,
-) {
+}
+
+/// How long the listen runs for.
+///
+/// It overlaps everything else, so on an ordinary /24 — eight seconds of sweep
+/// and identification — this adds about seven seconds to a scan and hears the
+/// whole of it. Longer is better and there is no cliff: the devices arrive
+/// steadily, and on the network this was measured against half of them spoke
+/// after the first eighty seconds. A scan is not the place to wait that long,
+/// and that measurement is the argument for the monitoring mode `CLAUDE.md`
+/// lists as open rather than for a slower scan here.
+const LISTEN_WINDOW: Duration = Duration::from_secs(15);
+
+/// How often the tail of the listen reports itself.
+const LISTEN_TICK: Duration = Duration::from_millis(200);
+
+fn run(job: Job) {
+    let Job {
+        prefix,
+        on_link,
+        resolver,
+        mac,
+        neighbours,
+        own,
+        opts,
+        cancel,
+        tx,
+    } = job;
+
     let transport = muster_net::platform::Host;
     let rate = Bucket::new(opts.rate);
+    let started = std::time::Instant::now();
+    // The listen runs through every phase below and is stopped when they are
+    // all done. It is a flag of its own rather than the scan's `cancel`,
+    // because "the rest of the scan has finished" and "the user pressed stop"
+    // are different things and only one of them means the results are partial.
+    let hush = AtomicBool::new(false);
 
     // **Started first and collected last.** A DISCOVER is one broadcast and
     // then a wait on a socket, which overlaps the sweep and the identification
@@ -415,77 +557,189 @@ fn run(
         discover::Options::default()
     };
 
-    let sweep = discover::sweep(prefix, &transport, &rate, sweep_opts, &cancel, &|p, hit| {
-        let _ = tx.send(Update::Swept {
-            probed: p.probed,
-            total: p.total,
-            found: p.found,
-            hit: hit.cloned().map(Box::new),
+    // What the link is asked, and it is asked **beside the sweep** for the
+    // same reason the DISCOVER is: every question in it is one datagram and
+    // then a wait, so running it as a phase of its own would add its whole
+    // window to every scan for nothing. See `muster_net::link`.
+    let link_opts = link::Options {
+        mdns: opts.identify,
+        ssdp: opts.identify,
+        wsd: opts.identify,
+        // A broadcast is only meaningful on a link this machine is on, and
+        // `Prefix::broadcast` is `None` for anything without host bits to
+        // spare.
+        netbios: opts.identify && on_link,
+        reverse: opts.reverse,
+        broadcast: on_link.then(|| prefix.broadcast()).flatten(),
+        resolver,
+        ..Default::default()
+    };
+    // The addresses the reverse question asks about: the whole prefix, because
+    // the point of it is the addresses the sweep is going to miss.
+    let every: Vec<IpAddr> = prefix
+        .hosts()
+        .map(|hosts| hosts.collect())
+        .unwrap_or_default();
+
+    std::thread::scope(|scope| {
+        // Sits on the discovery ports for as long as everything else takes, and
+        // sends nothing but the datagram that keeps a stateful firewall from
+        // dropping what it is listening for. See `muster_net::listen`.
+        let ears = opts.listen.then(|| {
+            scope.spawn(|| {
+                muster_net::listen::overhear(
+                    &muster_net::platform::listen::Link,
+                    &own,
+                    LISTEN_WINDOW,
+                    &hush,
+                )
+            })
         });
-    });
 
-    let addresses: Vec<_> = sweep.found.iter().map(|f| f.address).collect();
-    let mut names = identify::many(
-        &addresses,
-        &muster_net::platform::udp::Udp,
-        &rate,
-        identify::Options {
-            resolver,
-            mdns: opts.identify,
-            netbios: opts.identify,
-            ssdp: opts.identify,
-            llmnr: opts.identify,
-            dns: opts.dns,
-            ..Default::default()
-        },
-        &cancel,
-        &|done, total| {
-            let _ = tx.send(Update::Identifying { done, total });
-        },
-    );
+        let (mut sweep, heard) = std::thread::scope(|scope| {
+            let asked = scope.spawn(|| {
+                link::ask(
+                    &muster_net::platform::udp::Udp,
+                    link_opts,
+                    &every,
+                    &rate,
+                    &cancel,
+                )
+            });
 
-    // What the devices serve, over a connection rather than a datagram. A
-    // phase of its own and after identification rather than inside it: these
-    // are TCP, they are off unless somebody switched one on, and a device that
-    // never answered the sweep is never connected to.
-    if opts.serving().any() && !cancel.load(Ordering::SeqCst) {
-        let serving = muster_net::service::many(
-            &addresses,
-            &muster_net::platform::tcp::Stream,
-            &rate,
-            opts.serving(),
-            &cancel,
-            &|done, total| {
-                let _ = tx.send(Update::Serving { done, total });
-            },
-        );
-        for (identity, serves) in names.iter_mut().zip(serving.iter()) {
-            identity.serves(serves);
-        }
-    }
+            let sweep =
+                discover::sweep(prefix, &transport, &rate, sweep_opts, &cancel, &|p, hit| {
+                    let _ = tx.send(Update::Swept {
+                        probed: p.probed,
+                        total: p.total,
+                        found: p.found,
+                        hit: hit.cloned().map(Box::new),
+                    });
+                });
 
-    // The offers, and who made them. A server that answered is a device on the
-    // list — usually the gateway — so the badge goes on its row rather than
-    // only into a paragraph on another screen.
-    //
-    // A thread that panicked gives `None`, which is "not asked" rather than
-    // "nobody answered". The two must not collapse into one another.
-    let dhcp = dhcp.and_then(|handle| handle.join().ok());
-    if let Some(probe) = &dhcp {
-        for server in probe.servers() {
-            let server = IpAddr::V4(server);
-            if let Some(i) = addresses.iter().position(|a| *a == server) {
-                names[i].offers_addresses();
+            (sweep, asked.join().unwrap_or_default())
+        });
+
+        // **The union, and the whole point of the link phase.** A device that
+        // answered a group question is a device, whether or not anything sent to
+        // its own address came back, so it goes on the list with the protocol it
+        // answered as its evidence. A device the sweep already found gains a
+        // reason rather than a row.
+        //
+        // Only what *spoke* is admitted. A resolver's `PTR` record names an
+        // address without proving anything is at it, so it names the devices found
+        // by other means and never puts a row on the list by itself.
+        for (address, _) in heard.speakers() {
+            if let Some(protocol) = heard.credit(address)
+                && sweep.admit(Found::announced(address, protocol))
+            {
+                let _ = tx.send(Update::Heard { address, protocol });
             }
         }
-    }
 
-    let _ = tx.send(Update::Done(Box::new(Outcome {
-        sweep,
-        names,
-        prefix,
-        dhcp: dhcp.map(Box::new),
-    })));
+        // And what the operating system knew before any of this started. The
+        // cheapest source there is, and the weakest, and it says so on the row.
+        for (address, mac) in neighbours {
+            sweep.admit_neighbour(address, mac);
+        }
+
+        sweep.not_done.extend(heard.not_done.iter().cloned());
+
+        let addresses: Vec<_> = sweep.found.iter().map(|f| f.address).collect();
+        let mut names = identify::many(
+            &addresses,
+            &muster_net::platform::udp::Udp,
+            &rate,
+            identify::Options {
+                resolver,
+                mdns: opts.identify,
+                netbios: opts.identify,
+                ssdp: opts.identify,
+                llmnr: opts.identify,
+                dns: opts.dns,
+                ..Default::default()
+            },
+            &cancel,
+            &|done, total| {
+                let _ = tx.send(Update::Identifying { done, total });
+            },
+        );
+
+        // What the link said about each of them, folded in beside what they said
+        // when asked privately. This is where a device that answered only the
+        // group gets its name, its services and its model.
+        for (address, identity) in addresses.iter().zip(names.iter_mut()) {
+            if let Some(voice) = heard.by.get(address) {
+                identity.merge(&voice.identity);
+            }
+        }
+
+        // What the devices serve, over a connection rather than a datagram. A
+        // phase of its own and after identification rather than inside it: these
+        // are TCP, they are off unless somebody switched one on, and a device that
+        // never answered the sweep is never connected to.
+        if opts.serving().any() && !cancel.load(Ordering::SeqCst) {
+            let serving = muster_net::service::many(
+                &addresses,
+                &muster_net::platform::tcp::Stream,
+                &rate,
+                opts.serving(),
+                &cancel,
+                &|done, total| {
+                    let _ = tx.send(Update::Serving { done, total });
+                },
+            );
+            for (identity, serves) in names.iter_mut().zip(serving.iter()) {
+                identity.serves(serves);
+            }
+        }
+
+        // The offers, and who made them. A server that answered is a device on the
+        // list — usually the gateway — so the badge goes on its row rather than
+        // only into a paragraph on another screen.
+        //
+        // A thread that panicked gives `None`, which is "not asked" rather than
+        // "nobody answered". The two must not collapse into one another.
+        let dhcp = dhcp.and_then(|handle| handle.join().ok());
+        if let Some(probe) = &dhcp {
+            for server in probe.servers() {
+                let server = IpAddr::V4(server);
+                if let Some(i) = addresses.iter().position(|a| *a == server) {
+                    names[i].offers_addresses();
+                }
+            }
+        }
+
+        // Everything that asks a question is done. What is left is the listen,
+        // and the only honest thing to show is how much of its window remains.
+        if let Some(ears) = ears {
+            while !cancel.load(Ordering::SeqCst) {
+                let left = LISTEN_WINDOW.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    break;
+                }
+                let _ = tx.send(Update::Listening {
+                    left,
+                    window: LISTEN_WINDOW,
+                });
+                std::thread::sleep(LISTEN_TICK.min(left));
+            }
+            hush.store(true, Ordering::SeqCst);
+
+            let overheard = ears.join().unwrap_or_default();
+            // Folded in the same way the link phase's answers were, and by the same
+            // function, so the device list and the names beside it stay in step.
+            link::fold(&overheard, &mut sweep, &mut names);
+            sweep.not_done.extend(overheard.not_done.iter().cloned());
+        }
+
+        let _ = tx.send(Update::Done(Box::new(Outcome {
+            sweep,
+            names,
+            prefix,
+            dhcp: dhcp.map(Box::new),
+        })));
+    });
 }
 
 #[cfg(test)]

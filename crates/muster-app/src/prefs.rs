@@ -141,6 +141,23 @@ pub struct Prefs {
     /// Read the greeting an SSH server volunteers, which costs it a connection
     /// and this machine nothing to send: see `muster_net::service`.
     pub scan_ssh: bool,
+    /// Ask this network's own resolver for a name for every address in it.
+    ///
+    /// **On, where the three above are off, and the difference is who is being
+    /// asked.** Those three open a connection to each device, which the far end
+    /// writes down. This asks one server — the router, and only ever a router
+    /// on this machine's own link — for records it wrote itself when it handed
+    /// out the leases. Nothing is asked of the devices and nothing leaves the
+    /// wire, and it is what names the ones that are asleep.
+    pub scan_reverse: bool,
+    /// Sit on the discovery ports for the length of the scan and write down
+    /// who speaks.
+    ///
+    /// **The one thing Muster does that sends nothing at all**, and the only
+    /// one that finds a device by the questions the device itself asks. It
+    /// lengthens a scan to the listen's window, which is the cost, and it is on
+    /// because the devices it finds are found by nothing else.
+    pub scan_listen: bool,
 }
 
 impl Default for Prefs {
@@ -164,6 +181,8 @@ impl Default for Prefs {
             scan_smb: false,
             scan_nfs: false,
             scan_ssh: false,
+            scan_reverse: true,
+            scan_listen: true,
         }
     }
 }
@@ -239,6 +258,8 @@ pub fn parse(text: &str) -> Prefs {
             "scan_smb" => prefs.scan_smb = flag,
             "scan_nfs" => prefs.scan_nfs = flag,
             "scan_ssh" => prefs.scan_ssh = flag,
+            "scan_reverse" => prefs.scan_reverse = flag,
+            "scan_listen" => prefs.scan_listen = flag,
             // A file written by a newer Muster. Ignored rather than refused:
             // the alternative is a downgrade wiping settings it did not
             // understand.
@@ -269,6 +290,8 @@ pub fn render(prefs: &Prefs) -> String {
     out.push_str(&format!("scan_smb = {}\n", prefs.scan_smb));
     out.push_str(&format!("scan_nfs = {}\n", prefs.scan_nfs));
     out.push_str(&format!("scan_ssh = {}\n", prefs.scan_ssh));
+    out.push_str(&format!("scan_reverse = {}\n", prefs.scan_reverse));
+    out.push_str(&format!("scan_listen = {}\n", prefs.scan_listen));
     if !prefs.port_list.is_empty() {
         out.push_str(&format!("port_list = {}\n", prefs.port_list));
     }
@@ -327,6 +350,8 @@ mod tests {
             scan_smb: true,
             scan_nfs: false,
             scan_ssh: true,
+            scan_reverse: false,
+            scan_listen: false,
         };
         assert_eq!(parse(&render(&prefs)), prefs);
     }

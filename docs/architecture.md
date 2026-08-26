@@ -25,10 +25,12 @@ puts a packet on a wire**. A scanner whose tests need a LAN has no tests: CI
 runners have nothing to scan, and no two development machines see the same
 network.
 
-## Four phases, four different shapes
+## Six phases, six different shapes
 
-A scan is four things, and running them all through one mechanism is the mistake
-this layout exists to avoid.
+A scan is six things, and running them all through one mechanism is the mistake
+this layout exists to avoid. **Two of them do not walk addresses at all**, which
+is the point of them: a sweep finds only what answers when it is asked, and the
+devices somebody is scanning to find are very often the ones that never do.
 
 1. **Survey.** Interfaces, addresses, prefixes, routes, resolvers, the DHCP
    server and the neighbour table, read from the operating system. No packets,
@@ -37,7 +39,19 @@ this layout exists to avoid.
 2. **Sweep.** Find the hosts, bounded by the prefix. ICMP echo and a short TCP
    knock today; ARP when there is a raw transport to send one with.
 3. **Port scan.** Where the performance is, and where it is not yet.
-4. **Identify.** Only for hosts that answered. Hundreds of short exchanges
+4. **Ask the link.** One datagram per question, put to the whole network at
+   once: the mDNS enumeration, the mDNS service types by name, an SSDP search, a
+   WS-Discovery probe, a broadcast NetBIOS node status, and a reverse lookup per
+   address to this network's own resolver. It runs *beside* the sweep, because
+   every question in it is one datagram and then a wait on a socket — so a phase
+   of its own would add its whole window for nothing. **It adds devices**, which
+   is what makes it a phase rather than a step of identification.
+5. **Listen.** Sits on the four ports the discovery protocols use for the length
+   of the scan and writes down who speaks. Sends nothing, save the one datagram
+   per port that a stateful firewall needs to see before it will deliver
+   anything inbound. Adds devices too, and it is the only thing here that finds
+   one without sending it a packet.
+6. **Identify.** Only for hosts on the list by then. Hundreds of short exchanges
    rather than millions of packets, which is a different shape from phase three
    and does not belong in its loop. It is in two halves for the same reason:
    `identify` asks what a device *is* over UDP, and `service` asks what it
@@ -63,7 +77,19 @@ network, and it is the most common lie a scanner tells.
 **A refusal proves a host.** A TCP RST is a machine declining a connection,
 which means a machine was there to decline it. Counting only open ports as
 evidence loses every device that refuses rather than drops, which on a home
-network is most of them.
+network is most of them. The knock's timeout is therefore per platform: Linux
+reports a refusal at once and Windows retransmits the SYN first and takes about
+two seconds, so a timeout short enough for one made the other unable to hear a
+RST at all.
+
+**A device that speaks proves itself without being asked.** An announcement, a
+search reply, or a device's own *question* — a phone looking for a Chromecast
+has proved it is there. Those become rows, carrying
+`discover::Evidence::Announced` so the row says which route found it, and
+`Found::was_probed` is what the interface asks before presenting a silence as a
+fact about the device. **A name is not a device**: a reverse `PTR` proves only
+that a router wrote something down once, so it names devices found by other
+means and never puts a row on the list by itself.
 
 **Nothing degrades silently.** A transport says what it can do through
 `discover::Capabilities`, and whatever the sweep therefore skipped is named in
@@ -104,7 +130,7 @@ bar draws an empty track. `Phase::fraction` and `Stage::progress` both return an
 ## What is not decided
 
 - **Whether identification justifies an async runtime.** The stateless scan
-  needs two threads and no runtime; phase four's hundreds of short connections
+  needs two threads and no runtime; identification's hundreds of short connections
   are the argument for one. If it is added it stays inside `muster-net` and
   never appears in `muster-app`'s API.
 - **How a scan is persisted**, and whether a saved scan is a document with a

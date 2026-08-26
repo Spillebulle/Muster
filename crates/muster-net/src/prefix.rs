@@ -84,6 +84,30 @@ impl Prefix {
         }
     }
 
+    /// The IPv4 broadcast address: every host bit set.
+    ///
+    /// [`None`] for IPv6, which has no broadcast at all — the link-wide
+    /// questions there go to a multicast group instead — and [`None`] for a /31
+    /// and a /32, which have no host bits to spare for one.
+    ///
+    /// **The subnet-directed address, not `255.255.255.255`.** Some stacks
+    /// answer one and not the other, and this is the one that says which
+    /// network is being asked: a datagram to the all-ones address on a machine
+    /// with two interfaces goes out whichever the routing table prefers, which
+    /// is the wrong link half the time.
+    pub fn broadcast(&self) -> Option<std::net::Ipv4Addr> {
+        let IpAddr::V4(base) = self.base else {
+            return None;
+        };
+        if self.len >= 31 {
+            return None;
+        }
+        let host_bits = 32 - self.len;
+        Some(std::net::Ipv4Addr::from(
+            u32::from(base) | (u32::MAX >> self.len).min((1u32 << host_bits) - 1),
+        ))
+    }
+
     /// How many addresses the prefix holds, saturating at [`u64::MAX`] for the
     /// v6 prefixes where the true answer does not fit and does not matter.
     pub fn size(&self) -> u64 {
@@ -366,5 +390,22 @@ mod tests {
                 "{text}"
             );
         }
+    }
+    /// The broadcast address is the one that names the network, and the two
+    /// prefixes that have no host bits to spare have none.
+    #[test]
+    fn the_broadcast_address_is_the_subnet_directed_one() {
+        let p: Prefix = "192.168.1.0/24".parse().unwrap();
+        assert_eq!(p.broadcast(), Some("192.168.1.255".parse().unwrap()));
+        let p: Prefix = "10.0.0.0/8".parse().unwrap();
+        assert_eq!(p.broadcast(), Some("10.255.255.255".parse().unwrap()));
+        let p: Prefix = "172.16.4.0/22".parse().unwrap();
+        assert_eq!(p.broadcast(), Some("172.16.7.255".parse().unwrap()));
+
+        // A point-to-point link and a host route have no broadcast, and an
+        // IPv6 network has no such thing at all.
+        assert_eq!("10.0.0.0/31".parse::<Prefix>().unwrap().broadcast(), None);
+        assert_eq!("10.0.0.1/32".parse::<Prefix>().unwrap().broadcast(), None);
+        assert_eq!("fd00::/64".parse::<Prefix>().unwrap().broadcast(), None);
     }
 }

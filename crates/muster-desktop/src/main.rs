@@ -40,7 +40,7 @@ use muster_net::survey::{Reading, Survey};
 use muster_net::{Prefix, discover, identify};
 use std::io::{IsTerminal, Write};
 use std::net::IpAddr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -171,6 +171,10 @@ fn usage() {
     );
 }
 
+/// How long the listen runs for. The same window the window uses, and for the
+/// same reason: it overlaps the rest of the scan, so it costs only the tail.
+const LISTEN_WINDOW: Duration = Duration::from_secs(15);
+
 /// Sweeps a prefix and prints what answered.
 ///
 /// With no argument it takes the survey and sweeps what that found, which is
@@ -257,34 +261,140 @@ fn scan(target: Option<&str>, dhcp: bool, serves: muster_net::service::Options) 
         // which does the same thing for the same reason.
         let offers = (dhcp && on_link).then(|| dhcp_probe(&survey)).flatten();
 
+        // What the link is asked, beside the sweep rather than after it: every
+        // question in it is one datagram and then a wait, so a phase of its own
+        // would add its whole window to the scan for nothing. Same shape and
+        // same reasoning as `muster_app::scan`, which this mirrors.
+        let link_opts = muster_net::link::Options {
+            netbios: on_link,
+            reverse: true,
+            broadcast: on_link.then(|| prefix.broadcast()).flatten(),
+            // **Only a resolver on this machine's own link.** See
+            // `Survey::local_resolver`: asking a stranger's resolver for a name
+            // for every address on this network hands them the network.
+            resolver: survey.local_resolver(),
+            ..Default::default()
+        };
+        let every: Vec<IpAddr> = prefix
+            .hosts()
+            .map(|hosts| hosts.collect())
+            .unwrap_or_default();
+
+        // This machine's own addresses, which is what a multicast group is
+        // joined on: a machine with a VPN up has more than one.
+        let own: Vec<std::net::Ipv4Addr> = survey
+            .interfaces
+            .iter()
+            .filter(|i| i.is_scannable())
+            .flat_map(|i| i.addresses.iter())
+            .filter_map(|a| match a.address {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+        // Stopped when every phase that asks a question is done, which is a
+        // different flag from the user's cancel: one means the scan finished
+        // and the other means the results are partial.
+        let hush = AtomicBool::new(false);
+
         let last = Mutex::new(Instant::now() - Duration::from_secs(1));
-        let result = discover::sweep(prefix, &transport, &rate, opts, &cancel, &|p, _| {
-            // A progress line is drawn by returning to the start of it, which
-            // only means anything on a terminal. Redirected, every update
-            // becomes another line of rubbish in the file — and because it goes
-            // to stderr, it lands in the middle of the table when both streams
-            // are captured together.
-            if !live {
-                return;
+        let (result, heard, overheard) = std::thread::scope(|scope| {
+            // Sits on the discovery ports for as long as the rest of the scan
+            // takes, and sends nothing but what keeps a stateful firewall from
+            // dropping what it is listening for. See `muster_net::listen`.
+            let ears = scope.spawn(|| {
+                muster_net::listen::overhear(
+                    &muster_net::platform::listen::Link,
+                    &own,
+                    LISTEN_WINDOW,
+                    &hush,
+                )
+            });
+            let (result, heard) = std::thread::scope(|scope| {
+                let asked = scope.spawn(|| {
+                    muster_net::link::ask(
+                        &muster_net::platform::udp::Udp,
+                        link_opts,
+                        &every,
+                        &rate,
+                        &cancel,
+                    )
+                });
+                let result = discover::sweep(prefix, &transport, &rate, opts, &cancel, &|p, _| {
+                    // A progress line is drawn by returning to the start of it, which
+                    // only means anything on a terminal. Redirected, every update
+                    // becomes another line of rubbish in the file — and because it goes
+                    // to stderr, it lands in the middle of the table when both streams
+                    // are captured together.
+                    if !live {
+                        return;
+                    }
+                    // Throttled to ten a second: a line per probe is 254 lines of
+                    // scrollback for a result that fits on one.
+                    let mut last = last.lock().expect("progress clock poisoned");
+                    if last.elapsed() >= Duration::from_millis(100) || p.probed == p.total {
+                        *last = Instant::now();
+                        eprint!(
+                            "\r  {} of {} probed, {} found   ",
+                            p.probed, p.total, p.found
+                        );
+                        let _ = std::io::stderr().flush();
+                    }
+                });
+
+                (result, asked.join().unwrap_or_default())
+            });
+
+            // Everything that asks a question is done; what is left is the
+            // listen's own window.
+            while !cancel.load(Ordering::SeqCst) {
+                let left = LISTEN_WINDOW.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    break;
+                }
+                if live {
+                    eprint!(
+                        "
+  listening, {} more seconds   ",
+                        left.as_secs() + 1
+                    );
+                    let _ = std::io::stderr().flush();
+                }
+                std::thread::sleep(Duration::from_millis(200).min(left));
             }
-            // Throttled to ten a second: a line per probe is 254 lines of
-            // scrollback for a result that fits on one.
-            let mut last = last.lock().expect("progress clock poisoned");
-            if last.elapsed() >= Duration::from_millis(100) || p.probed == p.total {
-                *last = Instant::now();
-                eprint!(
-                    "\r  {} of {} probed, {} found   ",
-                    p.probed, p.total, p.found
-                );
-                let _ = std::io::stderr().flush();
-            }
+            hush.store(true, Ordering::SeqCst);
+            (result, heard, ears.join().unwrap_or_default())
         });
+        if live {
+            eprint!(
+                "
+{:<48}
+",
+                ""
+            );
+        }
+        let mut result = result;
         if live {
             // Blank the line rather than leaving the last count above the
             // table. Spaces rather than an erase escape, because a console
             // without ANSI processing would print the escape instead.
             eprint!("\r{:<48}\r", "");
         }
+
+        // The union: a device that answered a question put to the whole link
+        // is a device, whether or not anything sent to its own address came
+        // back. See `muster_net::link` — this is the half of discovery the
+        // sweep cannot do.
+        for (address, _) in heard.speakers() {
+            if let Some(protocol) = heard.credit(address) {
+                result.admit(discover::Found::announced(address, protocol));
+            }
+        }
+        // And what the operating system already knew, which costs no packet.
+        for neighbour in survey.known_in(prefix) {
+            result.admit_neighbour(neighbour.address, neighbour.mac);
+        }
+        result.not_done.extend(heard.not_done.iter().cloned());
 
         // Phase four, and only for what answered: two hundred and fifty
         // addresses were just probed and a handful of them are devices worth
@@ -298,7 +408,9 @@ fn scan(target: Option<&str>, dhcp: bool, serves: muster_net::service::Options) 
                 // The resolver the machine actually uses. `None` where it could
                 // not be read, which skips the reverse lookup rather than
                 // guessing at an address.
-                resolver: survey.resolvers.iter().copied().find(IpAddr::is_ipv4),
+                // The resolver this machine uses, and only where it is on
+                // this machine's own link.
+                resolver: survey.local_resolver(),
                 ..Default::default()
             },
             &cancel,
@@ -314,6 +426,21 @@ fn scan(target: Option<&str>, dhcp: bool, serves: muster_net::service::Options) 
         }
 
         let mut names = names;
+
+        // What the link said about each of them, beside what they said when
+        // asked privately. This is where a device that answered only the group
+        // gets its name, its services and its model.
+        for (address, identity) in addresses.iter().zip(names.iter_mut()) {
+            if let Some(voice) = heard.by.get(address) {
+                identity.merge(&voice.identity);
+            }
+        }
+
+        // And what was overheard while all of that ran. Folded by the engine's
+        // own function so that the device list and the names beside it stay in
+        // step here exactly as they do in the window.
+        muster_net::link::fold(&overheard, &mut result, &mut names);
+        result.not_done.extend(overheard.not_done.iter().cloned());
 
         // What they serve, over a connection. After identification and only for
         // what answered, and skipped entirely unless a flag asked: see
@@ -577,6 +704,18 @@ fn print_sweep(
         s.probed,
         s.total
     );
+
+    // **The count has to say what it is counting.** Some of these devices were
+    // never probed at all: they answered a question put to the whole link, or
+    // they were already in this machine's neighbour table. That is a real
+    // device found by a real means, and it is not the same claim as an address
+    // that answered when it was asked, so the line says which.
+    let heard = s.heard();
+    if heard > 0 {
+        println!(
+            "  {heard} of them answered a question put to the whole network, or were already known to this machine, rather than answering a probe."
+        );
+    }
 
     // The rule: a partial sweep never presents its count as the answer.
     if s.cancelled {

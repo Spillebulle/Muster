@@ -372,6 +372,8 @@ impl App {
             smb: self.prefs.scan_smb,
             nfs: self.prefs.scan_nfs,
             ssh: self.prefs.scan_ssh,
+            reverse: self.prefs.scan_reverse,
+            listen: self.prefs.scan_listen,
         }
     }
 }
@@ -844,8 +846,18 @@ fn scan_options(ui: &mut egui::Ui, p: Palette, app: &mut App, split: &Split) {
             for (label, explain, value) in [
                 (
                     "Identify devices",
-                    "mDNS, SSDP and NetBIOS, and the model a device names for itself.",
+                    "The link as a whole over mDNS, SSDP, WS-Discovery and NetBIOS, and each device about itself.",
                     &mut app.prefs.identify,
+                ),
+                (
+                    "Listen for devices",
+                    "Sends nothing. Hears the questions other devices ask, which is how the quiet ones are found.",
+                    &mut app.prefs.scan_listen,
+                ),
+                (
+                    "Ask this network for names",
+                    "One reverse lookup per address, to your own router. It names devices that are asleep.",
+                    &mut app.prefs.scan_reverse,
                 ),
                 (
                     "Find name servers",

@@ -36,6 +36,8 @@ pub mod discover;
 pub mod dns;
 pub mod identify;
 pub mod kind;
+pub mod link;
+pub mod listen;
 pub mod mac;
 pub mod netbios;
 pub mod platform;
@@ -48,6 +50,7 @@ pub mod ssdp;
 pub mod survey;
 pub mod sysinfo;
 pub mod vendor;
+pub mod wsd;
 
 pub use discover::Sweep;
 pub use kind::{Guess, Kind};

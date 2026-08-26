@@ -726,6 +726,44 @@ const UPNP: &[(&str, Kind)] = &[
     ("dslforum-org", Kind::NetworkGear),
 ];
 
+/// WS-Discovery `Types`, as a device claims them about itself.
+///
+/// The same class of self-report as an mDNS service or a UPnP device type, and
+/// ranked with them as [`Clue::Service`]: a `Types` value is a protocol the
+/// device implements and publishes, not free text it filled in.
+///
+/// **Matched with the namespace prefix on**, and that is what makes it safe.
+/// `Computer` on its own is a word; `pub:Computer` is Microsoft's publication
+/// namespace saying the thing is a PC. Every needle here is the prefix the
+/// namespace's own specification defines and every implementation in the field
+/// uses, and the prefix is matched as a substring so a responder that writes
+/// `wsdp:` where another writes `d:` still lands on the same row.
+///
+/// `wsdp:device` is deliberately absent. Every WS-Discovery responder claims
+/// it, so it says only "this is a device that answers WS-Discovery" — which the
+/// reply itself already said, and which names no kind at all.
+const WSD: &[(&str, Kind)] = &[
+    // Microsoft's publication namespace. This is the one that matters: it is
+    // what a Windows machine answers with, and on an office network it is the
+    // only thing that names the machines people sit in front of.
+    ("pub:computer", Kind::Computer),
+    // WSD-Print, which every network printer of the last fifteen years speaks
+    // and which Windows uses to find them.
+    ("printdevicetype", Kind::Printer),
+    // WSD-Scan. A scanner on a network is part of a multi-function printer
+    // often enough that the two share a kind, and [`Kind`] has no `Scanner`
+    // for the same reason it has no `Laptop`.
+    ("scandevicetype", Kind::Printer),
+    // ONVIF. `NetworkVideoTransmitter` is the profile every IP camera
+    // implements, and `NetworkVideoDisplay`, `NetworkVideoStorage` and
+    // `NetworkVideoAnalytics` are the rest of the family — a recorder is
+    // camera equipment, and there is nothing else it could be.
+    ("networkvideotransmitter", Kind::Camera),
+    ("networkvideodisplay", Kind::Camera),
+    ("networkvideostorage", Kind::Camera),
+    ("networkvideoanalytics", Kind::Camera),
+];
+
 /// Product names, as a device writes them about itself.
 ///
 /// Two sources, one table, because they are the same kind of statement: the
@@ -929,6 +967,14 @@ pub fn identify(found: &Found, identity: &Identity, vantage: Vantage) -> Option<
         }
     }
 
+    // And WS-Discovery's, which is a third vocabulary for the same kind of
+    // claim. `identity.wsd` is already lower cased by [`crate::wsd::parse`].
+    for (needle, kind) in WSD {
+        if identity.wsd.iter().any(|claim| claim.contains(needle)) {
+            consider(*kind, Clue::Service);
+        }
+    }
+
     for port in found.open_ports() {
         if let Some((_, kind)) = PORTS.iter().find(|(number, _)| *number == port) {
             consider(*kind, Clue::Port);
@@ -968,7 +1014,7 @@ pub fn kind_of(found: &Found, identity: &Identity, vantage: Vantage) -> Kind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discover::Evidence;
+    use crate::discover::{Evidence, Protocol};
     use crate::identify::{Name, Source};
     use crate::mac::MacAddr;
     use std::net::{IpAddr, Ipv4Addr};
@@ -1824,6 +1870,82 @@ mod tests {
             Kind::Unknown,
         ] {
             assert!(!kind.label().is_empty());
+        }
+    }
+    /// The claim that finds Windows. A machine that answered WS-Discovery and
+    /// nothing else is still named, which is the whole reason the protocol was
+    /// added.
+    #[test]
+    fn a_windows_machine_is_named_by_what_it_told_ws_discovery() {
+        let identity = Identity {
+            wsd: vec!["wsdp:device".into(), "pub:computer".into()],
+            ..Default::default()
+        };
+        let guess = identify(&bare("192.168.1.42"), &identity, Vantage::default());
+        assert_eq!(
+            guess,
+            Some(Guess {
+                kind: Kind::Computer,
+                clue: Clue::Service
+            })
+        );
+    }
+
+    /// A printer and a camera answer the same probe in their own namespaces.
+    #[test]
+    fn ws_discovery_names_printers_and_cameras() {
+        for (claim, expected) in [
+            ("wprt:printdevicetype", Kind::Printer),
+            ("wscn:scandevicetype", Kind::Printer),
+            ("dn:networkvideotransmitter", Kind::Camera),
+        ] {
+            let identity = Identity {
+                wsd: vec![claim.into()],
+                ..Default::default()
+            };
+            let guess = identify(&bare("192.168.1.9"), &identity, Vantage::default());
+            assert_eq!(guess.map(|g| g.kind), Some(expected), "{claim}");
+        }
+    }
+
+    /// Every responder claims `wsdp:Device`, so it names nothing and must not
+    /// be allowed to.
+    #[test]
+    fn a_bare_wsd_device_names_no_kind() {
+        let identity = Identity {
+            wsd: vec!["wsdp:device".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            identify(&bare("192.168.1.9"), &identity, Vantage::default()),
+            None
+        );
+    }
+
+    /// A device found only by the link is a device the sweep never probed, and
+    /// it still gets a kind: the guess is made from what it said, not from
+    /// whether a packet reached it.
+    #[test]
+    fn a_device_that_was_never_probed_is_still_identified() {
+        let host = Found::announced("192.168.1.42".parse().unwrap(), Protocol::WsDiscovery);
+        assert!(!host.was_probed());
+        let identity = Identity {
+            wsd: vec!["pub:computer".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            identify(&host, &identity, Vantage::default()).map(|g| g.kind),
+            Some(Kind::Computer)
+        );
+    }
+
+    /// A bare host with nothing but an address, for the tests above.
+    fn bare(address: &str) -> Found {
+        Found {
+            address: address.parse().unwrap(),
+            mac: None,
+            evidence: vec![Evidence::Ping],
+            rtt: None,
         }
     }
 }

@@ -60,7 +60,6 @@ use crate::dns;
 use crate::mac::MacAddr;
 use crate::netbios;
 use crate::rate::Bucket;
-use crate::ssdp;
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -196,6 +195,17 @@ pub struct Identity {
     /// because the two are different vocabularies and showing a URN under
     /// "advertises" beside `_ipp._tcp` reads as one list of nonsense.
     pub upnp: Vec<String>,
+    /// The `Types` a device claimed over WS-Discovery, lower cased and with
+    /// their namespace prefixes left on: `pub:computer`,
+    /// `wprt:printdevicetype`, `dn:networkvideotransmitter`.
+    ///
+    /// A third vocabulary beside [`Self::services`] and [`Self::upnp`], and
+    /// separate for the same reason those two are separate from each other:
+    /// they are different languages and showing them in one list reads as
+    /// nonsense. The prefix is kept because it is half the meaning — `pub:` is
+    /// Microsoft's publication namespace and is what makes `Computer` a claim
+    /// about a Windows machine rather than a word.
+    pub wsd: Vec<String>,
     /// The `SERVER` header of an SSDP reply: the product, in the device's own
     /// words. `Linux/4.19 UPnP/1.0 LG WebOS TV/1.0`.
     pub product: Option<String>,
@@ -237,6 +247,7 @@ impl Identity {
             && self.workgroup.is_none()
             && self.services.is_empty()
             && self.upnp.is_empty()
+            && self.wsd.is_empty()
             && self.product.is_none()
             && self.model.is_none()
             && self.resolver.is_none()
@@ -320,13 +331,24 @@ impl Identity {
         }
     }
 
-    /// Folds in what a link-wide question learned about this same device.
+    /// Folds in what another question learned about this same device.
     ///
     /// The device asked privately and the device that answered the group are
     /// one device, so this is a union rather than a choice: a name is added
     /// with its source and the deduplication in [`Self::add`] settles the rest,
-    /// and a model already learned is kept because the private answer is the
-    /// more specific of the two.
+    /// and anything already known is kept because the answer that arrived first
+    /// is the more specific of the two — [`crate::link`] merges the link's four
+    /// protocols into one identity in the order they are asked, and
+    /// [`many`] then merges that into what the private questions found.
+    ///
+    /// **Every field is unioned, and it was not always.** This merged names,
+    /// services and the model, and dropped the other nine — which was invisible
+    /// while the only thing it merged was an mDNS answer that could not carry
+    /// them. The moment a link-wide phase started producing SSDP product
+    /// strings, WS-Discovery types and NetBIOS workgroups, a partial merge
+    /// would have thrown away the identification for every device that answered
+    /// the link and not the private question, which is precisely the set of
+    /// devices the link phase exists to find.
     pub fn merge(&mut self, other: &Self) {
         for name in &other.names {
             self.add(name.value.clone(), name.source);
@@ -336,9 +358,34 @@ impl Identity {
                 self.services.push(service.clone());
             }
         }
+        for kind in &other.upnp {
+            if !self.upnp.contains(kind) {
+                self.upnp.push(kind.clone());
+            }
+        }
+        for kind in &other.wsd {
+            if !self.wsd.contains(kind) {
+                self.wsd.push(kind.clone());
+            }
+        }
+        if self.workgroup.is_none() {
+            self.workgroup.clone_from(&other.workgroup);
+        }
+        if self.mac.is_none() {
+            self.mac = other.mac;
+        }
+        if self.product.is_none() {
+            self.product.clone_from(&other.product);
+        }
         if self.model.is_none() {
             self.model.clone_from(&other.model);
         }
+        if self.resolver.is_none() {
+            self.resolver.clone_from(&other.resolver);
+        }
+        self.dhcp |= other.dhcp;
+        self.llmnr |= other.llmnr;
+        self.serves(&other.serves);
     }
 
     /// Folds one SSDP reply in.
@@ -357,7 +404,7 @@ impl Identity {
         }
     }
 
-    fn add(&mut self, value: String, source: Source) {
+    pub fn add(&mut self, value: String, source: Source) {
         let value = value.trim_end_matches('.').to_string();
         if value.is_empty() {
             return;
@@ -527,7 +574,7 @@ const MOST: usize = 512;
 /// datagram to the port that asked, rather than by multicasting to the group.
 /// That is what makes one socket able to collect the link's answers and tell
 /// them apart, and it is why nothing here has to join a multicast group.
-fn sweep_services<A: Ask + ?Sized>(ask: &A, window: Duration) -> BTreeMap<IpAddr, Identity> {
+pub fn sweep_services<A: Ask + ?Sized>(ask: &A, window: Duration) -> BTreeMap<IpAddr, Identity> {
     let question = dns::query(0, SERVICE_ENUMERATION, dns::TYPE_PTR, false);
     let Ok(replies) = ask.ask_all(MDNS, &question, window, MOST) else {
         return BTreeMap::new();
@@ -536,7 +583,9 @@ fn sweep_services<A: Ask + ?Sized>(ask: &A, window: Duration) -> BTreeMap<IpAddr
     let mut found: BTreeMap<IpAddr, (Identity, Vec<(usize, String)>)> = BTreeMap::new();
     for (from, reply) in replies {
         if let Some(message) = dns::parse(&reply) {
-            let (identity, models) = found.entry(from).or_default();
+            // The device the reply is *about*, which is the sender unless a
+            // sleep proxy answered for somebody else. See [`subject`].
+            let (identity, models) = found.entry(subject(&message, from)).or_default();
             harvest(&message, identity, models);
         }
     }
@@ -733,13 +782,65 @@ pub fn one<A: Ask>(address: IpAddr, ask: &A, rate: &Bucket, opts: Options, id: u
     found
 }
 
+/// Which device an mDNS reply is *about*, given who sent it.
+///
+/// **Not always the sender, and getting this wrong merges two devices into
+/// one.** A Bonjour sleep proxy — which is what an Apple TV or a HomePod
+/// quietly becomes — registers the services of machines that have gone to sleep
+/// and answers mDNS on their behalf. So a reply arriving from the Apple TV's
+/// address can be describing somebody's sleeping laptop, and attributing it by
+/// sender puts the laptop's name, services and model on the television's row
+/// while leaving the laptop off the list entirely.
+///
+/// The address records in the reply are what settle it: a responder attaches
+/// the `A` or `AAAA` for the name it is answering about.
+///
+/// **The sender wins whenever it is named in the reply**, which is the ordinary
+/// case of a device answering for itself, and that rule is what stops the other
+/// two failures:
+///
+/// * A dual-stacked device answers with both its `A` and its `AAAA`. Taking the
+///   first record would key half its answers under its link-local IPv6 address
+///   and split one device into two rows.
+/// * A reply describing several hosts at once names them all, and the one it is
+///   *from* is the one it is about.
+///
+/// Only when the sender is nowhere in the reply is it somebody else's record,
+/// and then an address of the sender's own family is preferred — a proxy on
+/// IPv4 is speaking for a machine's IPv4 address.
+///
+/// **This also finds devices.** The address in a proxied record is very often
+/// one that answered nothing at all: a sleeping machine no sweep would find.
+pub fn subject(msg: &dns::Message, from: IpAddr) -> IpAddr {
+    let mut named = msg.records().filter_map(|r| match r.data {
+        dns::RData::A(v4) => Some(IpAddr::V4(v4)),
+        dns::RData::Aaaa(v6) => Some(IpAddr::V6(v6)),
+        _ => None,
+    });
+
+    let mut first_alike = None;
+    let mut first_any = None;
+    for address in &mut named {
+        if address == from {
+            return from;
+        }
+        if first_any.is_none() {
+            first_any = Some(address);
+        }
+        if first_alike.is_none() && address.is_ipv4() == from.is_ipv4() {
+            first_alike = Some(address);
+        }
+    }
+    first_alike.or(first_any).unwrap_or(from)
+}
+
 /// Takes everything worth having out of an mDNS reply.
 ///
 /// Both mDNS questions read the same things, and they read them from every
 /// section: a responder answering a `PTR` commonly attaches the `SRV`, `TXT`
 /// and `A` records for the same service without being asked, and those carry
 /// the service type as their own name.
-fn harvest(msg: &dns::Message, found: &mut Identity, models: &mut Vec<(usize, String)>) {
+pub fn harvest(msg: &dns::Message, found: &mut Identity, models: &mut Vec<(usize, String)>) {
     let offered = |service: Option<String>, found: &mut Identity| {
         if let Some(service) = service
             && !found.services.contains(&service)
@@ -824,6 +925,15 @@ fn service_type(name: &str) -> Option<String> {
 ///
 /// Returns an identity per input address, in the same order, so the caller can
 /// zip it against what the sweep found.
+///
+/// **The link-wide questions are not asked here, and used to be.** An SSDP
+/// search and an mDNS enumeration ran at the top of this function and their
+/// answers were folded into the addresses the caller had passed in — which
+/// meant an answer from an address the sweep had missed had nowhere to go and
+/// was dropped. Those are the devices worth finding, so the link is now asked
+/// by [`crate::link`], as a phase of its own that runs beside the sweep and
+/// can *add* to the device list rather than only annotate it. What is left here
+/// is what it says: questions put to one device, about itself.
 pub fn many<A: Ask>(
     addresses: &[IpAddr],
     ask: &A,
@@ -832,22 +942,6 @@ pub fn many<A: Ask>(
     cancel: &AtomicBool,
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Vec<Identity> {
-    // One search for the whole link, before the per-device work rather than
-    // inside it: see [`crate::ssdp`] for why this is a multicast question and
-    // not twenty unicast ones. A device that answers here and was never swept
-    // is not invented into the results — this fills in what is known about the
-    // addresses the caller asked about, and nothing else.
-    let announced = if opts.ssdp && !cancel.load(Ordering::Relaxed) {
-        ssdp::discover(ask, opts.link_window)
-    } else {
-        Default::default()
-    };
-    let offered = if opts.mdns && !cancel.load(Ordering::Relaxed) {
-        sweep_services(ask, opts.link_window)
-    } else {
-        Default::default()
-    };
-
     let next = AtomicU64::new(0);
     let done = AtomicU64::new(0);
     let mut out: Vec<Identity> = vec![Identity::default(); addresses.len()];
@@ -887,14 +981,6 @@ pub fn many<A: Ask>(
         }
     });
 
-    for (address, identity) in addresses.iter().zip(out.iter_mut()) {
-        if let Some(link) = offered.get(address) {
-            identity.merge(link);
-        }
-        for announcement in announced.get(address).into_iter().flatten() {
-            identity.announced(announcement);
-        }
-    }
     out
 }
 
@@ -1281,132 +1367,6 @@ mod tests {
             Some((0, "MacPro7,1".into())),
             "the colour hint is not part of the model"
         );
-    }
-
-    /// The search is one multicast question, and a reply is attributed to the
-    /// device it came from and to no other.
-    ///
-    /// Both halves matter. The whole reason SSDP moved out of the per-device
-    /// loop is that a device answers the group and ignores a question addressed
-    /// to itself, so the only thing tying an answer to a device is the address
-    /// it arrived from — and getting that wrong would put a television's name
-    /// on its neighbour.
-    #[test]
-    fn a_group_search_is_attributed_to_whoever_answered_it() {
-        struct Link;
-        impl Ask for Link {
-            fn ask(&self, _to: SocketAddr, _p: &[u8], _t: Duration) -> io::Result<Vec<u8>> {
-                Err(io::Error::new(io::ErrorKind::TimedOut, "nothing answered"))
-            }
-            fn ask_all(
-                &self,
-                to: SocketAddr,
-                payload: &[u8],
-                _w: Duration,
-                _most: usize,
-            ) -> io::Result<Vec<(IpAddr, Vec<u8>)>> {
-                // Two link-wide questions go out now, and only one of them is
-                // this test's.
-                if to == MDNS {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "no mDNS here"));
-                }
-                assert_eq!(to, ssdp::GROUP, "the search goes to the group");
-                assert!(String::from_utf8_lossy(payload).starts_with("M-SEARCH "));
-                let television = ip("192.168.0.107");
-                Ok(vec![
-                    // The first reply from the television names nothing, which
-                    // is the usual case and the reason the window is read out.
-                    (
-                        television,
-                        b"HTTP/1.1 200 OK
-ST: upnp:rootdevice
-SERVER: WebOS/4.0.0 UPnP/1.0
-
-"
-                        .to_vec(),
-                    ),
-                    (
-                        television,
-                        b"HTTP/1.1 200 OK
-ST: urn:lge:device:tv:1
-SERVER: WebOS/4.0.0 UPnP/1.0
-
-"
-                        .to_vec(),
-                    ),
-                    (
-                        ip("192.168.0.1"),
-                        b"HTTP/1.1 200 OK
-ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
-SERVER: TP-LINK/TP-LINK UPnP/1.1 MiniUPnPd/2.2.2
-
-"
-                        .to_vec(),
-                    ),
-                ])
-            }
-        }
-
-        let addresses = [ip("192.168.0.1"), ip("192.168.0.9"), ip("192.168.0.107")];
-        let found = many(
-            &addresses,
-            &Link,
-            &Bucket::new(1_000_000),
-            Options::default(),
-            &AtomicBool::new(false),
-            &|_, _| {},
-        );
-        assert_eq!(found[2].upnp, vec!["urn:lge:device:tv:1"]);
-        assert_eq!(found[2].product.as_deref(), Some("WebOS/4.0.0 UPnP/1.0"));
-        assert_eq!(
-            found[0].upnp,
-            vec!["urn:schemas-upnp-org:device:internetgatewaydevice:1"]
-        );
-        assert!(
-            found[1].is_empty(),
-            "the address that said nothing is left saying nothing"
-        );
-    }
-
-    /// The link-wide mDNS question, and the reason it exists: two televisions
-    /// that answer it and ignore the same question asked of them privately.
-    #[test]
-    fn the_link_wide_mdns_question_fills_in_a_device_that_answers_nothing_privately() {
-        struct Link;
-        impl Ask for Link {
-            fn ask(&self, _to: SocketAddr, _p: &[u8], _t: Duration) -> io::Result<Vec<u8>> {
-                Err(io::Error::new(io::ErrorKind::TimedOut, "not privately"))
-            }
-            fn ask_all(
-                &self,
-                to: SocketAddr,
-                payload: &[u8],
-                _w: Duration,
-                _most: usize,
-            ) -> io::Result<Vec<(IpAddr, Vec<u8>)>> {
-                if to != MDNS {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "no UPnP here"));
-                }
-                let asked = dns::parse(payload).expect("a query");
-                assert_eq!(asked.questions[0].0, SERVICE_ENUMERATION);
-                Ok(vec![(
-                    ip("192.168.0.107"),
-                    ptr_reply(SERVICE_ENUMERATION, "_androidtvremote2._tcp.local"),
-                )])
-            }
-        }
-
-        let addresses = [ip("192.168.0.9"), ip("192.168.0.107")];
-        let found = many(
-            &addresses,
-            &Link,
-            &Bucket::new(1_000_000),
-            Options::default(),
-            &AtomicBool::new(false),
-            &|_, _| {},
-        );
-        assert_eq!(found[1].services, vec!["_androidtvremote2._tcp"]);
-        assert!(found[0].is_empty(), "and nobody else is given its services");
     }
 
     /// A name server is anything that answers in the protocol, including a

@@ -50,6 +50,32 @@ use std::time::Duration;
 /// profile and is otherwise invisible.
 pub const KNOCK_PORTS: &[u16] = &[80, 443, 22, 445];
 
+/// The four tried next, and only for an address that answered none of the
+/// above.
+///
+/// **The first four prove almost anything that refuses; these are for the
+/// devices that drop.** Once a refusal is visible — see [`TCP_TIMEOUT`] — the
+/// choice of port barely matters for a host that sends a RST, because it sends
+/// one on every port. It matters entirely for the minority that drop
+/// everything, and there the only question that gets an answer is a port the
+/// device is actually *listening* on. So these are chosen for what they are
+/// open on rather than for what they are closed on:
+///
+/// * **7000** is AirPlay, and on the network this was measured against it was
+///   the only open port on either television. Nothing else in the sweep found
+///   them.
+/// * **62078** is `lockdownd`, which starts at boot on every iPhone and iPad
+///   and listens for the life of the device. There is nothing else it can be.
+/// * **8009** is the Chromecast control channel, which every Cast device and
+///   Cast-capable television holds open.
+/// * **9100** is JetDirect, on printers and on the storage boxes that offer
+///   printing.
+///
+/// Four more connections, paid only on an address that has already produced
+/// nothing, which on an ordinary network is a handful of addresses rather than
+/// two hundred.
+pub const KNOCK_HARDER: &[u16] = &[7000, 62078, 8009, 9100];
+
 /// What a transport is able to send.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capabilities {
@@ -84,6 +110,55 @@ pub enum Outcome {
     NoAnswer,
 }
 
+/// A protocol a device spoke to the link as a whole.
+///
+/// **This is the other half of finding a device, and for a long time it was
+/// thrown away.** The sweep asks each address a question; these are the
+/// questions asked once of everybody, and the answers arrive from whoever felt
+/// like answering — including addresses the sweep never got a word out of. A
+/// television that ignores ARP, drops ping and refuses nothing is silent to
+/// phase two and shouts its model number at `239.255.255.250` every few
+/// minutes, and until this existed it was not on the list.
+///
+/// The variants are ordered by how much a reply narrows down what the device
+/// is, which is also roughly how much work each costs. Nothing depends on the
+/// order; it is a reading order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Protocol {
+    /// Multicast DNS, the question every Apple device, printer and Avahi host
+    /// answers.
+    Mdns,
+    /// SSDP, which is how nearly everything that is not Apple announces itself:
+    /// televisions, set-top boxes, media players, routers and cameras.
+    Ssdp,
+    /// WS-Discovery, which Windows machines, network printers and ONVIF
+    /// cameras answer and the two above do not.
+    WsDiscovery,
+    /// The NetBIOS name service, asked of the broadcast address rather than of
+    /// one machine.
+    NetBios,
+    /// **Not the device speaking.** This network's own resolver had a `PTR`
+    /// record for the address, which is what the router was told once and is
+    /// second-hand by definition: the device may be asleep, or may have given
+    /// the address up a month ago. Last in this order for that reason, and it
+    /// is deliberately never enough on its own to put a row on the device
+    /// list — see [`crate::link::Voice::spoke`].
+    Dns,
+}
+
+impl Protocol {
+    /// The protocol's name, as the interface writes it.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Mdns => "mDNS",
+            Self::Ssdp => "SSDP",
+            Self::WsDiscovery => "WS-Discovery",
+            Self::NetBios => "NetBIOS",
+            Self::Dns => "reverse DNS",
+        }
+    }
+}
+
 /// Why Muster believes a host is there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Evidence {
@@ -95,6 +170,22 @@ pub enum Evidence {
     TcpOpen(u16),
     /// It refused a connection on this port, which proves it is there.
     TcpRefused(u16),
+    /// It answered a question put to the whole link, in this protocol.
+    ///
+    /// As good as any other evidence and better than most: a device that sent
+    /// a datagram is a device that exists, and unlike a TCP refusal it has
+    /// also just said what it is. What it is *not* is a measurement — nothing
+    /// here has a round trip time, and the interface must not draw one.
+    Announced(Protocol),
+    /// This machine's own neighbour table already had it, with a hardware
+    /// address, from before the scan began.
+    ///
+    /// The one piece of evidence that costs no packet at all. It is what the
+    /// operating system learned the last time anything on this machine talked
+    /// to the device, so it is weaker than an answer given just now — a device
+    /// can have left — and it is the only way an IPv6 neighbour reaches the
+    /// list at all, because the sweep walks IPv4 addresses.
+    Neighbour,
 }
 
 impl Evidence {
@@ -105,7 +196,20 @@ impl Evidence {
             Self::Ping => "answered ping".into(),
             Self::TcpOpen(p) => format!("port {p} open"),
             Self::TcpRefused(p) => format!("port {p} refused"),
+            Self::Announced(p) => format!("announced itself over {}", p.label()),
+            Self::Neighbour => "already in this machine's neighbour table".into(),
         }
+    }
+
+    /// Did a probe of this address produce this, or did it arrive on its own?
+    ///
+    /// The sweep counts what it probed, and a device that was never probed
+    /// must not be counted as one that was. See [`Sweep::heard`].
+    pub const fn is_probe(&self) -> bool {
+        matches!(
+            self,
+            Self::Arp(_) | Self::Ping | Self::TcpOpen(_) | Self::TcpRefused(_)
+        )
     }
 }
 
@@ -123,6 +227,53 @@ pub struct Found {
 }
 
 impl Found {
+    /// A host that answered a question put to the whole link.
+    ///
+    /// No round trip, because none was measured: the datagram was sent to a
+    /// group and a reply arrived from somewhere, which proves the somewhere
+    /// and times nothing. The hardware address is filled in later where the
+    /// neighbour table or an ARP reply knows one.
+    pub fn announced(address: IpAddr, protocol: Protocol) -> Self {
+        Self {
+            address,
+            mac: None,
+            evidence: vec![Evidence::Announced(protocol)],
+            rtt: None,
+        }
+    }
+
+    /// A host this machine had already talked to, out of the neighbour table.
+    pub fn neighbour(address: IpAddr, mac: MacAddr) -> Self {
+        Self {
+            address,
+            mac: Some(mac),
+            evidence: vec![Evidence::Neighbour],
+            rtt: None,
+        }
+    }
+
+    /// Did anything Muster sent to *this address* come back?
+    ///
+    /// False for a device that only ever answered a group question or that
+    /// came out of the neighbour table. The interface asks before it presents
+    /// a silence as a fact about the device: a row that was never probed has
+    /// nothing to say about ping, and saying "nothing came back" about a
+    /// question that was never put is the mistake `discover::recheck` exists
+    /// to stop.
+    pub fn was_probed(&self) -> bool {
+        self.evidence.iter().any(Evidence::is_probe)
+    }
+
+    /// Folds one more reason in, without repeating one already there.
+    ///
+    /// Order is preserved because it is meaningful: the evidence list reads as
+    /// the order things were learned, and the interface prints it that way.
+    pub fn attest(&mut self, evidence: Evidence) {
+        if !self.evidence.contains(&evidence) {
+            self.evidence.push(evidence);
+        }
+    }
+
     /// The open ports the sweep happened to notice while knocking. Not a port
     /// scan's answer.
     pub fn open_ports(&self) -> Vec<u16> {
@@ -219,7 +370,7 @@ impl Default for Options {
             // patience, it is 254 seconds of sweep.
             arp_timeout: Duration::from_millis(300),
             ping_timeout: Duration::from_millis(500),
-            tcp_timeout: Duration::from_millis(400),
+            tcp_timeout: TCP_TIMEOUT,
             workers: 256,
             knock: true,
             // Off by default because it is only true on-link, and a default
@@ -238,6 +389,35 @@ impl Options {
         }
     }
 }
+
+/// How long to wait on a TCP knock, **which is a different number on each
+/// platform because the platforms report a refusal differently.**
+///
+/// On Linux a RST arrives as `ECONNREFUSED` on the first one, in about as long
+/// as the round trip: 600 ms is generous.
+///
+/// **On Windows it takes two seconds, and for a long time this was 400 ms
+/// there too — which quietly made [`Outcome::Refused`] unreachable.** Windows
+/// does not hand a RST straight to `connect()`; it treats the reset as possibly
+/// transient, retransmits the SYN, and only fails the call when its own retry
+/// schedule runs out. Measured on loopback and on the wire, against a closed
+/// port, the refusal surfaces at 2.0 to 2.6 seconds and not before — so every
+/// refused connection became [`Outcome::NoAnswer`], which is exactly the lie
+/// this module's doc comment opens by refusing to tell. On a real network of
+/// eighteen devices, seventeen of which refuse rather than drop, the same knock
+/// proved eleven hosts at 400 ms and eighteen at 3000 ms.
+///
+/// `TCP_MAXRT` looks like the cure and is the opposite of one: it shortens the
+/// call and turns the refusal into `WSAETIMEDOUT`, throwing away the very
+/// evidence being waited for. Waiting is the only way to hear a RST on Windows.
+///
+/// The cost is paid in concurrency rather than in elapsed time — the knock only
+/// runs for addresses that answered nothing else, and 256 of them are in flight
+/// at once.
+#[cfg(windows)]
+const TCP_TIMEOUT: Duration = Duration::from_millis(3000);
+#[cfg(not(windows))]
+const TCP_TIMEOUT: Duration = Duration::from_millis(600);
 
 /// The share of a prefix that has to be settled by ARP silence alone, with
 /// nothing found anywhere, before the sweep stops believing the shortcut.
@@ -312,6 +492,92 @@ pub struct Sweep {
 }
 
 impl Sweep {
+    /// Admits a host that attested to itself rather than answering a probe.
+    ///
+    /// **The sweep walks addresses and this is how everything else gets in.**
+    /// A device that answered a multicast question, or that was already in the
+    /// neighbour table, is a device — but it was found by a different route
+    /// and the list has to say so rather than quietly presenting it as a probe
+    /// that succeeded. So the evidence comes in with it, and where the address
+    /// is already on the list the two attestations are merged rather than one
+    /// of them winning: a television that answered both ARP and SSDP has two
+    /// reasons, and both are worth printing.
+    ///
+    /// Answers whether this was a device the sweep did not already have.
+    ///
+    /// The list stays sorted by address, which is the order [`sweep`] leaves it
+    /// in and the order the table reads in. Inserting in place rather than
+    /// re-sorting afterwards is what lets a caller admit hosts one at a time as
+    /// they are heard.
+    pub fn admit(&mut self, host: Found) -> bool {
+        match self
+            .found
+            .binary_search_by_key(&host.address, |f| f.address)
+        {
+            Ok(at) => {
+                let existing = &mut self.found[at];
+                for evidence in host.evidence {
+                    existing.attest(evidence);
+                }
+                // A hardware address from anywhere beats not having one, and a
+                // probe's answer beats a table's memory of one, so an address
+                // already known is never overwritten.
+                if existing.mac.is_none() {
+                    existing.mac = host.mac;
+                }
+                if existing.rtt.is_none() {
+                    existing.rtt = host.rtt;
+                }
+                false
+            }
+            Err(at) => {
+                self.found.insert(at, host);
+                true
+            }
+        }
+    }
+
+    /// Admits what the operating system already knew, **without saying so
+    /// about a device that answered for itself.**
+    ///
+    /// The neighbour table holds an entry for every device the sweep just
+    /// found, because the sweep is what put most of them there. Recording that
+    /// as evidence would print "already in this machine's neighbour table"
+    /// against nearly every row, where it adds nothing to "answered ARP" and
+    /// crowds out the reasons that do say something. The table earns its place
+    /// on the two rows where it is the *only* thing that knows.
+    ///
+    /// The hardware address is taken either way, and that is the other half of
+    /// why this is not simply skipped: a device found only by a multicast
+    /// answer has no MAC, and the table very often has one.
+    ///
+    /// Answers whether this was a device the sweep did not already have.
+    pub fn admit_neighbour(&mut self, address: IpAddr, mac: MacAddr) -> bool {
+        match self.found.binary_search_by_key(&address, |f| f.address) {
+            Ok(at) => {
+                let existing = &mut self.found[at];
+                if existing.mac.is_none() {
+                    existing.mac = Some(mac);
+                }
+                false
+            }
+            Err(at) => {
+                self.found.insert(at, Found::neighbour(address, mac));
+                true
+            }
+        }
+    }
+
+    /// Devices that never answered anything sent to their own address.
+    ///
+    /// The count the result line needs to stay honest: "fourteen devices" from
+    /// a sweep that probed 254 addresses and got eleven answers is a claim
+    /// about three devices that were heard rather than found, and the
+    /// difference is one the reader is entitled to.
+    pub fn heard(&self) -> usize {
+        self.found.iter().filter(|f| !f.was_probed()).count()
+    }
+
     /// Did this sweep look as hard as Muster knows how?
     ///
     /// The interface asks before presenting a count, because "no devices" from
@@ -662,7 +928,9 @@ fn probe_one<T: Transport>(
         }
 
         if evidence.is_empty() && opts.knock && caps.tcp {
-            for &port in KNOCK_PORTS {
+            // Two rounds, and the second is only reached by an address that
+            // answered nothing in the first: see [`KNOCK_HARDER`].
+            for &port in KNOCK_PORTS.iter().chain(KNOCK_HARDER) {
                 if !rate.wait_unless(cancel) {
                     break 'probes;
                 }
@@ -675,6 +943,14 @@ fn probe_one<T: Transport>(
                         break;
                     }
                     Outcome::NoAnswer => {}
+                }
+                // An open port proves the host too, and the first four are on
+                // everything. The second four are each a claim about what the
+                // device *is*, so they are all worth asking even after one has
+                // answered — a printer that opens 9100 is a printer, and a
+                // television that opens 7000 is a television.
+                if !evidence.is_empty() && port == *KNOCK_PORTS.last().expect("not empty") {
+                    break;
                 }
             }
         }
@@ -808,6 +1084,138 @@ mod tests {
         assert_eq!(s.found[0].address, ip("192.168.1.7"));
         assert_eq!(s.found[0].evidence, vec![Evidence::TcpRefused(443)]);
         assert_eq!(s.found[0].evidence[0].reason(), "port 443 refused");
+    }
+
+    /// The second round of the knock is for the devices that drop everything,
+    /// and it is only paid by an address that answered none of the first four.
+    #[test]
+    fn the_harder_knock_is_only_for_an_address_that_answered_nothing() {
+        let mut fake = Fake::new();
+        // One that refuses on the first port, one that opens the last of the
+        // first four, and one that says nothing at all.
+        fake.tcp
+            .insert(ip("192.168.1.1"), BTreeMap::from([(80, Outcome::Refused)]));
+        fake.tcp
+            .insert(ip("192.168.1.2"), BTreeMap::from([(445, Outcome::Open)]));
+
+        run("192.168.1.0/29", &fake, Options::default());
+
+        assert_eq!(fake.count("tcp 192.168.1.1:"), 1, "stopped at the refusal");
+        assert_eq!(
+            fake.count("tcp 192.168.1.2:"),
+            KNOCK_PORTS.len(),
+            "an open port in the first round ends the knock there"
+        );
+        assert_eq!(
+            fake.count("tcp 192.168.1.3:"),
+            KNOCK_PORTS.len() + KNOCK_HARDER.len(),
+            "and an address that answered nothing gets the second round"
+        );
+    }
+
+    /// A television that opens only 7000 is a device, and it was not one
+    /// before: the first four ports find nothing on it at all.
+    #[test]
+    fn a_device_that_only_opens_an_airplay_port_is_found() {
+        let mut fake = Fake::new();
+        fake.tcp
+            .insert(ip("192.168.1.9"), BTreeMap::from([(7000, Outcome::Open)]));
+
+        let s = run("192.168.1.0/28", &fake, Options::default());
+        assert_eq!(s.found.len(), 1);
+        assert_eq!(s.found[0].address, ip("192.168.1.9"));
+        assert_eq!(s.found[0].evidence, vec![Evidence::TcpOpen(7000)]);
+    }
+
+    /// A device the link answered for joins the list, in address order, and
+    /// says how it got there.
+    #[test]
+    fn a_host_that_only_announced_itself_is_admitted() {
+        let mut sweep = Sweep::default();
+        assert!(sweep.admit(Found::announced(ip("192.168.1.9"), Protocol::Ssdp)));
+        assert!(sweep.admit(Found::announced(ip("192.168.1.3"), Protocol::WsDiscovery)));
+
+        assert_eq!(
+            sweep.found.iter().map(|f| f.address).collect::<Vec<_>>(),
+            vec![ip("192.168.1.3"), ip("192.168.1.9")],
+            "the list stays in address order"
+        );
+        assert_eq!(
+            sweep.found[0].evidence[0].reason(),
+            "announced itself over WS-Discovery"
+        );
+        assert!(!sweep.found[0].was_probed());
+        assert_eq!(sweep.heard(), 2);
+    }
+
+    /// A device that answered both a probe and the link keeps both reasons,
+    /// and is one row.
+    #[test]
+    fn an_address_admitted_twice_gains_a_reason_rather_than_a_row() {
+        let mut sweep = Sweep::default();
+        sweep.found.push(Found {
+            address: ip("192.168.1.9"),
+            mac: None,
+            evidence: vec![Evidence::Ping],
+            rtt: Some(Duration::from_millis(3)),
+        });
+
+        assert!(!sweep.admit(Found::announced(ip("192.168.1.9"), Protocol::Mdns)));
+        assert_eq!(sweep.found.len(), 1);
+        assert_eq!(
+            sweep.found[0].evidence,
+            vec![Evidence::Ping, Evidence::Announced(Protocol::Mdns)]
+        );
+        // It answered a probe, so it is not one of the heard.
+        assert!(sweep.found[0].was_probed());
+        assert_eq!(sweep.heard(), 0);
+        // And the measurement it already had is not thrown away by an
+        // announcement, which measures nothing.
+        assert_eq!(sweep.found[0].rtt, Some(Duration::from_millis(3)));
+    }
+
+    /// The neighbour table finds a device that answered nothing, and stays
+    /// quiet about one that answered for itself — where it would only repeat
+    /// what ARP already said.
+    #[test]
+    fn the_neighbour_table_speaks_only_when_it_is_the_one_that_knows() {
+        let mac = MacAddr::new([0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+        let mut sweep = Sweep::default();
+        sweep.found.push(Found {
+            address: ip("192.168.1.9"),
+            mac: Some(mac),
+            evidence: vec![Evidence::Arp(mac)],
+            rtt: None,
+        });
+
+        assert!(!sweep.admit_neighbour(ip("192.168.1.9"), mac));
+        assert_eq!(
+            sweep.found[0].evidence,
+            vec![Evidence::Arp(mac)],
+            "it adds no reason to a device that answered for itself"
+        );
+
+        assert!(sweep.admit_neighbour(ip("192.168.1.4"), mac));
+        assert_eq!(sweep.found[0].address, ip("192.168.1.4"));
+        assert_eq!(sweep.found[0].evidence, vec![Evidence::Neighbour]);
+    }
+
+    /// A device found by a multicast answer has no hardware address, and the
+    /// neighbour table very often has one. That is the other half of why the
+    /// table is read even when it says nothing new about presence.
+    #[test]
+    fn the_neighbour_table_lends_a_hardware_address_without_taking_credit() {
+        let mac = MacAddr::new([0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]);
+        let mut sweep = Sweep::default();
+        sweep.admit(Found::announced(ip("192.168.1.9"), Protocol::Ssdp));
+        assert_eq!(sweep.found[0].mac, None);
+
+        assert!(!sweep.admit_neighbour(ip("192.168.1.9"), mac));
+        assert_eq!(sweep.found[0].mac, Some(mac));
+        assert_eq!(
+            sweep.found[0].evidence,
+            vec![Evidence::Announced(Protocol::Ssdp)]
+        );
     }
 
     /// And its mirror: silence is not a host.
@@ -1264,15 +1672,17 @@ mod tests {
             &|_, _| {},
         );
 
-        // Two addresses, each one ping and then four knocks. No ARP: this
-        // prefix is not on-link.
+        // Two addresses, each one ping and then both rounds of the knock,
+        // because neither answered anything. No ARP: this prefix is not
+        // on-link.
+        let knocks = (KNOCK_PORTS.len() + KNOCK_HARDER.len()) as u64;
         assert_eq!(fake.count("arp"), 0);
         assert_eq!(fake.count("ping"), 2);
-        assert_eq!(fake.count("tcp"), 8);
+        assert_eq!(fake.count("tcp") as u64, 2 * knocks);
         assert_eq!(
             reads.load(Ordering::SeqCst),
-            10,
-            "ten probes went out and ten were charged for"
+            2 + 2 * knocks,
+            "every probe that went out was charged for"
         );
     }
 

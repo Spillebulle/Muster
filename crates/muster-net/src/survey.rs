@@ -243,6 +243,58 @@ impl Survey {
             .filter(|n| n.state.is_evidence() && !n.mac.is_zero() && !n.mac.is_multicast())
     }
 
+    /// The resolver this machine uses, **and only where it is on this
+    /// machine's own link**.
+    ///
+    /// The condition is the whole point of the function, and it is
+    /// `CLAUDE.md`'s rule about somebody else's resolver applied to the one
+    /// question that would break it: [`crate::link`] asks for a `PTR` for every
+    /// address in the network being scanned, which is a map of the user's LAN.
+    /// Asked of the gateway that issued the leases, that map never leaves the
+    /// wire and tells the gateway nothing it did not write down itself. Asked
+    /// of `1.1.1.1`, or of a resolver down a VPN, it is the user's network
+    /// handed to a stranger.
+    ///
+    /// So the test is whether the resolver's address falls inside one of this
+    /// machine's own interface prefixes. A `None` here is a question not asked,
+    /// and the caller says so rather than quietly finding fewer devices.
+    pub fn local_resolver(&self) -> Option<IpAddr> {
+        let local: Vec<Prefix> = self
+            .interfaces
+            .iter()
+            .filter(|i| i.is_scannable())
+            .flat_map(Interface::v4_prefixes)
+            .collect();
+        self.resolvers
+            .iter()
+            .copied()
+            .find(|a| a.is_ipv4() && local.iter().any(|p| p.contains(*a)))
+    }
+
+    /// Devices the operating system already knew about inside one prefix.
+    ///
+    /// **The one discovery source that costs no packet at all.** The neighbour
+    /// table is what this machine learned the last time anything on it talked
+    /// to a device, and it was read at start-up and then used for nothing but a
+    /// line in `muster survey`. A device that was there five minutes ago and is
+    /// now asleep behind a firewall is in it, with its hardware address, and no
+    /// question Muster can ask will reach it.
+    ///
+    /// Weaker than an answer given just now, and the device list says so: it
+    /// comes in as [`crate::discover::Evidence::Neighbour`], which reads as
+    /// "already in this machine's neighbour table" rather than as a reply.
+    ///
+    /// **Bounded to the prefix being scanned**, which is what stops it
+    /// inventing rows. The table holds every neighbour on every interface —
+    /// including IPv6 link-local addresses for devices that are already on the
+    /// list under their IPv4 address, which would be one device drawn twice.
+    /// Scanning a prefix is asking about that prefix, and this answers the same
+    /// question from a different source.
+    pub fn known_in(&self, prefix: Prefix) -> impl Iterator<Item = &Neighbour> + '_ {
+        self.known_devices()
+            .filter(move |n| prefix.contains(n.address))
+    }
+
     /// Was this reading taken at all? The interface asks before saying that
     /// something is absent, so it can say "could not look" instead.
     pub fn has(&self, reading: Reading) -> bool {

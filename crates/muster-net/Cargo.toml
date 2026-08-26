@@ -9,6 +9,16 @@ repository.workspace = true
 [dependencies]
 log = { workspace = true }
 
+# The one thing `std` cannot do and this engine needs: `SO_REUSEADDR` set
+# *before* a bind. `listen.rs` shares port 5353 with the machine's own mDNS
+# responder and 1900 with its SSDP service, which is only possible with that
+# option, and `std::net::UdpSocket::bind` binds before anything can be set on
+# it. The alternative was two hundred lines of platform-specific `unsafe`
+# socket setup, of which only the half that runs on the developer's machine
+# could be tested. socket2 is the crate the ecosystem uses for exactly this,
+# and it pulls in nothing that is not already here.
+socket2 = { version = "0.6", features = ["all"] }
+
 # The OS readings on Linux: `getifaddrs` for the interface list, and the
 # netlink socket for routes and neighbours. Everything else on this platform is
 # `/proc` and `/etc`, which is plain file reading and needs no crate.

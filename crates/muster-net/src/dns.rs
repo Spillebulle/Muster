@@ -171,6 +171,38 @@ pub fn query_in_class(id: u16, name: &str, kind: u16, class: u16) -> Vec<u8> {
     out
 }
 
+/// Builds one query carrying several questions.
+///
+/// **mDNS allows this and it is what makes asking about a dozen service types
+/// affordable.** RFC 6762 permits many questions in one message, and a
+/// responder answers the ones it knows about and ignores the rest, so a list of
+/// service types costs one datagram on the link rather than one each. Ordinary
+/// unicast DNS does *not* allow it — a resolver answers the first question and
+/// most refuse outright — so this is for the multicast questions only, and the
+/// name says which.
+///
+/// The questions go out in the order given. A responder that answers only the
+/// first is why the caller sends the list in more than one datagram rather than
+/// all of it in one.
+pub fn multicast_query(id: u16, questions: &[(&str, u16)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(questions.len() * 24 + 12);
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(&0x0100u16.to_be_bytes());
+    out.extend_from_slice(&(questions.len() as u16).to_be_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+
+    for (name, kind) in questions {
+        // No name compression. A pointer would save a few bytes across a dozen
+        // questions that all end in `_tcp.local`, and a responder that mishandles
+        // a compressed question name answers nothing at all — which would look
+        // exactly like a device that is not there.
+        write_name(&mut out, name);
+        out.extend_from_slice(&kind.to_be_bytes());
+        out.extend_from_slice(&CLASS_IN.to_be_bytes());
+    }
+    out
+}
+
 /// The `in-addr.arpa` name for a reverse lookup: `192.168.0.1` becomes
 /// `1.0.168.192.in-addr.arpa`.
 pub fn reverse_name(addr: Ipv4Addr) -> String {

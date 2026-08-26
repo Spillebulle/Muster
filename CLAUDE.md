@@ -10,8 +10,8 @@ Windows and Linux, installable and self-updating.
 
 **Released and building out.** The survey, the sweep, identification by name
 and vendor, device-kind inference, the `connect()` port scan, DHCP discovery,
-SSDP and UPnP, the window, the text mode, the packaging and the updater are all
-built. The
+SSDP and UPnP, the link phase and the passive listen, the window, the text
+mode, the packaging and the updater are all built. The
 **privileged engine** is not: no raw transport, so no SYN scan, no ARP sweep,
 no passive fingerprinting and no LLDP or CDP. Neither is IPv6 sweeping.
 `README.md`'s "What is not there yet" is the user-facing list and is kept
@@ -110,8 +110,11 @@ is driven from a clock the test controls.
 
 ### The scan pipeline
 
-A scan is four phases with different shapes, and the mistake to avoid is running
-them all through one mechanism.
+A scan is five phases with different shapes, and the mistake to avoid is
+running them all through one mechanism. **Two of them do not walk addresses at
+all**, and that is the point of them: a sweep can only find what answers when it
+is asked, and the devices somebody is scanning to find are very often the ones
+that never do.
 
 1. **Enumerate.** Interfaces, addresses, prefixes, the routing table, the
    configured DNS servers and the DHCP lease. All of it read from the OS, no
@@ -122,10 +125,22 @@ them all through one mechanism.
    ICMP echo, plus the multicast discovery protocols below. Bounded by the
    prefix size, so a /24 is 254 addresses and a /16 needs a plan.
 3. **Port scan.** The stateless path, below. This is where the performance is.
-4. **Identify.** Per host, and only for hosts that answered: banner grabs, TLS
-   certificates, mDNS/SSDP/NetBIOS queries, fingerprinting. Hundreds of short
-   connections rather than millions of packets — a different shape from phase 3,
-   and it does not belong in phase 3's loop.
+4. **Ask the link** (`link.rs`). One datagram per question, put to the whole
+   network at once: the mDNS enumeration, the mDNS service types by name, an
+   SSDP search, a WS-Discovery probe, a broadcast NetBIOS node status, and a
+   reverse lookup per address to this network's own resolver. **It runs beside
+   the sweep rather than after it** — every question is one datagram and then a
+   wait on a socket, so a phase of its own would add its whole window for
+   nothing — and *it adds devices to the list*. That is the whole reason it is
+   a phase: an answer from an address the sweep missed is the most valuable
+   thing a scan can produce.
+5. **Listen** (`listen.rs`). Sits on 5353, 1900, 3702 and 137 for the length of
+   the scan and writes down who speaks. Sends nothing, except the one datagram
+   per port that the Windows firewall requires; see below. Also adds devices.
+6. **Identify.** Per host, and only for hosts on the list by then: banner grabs,
+   TLS certificates, unicast mDNS/SSDP/NetBIOS queries, fingerprinting. Hundreds
+   of short connections rather than millions of packets — a different shape from
+   phase 3, and it does not belong in phase 3's loop.
 
 **The port scan is stateless, in the masscan shape, and this is the whole
 performance argument.** One thread sends, one thread receives, and there is no
@@ -146,6 +161,21 @@ Rules that come with it:
   switch with storm control, and produces false negatives that look like an
   empty network. The limiter is a token bucket the caller sets, with an adaptive
   mode that backs off on loss, and there is a hard default well below line rate.
+- **The TCP knock's timeout is per platform, and it is not a preference.**
+  Linux returns `ECONNREFUSED` on the first RST; **Windows retransmits the SYN
+  first and only surfaces the refusal after about two seconds**. At the 400 ms
+  the two used to share, `Outcome::Refused` was unreachable on Windows and every
+  refusal became `NoAnswer` — the exact lie the receive-path rule below exists
+  to forbid. Measured on eighteen devices, seventeen of which refuse: eleven
+  proved at 400 ms, eighteen at 3000 ms. `TCP_MAXRT` looks like the cure and
+  destroys the evidence, turning the refusal into `WSAETIMEDOUT`. The cost is
+  paid in concurrency, never in elapsed time.
+- **The knock has two rounds and the second is for the devices that drop.**
+  Once a refusal is visible, port choice barely matters for anything that sends
+  a RST — it sends one on every port. It matters entirely for the minority that
+  drop everything, and there the only question that gets an answer is a port the
+  device is *listening* on. `KNOCK_HARDER` is chosen that way and is paid only
+  by an address that answered nothing at all.
 - **The receive path must not assume it sees a reply.** Absence of a reply is
   "filtered or dropped", never "closed"; a RST is "closed"; only a SYN-ACK is
   "open". Reporting an unanswered probe as a closed port is the most common lie
@@ -233,6 +263,37 @@ wearing a confident face.
   window from a single SYN-ACK give a coarse OS class for free and should be
   taken; nmap-grade active fingerprinting is a much larger probe set and a much
   larger claim. Label which one answered.
+- **A device that sends a datagram is a device, and it goes on the list.** This
+  is the rule the link phase and the listen exist for, and for a long time the
+  engine had it backwards: the multicast questions ran *inside*
+  `identify::many`, which is handed the addresses the sweep found, so an answer
+  from an address the sweep missed had nowhere to go and was silently dropped.
+  Those are the devices worth finding. `discover::Evidence::Announced` and
+  `Evidence::Neighbour` are how a row says it got there by a route other than a
+  probe, `Found::was_probed` is what the interface asks before presenting a
+  silence as a fact about the device, and `Sweep::heard` is what keeps the count
+  honest. **A name is not a device**: a reverse `PTR` proves only that a router
+  wrote something down once, so `link::Voice::spoke` keeps those out of the list
+  while still letting them name the devices found by other means.
+- **Listening is the only thing here that finds a device without sending it a
+  packet, and on Windows it does not work unless one packet is sent.** Windows
+  Firewall is stateful; unsolicited inbound multicast to a joined group matches
+  no flow and is dropped before the socket sees it, silently. Measured: nothing
+  sent, zero datagrams from zero sources; one datagram sent first, fifty-three
+  from four. So every watch sends one well-formed question **that matches
+  nothing** from its own bound port, and repeats it every twenty seconds. Get
+  this wrong and the feature works perfectly on Linux and returns an empty list
+  on Windows with no error anywhere.
+- **A question identifies its asker as well as an answer does.** Half the value
+  of the listen is other devices' *queries*: a phone searching for a Chromecast
+  has proved it exists. So an unparseable datagram on a watched port still puts
+  the address on the list — only the identity depends on reading it — and an
+  mDNS **query** is never harvested for services, because what a device is
+  looking for says nothing about what it is.
+- **The ports are shared, never taken, and nothing ever replies.** 5353 belongs
+  to the machine's own responder and 1900 to its SSDP service; `SO_REUSEADDR`
+  before the bind is what lets Muster sit beside them. This is the one thing
+  `std` cannot do, and the reason `socket2` is a dependency.
 - **A question asked of the link is answered by devices that ignore the same
   question asked of them.** This is the single largest thing identification
   learned from a real network: a unicast SSDP `M-SEARCH` found one device out
@@ -318,6 +379,19 @@ wearing a confident face.
   are in `VENDORS` and the rest cannot be named at all until one of them
   answers something. Reading the model out of their hostname is the thing that
   was tried and refused; see the rule above.
+- **An mDNS reply names the device it is about, which is not always the sender.**
+  A Bonjour sleep proxy — which is what an Apple TV or a HomePod quietly becomes
+  — answers on behalf of machines that have gone to sleep, so attributing by
+  sender put a sleeping laptop's services on the television's row and left the
+  laptop off the list. `identify::subject` reads the reply's own address
+  records, with the sender winning whenever it is named in them, which is what
+  stops a dual-stacked device splitting into two rows. It is also free
+  discovery: the address in a proxied record is usually one nothing swept.
+- **The enumeration query is not enough, and asking by name is one datagram.**
+  RFC 6763 §9 requires a responder to register itself in
+  `_services._dns-sd._udp`, and a great many embedded ones — every ESP-based
+  smart plug — simply do not. `link::NAMED_SERVICES` asks for the types
+  outright, which reaches a whole class of device that answers nothing else.
 - **Identity is a merge of independent sources with a priority, not a race.** A
   UPnP model string beats an OUI vendor; a `_device-info` record beats a TTL
   guess. Where sources disagree, keep both — a device answering as two things is
@@ -573,6 +647,15 @@ lands, `CAP_NET_ADMIN` joins them and the README's first "not there yet" entry
 goes.
 
 Cheap and unprivileged, so worth doing before that:
+
+- **Continuous monitoring is now the nearest big thing**, and `listen.rs` is
+  most of it. The listen runs for the length of a scan and stops; a listen that
+  kept running is what makes "a new device appeared on your network" possible.
+  The measurement that argues for it: on one real network eight addresses spoke
+  in 150 seconds and only four in the first 30, so the yield keeps climbing well
+  past any window a scan can afford to wait for. Adding ports 67 and 68 to the
+  watch list would give an address *and* a hardware address for every device
+  that joins or renews a lease, which is the arrival event itself.
 
 - **The UPnP description.** SSDP itself is built and its headers are read; the
   `LOCATION` they carry points at an XML document with the manufacturer, the
