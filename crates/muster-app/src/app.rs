@@ -799,6 +799,25 @@ const ARROW_HALF: f32 = 26.0;
 /// The chevron's box.
 const CHEVRON: f32 = 12.0;
 
+/// How wide the chevron's *ink* is, as against the box it is drawn in.
+///
+/// The arms reach `CHEVRON * 0.34` either side of the centre, so the mark is
+/// barely two thirds of its box. Laying a menu button out against the box
+/// rather than against this is what put the chevron on top of the label: the
+/// width reserved twelve pixels after the word and the glyph floated in the
+/// middle of them, leaving under two pixels of daylight where the eye reads a
+/// gap. Everything in [`menu_button`] measures the ink, so the padding either
+/// side of it is the padding it looks like.
+const CHEVRON_INK: f32 = CHEVRON * 0.68;
+
+/// The gap between a menu button's label and its chevron.
+///
+/// One step of the spacing scale, and smaller than the [`metrics::S3`] either
+/// end of the button: a chevron is part of the label's claim about what the
+/// control does, so it has to sit nearer the word than the word sits to the
+/// button's edge. Equal gaps would read as two things side by side.
+const MENU_GAP: f32 = metrics::S2;
+
 /// What a scan asks, hung off the arrow.
 ///
 /// A §7.17 popover. Everything in it writes [`crate::prefs::Prefs`] and is saved
@@ -1320,9 +1339,14 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(metrics::S2);
-            if let Some(mark_all) =
-                table_header(ui, p, &mut app.sort, Marks::of(marked_here, shown.len()))
-            {
+            let before = app.prefs.columns;
+            if let Some(mark_all) = table_header(
+                ui,
+                p,
+                &mut app.sort,
+                Marks::of(marked_here, shown.len()),
+                &mut app.prefs.columns,
+            ) {
                 for i in &shown {
                     let address = devices[*i].address;
                     if mark_all {
@@ -1332,6 +1356,14 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
                     }
                 }
             }
+            // A dragged column is a setting like any other, and it is written
+            // the moment it stops changing rather than on every frame of a
+            // drag: the file would otherwise be rewritten sixty times a second
+            // for as long as somebody held the edge.
+            if app.prefs.columns != before && !ui.ctx().input(|i| i.pointer.any_down()) {
+                crate::prefs::save(&app.prefs);
+            }
+            let widths = app.prefs.columns;
             let mode = app.mode;
             for i in &shown {
                 let host = &devices[*i];
@@ -1358,6 +1390,7 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
                         selected,
                         marked,
                         ping,
+                        widths,
                     },
                 );
                 if row.marked {
@@ -1459,6 +1492,205 @@ const MARK_TEXTURE: u32 = 64;
 /// up under the one in the header.
 const COL_MARK: f32 = 24.0;
 
+/// How wide the columns a reader can drag are.
+///
+/// **The mark and the icon are not in here, and "Made by" is not either.** The
+/// first two are boxes rather than columns — a 16 px checkbox in an 18 px hit
+/// area, and an icon drawn at [`metrics::ICON`] — so a width for them would be
+/// a width for nothing to fill. The last is the elastic one that takes whatever
+/// is left, which is what stops a resize leaving a strip of empty table down the
+/// right-hand side.
+///
+/// Widths are in points before the interface scale, the same as every other
+/// figure in this file, so a table dragged into shape at one scale is the same
+/// table at another.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Widths {
+    pub address: f32,
+    pub name: f32,
+    pub mac: f32,
+    pub time: f32,
+    pub ping: f32,
+    pub serves: f32,
+    pub ports: f32,
+}
+
+impl Default for Widths {
+    fn default() -> Self {
+        Self {
+            address: COL_ADDRESS,
+            name: COL_NAME,
+            mac: COL_MAC,
+            time: COL_TIME,
+            ping: COL_PING,
+            serves: COL_SERVES,
+            ports: COL_PORTS,
+        }
+    }
+}
+
+impl Widths {
+    /// The narrowest a column may be dragged.
+    ///
+    /// Not zero, and not "as narrow as you like": a column dragged shut is a
+    /// column whose heading cannot be read, and the reader has no way back to
+    /// it except by finding an edge that is no longer visibly there. Wide
+    /// enough for the shortest heading in the table and its sort caret.
+    pub const NARROWEST: f32 = 46.0;
+
+    /// The widest. Generous, and there only so that a dragged edge cannot be
+    /// thrown far enough to push every other column off the window.
+    pub const WIDEST: f32 = 520.0;
+
+    /// What "Made by" is never squeezed below. It is the elastic column, so
+    /// every other column's ceiling is whatever leaves this much.
+    pub const VENDOR_LEAST: f32 = 90.0;
+
+    /// The width this column is drawn at, for the ones that have one.
+    fn of(self, column: Column) -> f32 {
+        match column {
+            Column::Address => self.address,
+            Column::Name => self.name,
+            Column::Mac => self.mac,
+            Column::Time => self.time,
+            Column::Ping => self.ping,
+            Column::Serves => self.serves,
+            Column::Ports => self.ports,
+            // Not draggable: see the note on the type.
+            Column::Kind => COL_KIND,
+            Column::Vendor => 0.0,
+        }
+    }
+
+    /// The field a drag on this column's edge moves, where there is one.
+    fn slot(&mut self, column: Column) -> Option<&mut f32> {
+        Some(match column {
+            Column::Address => &mut self.address,
+            Column::Name => &mut self.name,
+            Column::Mac => &mut self.mac,
+            Column::Time => &mut self.time,
+            Column::Ping => &mut self.ping,
+            Column::Serves => &mut self.serves,
+            Column::Ports => &mut self.ports,
+            Column::Kind | Column::Vendor => return None,
+        })
+    }
+
+    /// Every draggable column added up.
+    fn total(self) -> f32 {
+        self.address + self.name + self.mac + self.time + self.ping + self.serves + self.ports
+    }
+
+    /// Reads the settings file's form: seven figures, comma separated.
+    ///
+    /// **Anything wrong gives the defaults rather than a refusal**, which is
+    /// this file's rule everywhere. A table is a thing somebody can put back by
+    /// dragging it; a settings file that will not load is not.
+    pub fn parse(text: &str) -> Self {
+        let figures: Vec<f32> = text
+            .split(',')
+            .filter_map(|f| f.trim().parse::<f32>().ok())
+            .collect();
+        let [address, name, mac, time, ping, serves, ports] = figures[..] else {
+            return Self::default();
+        };
+        Self {
+            address,
+            name,
+            mac,
+            time,
+            ping,
+            serves,
+            ports,
+        }
+        .sane()
+    }
+
+    /// The same seven figures, for writing back.
+    pub fn render(self) -> String {
+        [
+            self.address,
+            self.name,
+            self.mac,
+            self.time,
+            self.ping,
+            self.serves,
+            self.ports,
+        ]
+        .map(|w| format!("{}", w.round()))
+        .join(",")
+    }
+
+    /// Every width inside its bounds.
+    ///
+    /// Applied on the way in as well as on the way out, so a hand-edited file
+    /// or one written by a later version cannot produce a table with a column
+    /// nobody can find.
+    pub fn sane(mut self) -> Self {
+        for column in Column::ALL {
+            if let Some(width) = self.slot(column)
+                && !width.is_finite()
+            {
+                *width = Widths::default().of(column);
+            }
+        }
+        for column in Column::ALL {
+            if let Some(width) = self.slot(column) {
+                *width = width.clamp(Self::NARROWEST, Self::WIDEST);
+            }
+        }
+        self
+    }
+}
+
+/// One line of text in a cell, cut with an ellipsis where it will not fit.
+///
+/// **A column the reader can drag has no promise that its contents fit**, and
+/// the two ways of breaking that promise are not equally honest. Text painted
+/// unclipped runs on under the next column's figures and makes both unreadable.
+/// Text merely clipped stops mid-letter, which reads as a name that happens to
+/// end oddly rather than as a name that has been cut. The ellipsis is the same
+/// rule the ports and the badges follow with their `+n`: what does not fit is
+/// *said* not to fit, never quietly dropped.
+///
+/// The whole value is still in the row's tooltip, which is where somebody goes
+/// when the cut one is not enough.
+fn cell_text(
+    painter: &egui::Painter,
+    at: egui::Pos2,
+    align: egui::Align2,
+    text: &str,
+    font: FontId,
+    ink: Color32,
+    room: f32,
+) {
+    if text.is_empty() || room <= 0.0 {
+        return;
+    }
+    let mut job =
+        egui::text::LayoutJob::single_section(text.to_owned(), egui::TextFormat::simple(font, ink));
+    job.wrap = egui::text::TextWrapping {
+        max_width: room,
+        max_rows: 1,
+        // Break inside a word rather than dropping the word: an address and a
+        // hardware address have no spaces in them at all, so a break only at
+        // word boundaries would leave those two columns empty rather than cut.
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = painter.layout_job(job);
+    let anchored = align.anchor_size(at, galley.size());
+    painter.galley(anchored.min, galley, ink);
+}
+
+/// How wide the band is that a reader grabs to resize a column.
+///
+/// Straddles the boundary, so half of it is the last pixels of one column and
+/// half the first of the next. Wider than the hairline it sits on, because a
+/// one-pixel target is a target nobody hits: §7 asks for a hit area rather than
+/// an ink area everywhere else, and an edge is no different.
+const GRIP: f32 = 8.0;
+
 const COL_ADDRESS: f32 = 116.0;
 const COL_NAME: f32 = 174.0;
 const COL_MAC: f32 = 124.0;
@@ -1505,6 +1737,42 @@ pub enum Column {
     /// where one has been run.
     Ports,
     Vendor,
+}
+
+impl Column {
+    /// Every column, in the order the header and the row both walk them.
+    ///
+    /// **One list, used by both**, because the two must agree: a header that
+    /// walks its columns in one order and a row that walks them in another
+    /// draws a table whose headings sit above the wrong figures, and nothing
+    /// about it looks wrong until you read it.
+    pub const ALL: [Column; 9] = [
+        Column::Kind,
+        Column::Address,
+        Column::Name,
+        Column::Mac,
+        Column::Time,
+        Column::Ping,
+        Column::Serves,
+        Column::Ports,
+        Column::Vendor,
+    ];
+
+    /// The heading over it. Empty for the icon, which is a picture with no room
+    /// for a word and whose meaning is in each row's tooltip.
+    pub const fn heading(self) -> &'static str {
+        match self {
+            Self::Kind => "",
+            Self::Address => "Address",
+            Self::Name => "Name",
+            Self::Mac => "Hardware",
+            Self::Time => "Time",
+            Self::Ping => "Ping",
+            Self::Serves => "Serves",
+            Self::Ports => "Ports",
+            Self::Vendor => "Made by",
+        }
+    }
 }
 
 /// A column, and which way.
@@ -1672,11 +1940,28 @@ fn address_key(address: std::net::IpAddr) -> u128 {
 /// §7.12's rule and the reason it reads as "one of these" rather than as a
 /// heading with a decoration.
 ///
+/// **Every boundary between two columns is a handle.** Dragging one moves that
+/// column's right edge and nothing else: the columns to its right slide along
+/// and "Made by" takes up or gives back the difference, so the table is never
+/// left with a strip of nothing down its side. A boundary cannot be dragged
+/// past the point where "Made by" would stop being worth having, and
+/// double-clicking one puts that column back to the width it shipped with.
+///
+/// The grip band is taken out of the heading's own click target rather than
+/// laid over it, so the edge resizes and the middle sorts, and neither has to
+/// win a fight with the other.
+///
 /// Returns what the box was asked to do, where it was pressed: [`Some(true)`]
 /// to mark everything shown and [`Some(false)`] to clear it. The caller owns
 /// the marks and knows which rows the filter is showing; this only draws the
 /// three states and reports the press.
-fn table_header(ui: &mut egui::Ui, p: Palette, sort: &mut Sort, marks: Marks) -> Option<bool> {
+fn table_header(
+    ui: &mut egui::Ui,
+    p: Palette,
+    sort: &mut Sort,
+    marks: Marks,
+    widths: &mut Widths,
+) -> Option<bool> {
     // §7.16: a table header is a 26 px row in `text_dim`. It was 20 px in
     // `placeholder`, which is the eyebrow's colour and a different rank.
     let (rect, _) =
@@ -1702,19 +1987,26 @@ fn table_header(ui: &mut egui::Ui, p: Palette, sort: &mut Sort, marks: Marks) ->
     x += COL_MARK;
 
     let last = rect.right() - metrics::PAD_PANEL;
-    for (label, width, column) in [
-        ("", COL_KIND, Column::Kind),
-        ("Address", COL_ADDRESS, Column::Address),
-        ("Name", COL_NAME, Column::Name),
-        ("Hardware", COL_MAC, Column::Mac),
-        ("Time", COL_TIME, Column::Time),
-        ("Ping", COL_PING, Column::Ping),
-        ("Serves", COL_SERVES, Column::Serves),
-        ("Ports", COL_PORTS, Column::Ports),
-        ("Made by", 0.0, Column::Vendor),
-    ] {
-        let span = if width > 0.0 { width } else { last - x };
-        let cell = Rect::from_min_max(pos2(x, rect.top()), pos2(x + span, rect.bottom()));
+    // What a single column may grow to before "Made by" stops being worth
+    // having. Measured once, against the widths as they are now, so a drag is
+    // bounded by the window rather than by a figure guessed in advance.
+    let room = last - x - COL_KIND - Widths::VENDOR_LEAST;
+    for column in Column::ALL {
+        let label = column.heading();
+        let span = match column {
+            Column::Vendor => last - x,
+            other => widths.of(other),
+        };
+        // The grip band belongs to the edge, so it is taken out of the
+        // heading's click target rather than laid over it. Only where there is
+        // an edge to drag: the icon's width is fixed and the last column has no
+        // right-hand edge of its own.
+        let draggable = widths.slot(column).is_some();
+        let grip = if draggable { GRIP / 2.0 } else { 0.0 };
+        let cell = Rect::from_min_max(
+            pos2(x, rect.top()),
+            pos2((x + span - grip).max(x), rect.bottom()),
+        );
         let response = ui.interact(
             cell,
             ui.id().with(("sort", label, column as usize)),
@@ -1756,6 +2048,52 @@ fn table_header(ui: &mut egui::Ui, p: Palette, sort: &mut Sort, marks: Marks) ->
         }
         if response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
+        if draggable {
+            let edge = x + span;
+            let band = Rect::from_min_max(
+                pos2(edge - GRIP / 2.0, rect.top()),
+                pos2(edge + GRIP / 2.0, rect.bottom()),
+            );
+            let handle = ui.interact(
+                band,
+                ui.id().with(("grip", column as usize)),
+                Sense::click_and_drag(),
+            );
+            if handle.hovered() || handle.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            // The edge shows itself while it is being used, and only then: a
+            // table with a line down every boundary is a spreadsheet, and §7.16
+            // does not want one.
+            if handle.hovered() || handle.dragged() {
+                ui.painter().rect_filled(
+                    Rect::from_min_max(
+                        pos2(edge - metrics::HAIRLINE, rect.top() + metrics::S1),
+                        pos2(edge, rect.bottom() - metrics::S1),
+                    ),
+                    0.0,
+                    p.accent,
+                );
+            }
+            // Everything below moves one field, so the borrow is taken once and
+            // the ceiling worked out before it.
+            let others = widths.total() - widths.of(column);
+            let ceiling = (room - others).clamp(Widths::NARROWEST, Widths::WIDEST);
+            if let Some(width) = widths.slot(column) {
+                if handle.double_clicked() {
+                    // Back to what it shipped with, which is the way out of a
+                    // column dragged somewhere unhelpful.
+                    *width = Widths::default().of(column);
+                } else if handle.dragged() {
+                    *width += handle.drag_delta().x;
+                }
+                *width = width.clamp(Widths::NARROWEST, ceiling);
+            }
+            if handle.hovered() && !handle.dragged() {
+                handle.on_hover_text("Drag to resize. Double click to put it back.");
+            }
         }
         x += span;
     }
@@ -1960,6 +2298,7 @@ fn device_row(
         selected,
         marked,
         ping,
+        widths,
     } = row;
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), metrics::ROW), Sense::click());
@@ -2024,51 +2363,67 @@ fn device_row(
     );
     x += COL_KIND;
 
-    ui.painter().text(
+    // Every text cell from here down is cut to its column with an ellipsis
+    // rather than painted and hoped for: see [`cell_text`]. The two that are
+    // not text — the badges and the ports — take a rectangle and count what
+    // they cannot fit, which is the same rule by another means.
+    let cell = |x: f32, width: f32| {
+        Rect::from_min_max(pos2(x, rect.top()), pos2(x + width, rect.bottom()))
+    };
+
+    cell_text(
+        ui.painter(),
         pos2(x, y),
         egui::Align2::LEFT_CENTER,
-        host.address.to_string(),
+        &host.address.to_string(),
         figure.clone(),
         p.text_strong,
+        widths.address - metrics::S2,
     );
-    x += COL_ADDRESS;
+    x += widths.address;
 
     let name = named
         .and_then(Identity::best)
         .map(|n| n.value.clone())
         .unwrap_or_default();
-    ui.painter().text(
+    cell_text(
+        ui.painter(),
         pos2(x, y),
         egui::Align2::LEFT_CENTER,
         &name,
         FontId::proportional(text::CONTROL),
         p.text,
+        widths.name - metrics::S2,
     );
-    x += COL_NAME;
+    x += widths.name;
 
     let mac = host.mac.map(|m| m.to_string()).unwrap_or_default();
-    ui.painter().text(
+    cell_text(
+        ui.painter(),
         pos2(x, y),
         egui::Align2::LEFT_CENTER,
         &mac,
         figure.clone(),
         p.text_muted,
+        widths.mac - metrics::S2,
     );
-    x += COL_MAC;
+    x += widths.mac;
 
     let rtt = match host.rtt {
         Some(t) if t.as_millis() > 0 => format!("{} ms", t.as_millis()),
         Some(_) => "<1 ms".into(),
         None => String::new(),
     };
-    ui.painter().text(
-        pos2(x + COL_TIME - metrics::S2, y),
+    cell_text(
+        ui.painter(),
+        pos2(x + widths.time - metrics::S2, y),
         egui::Align2::RIGHT_CENTER,
         &rtt,
         figure,
         p.text_dim,
+        widths.time - metrics::S2,
     );
-    x += COL_TIME;
+    x += widths.time;
 
     // The last re-check, which is blank until one has been asked for. Amber
     // where the probe could not be sent, because that is a fact about this
@@ -2085,35 +2440,27 @@ fn device_row(
         },
         PingCell::Never => (String::new(), p.text_dim),
     };
-    ui.painter().text(
-        pos2(x + COL_PING - metrics::S2, y),
+    cell_text(
+        ui.painter(),
+        pos2(x + widths.ping - metrics::S2, y),
         egui::Align2::RIGHT_CENTER,
         &ping_text,
         FontId::monospace(text::TINY),
         ping_ink,
+        widths.ping - metrics::S2,
     );
-    x += COL_PING;
+    x += widths.ping;
 
     // What this device serves the network, as against what it is. The icon
     // says the one and these say the other; a router that is also the name
     // server shows both, which no single label could.
     let roles = named.map(Identity::roles).unwrap_or_default();
     let open = open_ports(host);
-    badges(
-        ui,
-        p,
-        Rect::from_min_max(pos2(x, rect.top()), pos2(x + COL_SERVES, rect.bottom())),
-        &roles,
-    );
-    x += COL_SERVES;
+    badges(ui, p, cell(x, widths.serves), &roles);
+    x += widths.serves;
 
-    ports_cell(
-        ui,
-        p,
-        Rect::from_min_max(pos2(x, rect.top()), pos2(x + COL_PORTS, rect.bottom())),
-        &open,
-    );
-    x += COL_PORTS;
+    ports_cell(ui, p, cell(x, widths.ports), &open);
+    x += widths.ports;
 
     // The vendor, and the one thing that is *not* a vendor: a randomised
     // address is reported as randomised rather than as an unknown maker, which
@@ -2126,12 +2473,14 @@ fn device_row(
         Some(o) => (o.label().to_string(), p.text_muted),
         None => (String::new(), p.text_muted),
     };
-    ui.painter().text(
+    cell_text(
+        ui.painter(),
         pos2(x, y),
         egui::Align2::LEFT_CENTER,
         &vendor,
         FontId::proportional(text::SMALL),
         colour,
+        rect.right() - metrics::PAD_PANEL - x,
     );
 
     hairline_across(ui, p, rect.bottom());
@@ -2200,6 +2549,9 @@ struct RowInput<'a> {
     /// It is marked for the toolbar's menus.
     marked: bool,
     ping: PingCell<'a>,
+    /// The columns as the reader has dragged them. The header owns these and
+    /// the row is told, so the two cannot lay the table out differently.
+    widths: Widths,
 }
 
 /// What a device row was asked to do.
@@ -3951,7 +4303,7 @@ fn menu_button(ui: &mut egui::Ui, p: Palette, label: &str, enabled: bool) -> egu
     let galley = ui
         .painter()
         .layout_no_wrap(label.to_string(), font.clone(), p.text);
-    let width = galley.size().x + metrics::S3 * 2.0 + CHEVRON;
+    let width = galley.size().x + metrics::S3 * 2.0 + MENU_GAP + CHEVRON_INK;
     let (rect, response) = ui.allocate_exact_size(
         vec2(width, metrics::BUTTON),
         if enabled {
@@ -3977,7 +4329,10 @@ fn menu_button(ui: &mut egui::Ui, p: Palette, label: &str, enabled: bool) -> egu
         dim(p.text),
     );
 
-    let c = pos2(rect.right() - metrics::S3 - CHEVRON / 2.0, rect.center().y);
+    let c = pos2(
+        rect.right() - metrics::S3 - CHEVRON_INK / 2.0,
+        rect.center().y,
+    );
     let (w, h) = (CHEVRON * 0.34, CHEVRON * 0.18);
     let ink = if enabled && response.hovered() {
         p.text_strong
@@ -4346,4 +4701,85 @@ mod tests {
     /// What "Made by" needs to be worth having: enough for the longest vendor
     /// name a real network has turned up, which is about twenty characters.
     const VENDOR_ROOM: f32 = 160.0;
+
+    /// The two lists the header and the row walk have to hold the same columns
+    /// in the same order, or the headings sit above the wrong figures and
+    /// nothing looks wrong until somebody reads it.
+    #[test]
+    fn every_column_is_walked_once() {
+        let mut seen = Column::ALL.to_vec();
+        seen.sort_by_key(|c| *c as usize);
+        seen.dedup();
+        assert_eq!(seen.len(), Column::ALL.len(), "a column appears twice");
+        assert_eq!(*Column::ALL.last().expect("not empty"), Column::Vendor);
+    }
+
+    /// Only the columns with something to size are draggable. The mark and the
+    /// icon are boxes, and "Made by" takes whatever is left.
+    #[test]
+    fn the_fixed_columns_have_no_handle() {
+        let mut widths = Widths::default();
+        assert!(widths.slot(Column::Kind).is_none());
+        assert!(widths.slot(Column::Vendor).is_none());
+        for column in [Column::Address, Column::Name, Column::Mac] {
+            assert!(widths.slot(column).is_some(), "{column:?}");
+        }
+    }
+
+    /// A width out of bounds is brought back rather than refused, which is the
+    /// settings file's rule for every other figure.
+    #[test]
+    fn a_width_is_clamped_rather_than_rejected() {
+        let wild = Widths {
+            address: 4.0,
+            name: 9_000.0,
+            mac: f32::NAN,
+            ..Default::default()
+        }
+        .sane();
+        assert_eq!(wild.address, Widths::NARROWEST);
+        assert_eq!(wild.name, Widths::WIDEST);
+        assert_eq!(
+            wild.mac, COL_MAC,
+            "a figure that is not one gives the default"
+        );
+    }
+
+    /// The settings file's form, both ways.
+    #[test]
+    fn widths_survive_a_round_trip() {
+        let dragged = Widths {
+            address: 140.0,
+            ports: 200.0,
+            ..Default::default()
+        };
+        assert_eq!(Widths::parse(&dragged.render()), dragged);
+    }
+
+    /// Anything the file cannot offer gives the table it shipped with. A
+    /// settings file that will not load is worse than a table somebody has to
+    /// drag again.
+    #[test]
+    fn a_broken_columns_line_gives_the_default_table() {
+        for line in [
+            "",
+            "116,174",
+            "one,two,three,four,five,six,seven",
+            "1,2,3,4,5,6,7,8",
+        ] {
+            assert_eq!(Widths::parse(line), Widths::default(), "{line:?}");
+        }
+    }
+
+    /// The whole table still fits the narrowest window the application opens
+    /// at, with room for the elastic column.
+    #[test]
+    fn the_default_table_fits_the_smallest_window() {
+        let fixed = COL_MARK + COL_KIND + Widths::default().total();
+        assert!(
+            fixed + Widths::VENDOR_LEAST <= crate::WINDOW[0],
+            "the columns want {fixed} and the window is {}",
+            crate::WINDOW[0]
+        );
+    }
 }

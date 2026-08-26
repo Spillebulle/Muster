@@ -103,6 +103,12 @@ pub struct Prefs {
     pub warn_off_link: bool,
     /// The port list. Empty means the built-in common list.
     pub port_list: String,
+    /// How wide the device table's draggable columns are.
+    ///
+    /// Kept here rather than in the window's own state because a table somebody
+    /// has dragged into shape is a preference, and losing it on every restart
+    /// would make the dragging not worth doing.
+    pub columns: crate::app::Widths,
 
     /// Ask devices what they are: mDNS, SSDP, NetBIOS, LLMNR, the model.
     ///
@@ -175,6 +181,7 @@ impl Default for Prefs {
             port_rate: 400,
             warn_off_link: true,
             port_list: String::new(),
+            columns: crate::app::Widths::default(),
             identify: true,
             scan_dhcp: false,
             scan_dns: true,
@@ -260,6 +267,10 @@ pub fn parse(text: &str) -> Prefs {
             "scan_ssh" => prefs.scan_ssh = flag,
             "scan_reverse" => prefs.scan_reverse = flag,
             "scan_listen" => prefs.scan_listen = flag,
+            // Not a flag, and the only line here that is a list of figures.
+            // `Widths::parse` gives the defaults back for anything it cannot
+            // read, which is this file's rule for every other value too.
+            "columns" => prefs.columns = crate::app::Widths::parse(value),
             // A file written by a newer Muster. Ignored rather than refused:
             // the alternative is a downgrade wiping settings it did not
             // understand.
@@ -292,6 +303,11 @@ pub fn render(prefs: &Prefs) -> String {
     out.push_str(&format!("scan_ssh = {}\n", prefs.scan_ssh));
     out.push_str(&format!("scan_reverse = {}\n", prefs.scan_reverse));
     out.push_str(&format!("scan_listen = {}\n", prefs.scan_listen));
+    out.push_str(&format!(
+        "columns = {}
+",
+        prefs.columns.render()
+    ));
     if !prefs.port_list.is_empty() {
         out.push_str(&format!("port_list = {}\n", prefs.port_list));
     }
@@ -352,6 +368,10 @@ mod tests {
             scan_ssh: true,
             scan_reverse: false,
             scan_listen: false,
+            columns: crate::app::Widths {
+                address: 90.0,
+                ..Default::default()
+            },
         };
         assert_eq!(parse(&render(&prefs)), prefs);
     }
