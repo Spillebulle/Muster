@@ -464,6 +464,19 @@ Two things the design language decides for this application specifically:
   available and takes effect at the next packet rather than at the end of a
   phase.
 
+- **A logo is not a symbol, and it is drawn as itself.** The one icon in
+  `icons.rs` that is not Lucide's is GitHub's mark, filled, from Simple Icons,
+  the same silhouette Tally and HomeLab put beside their own source links: a
+  symbol means what its shape shows and can be redrawn in any hand, while a
+  logo means one company and only the known shape says so. Lucide's outlined
+  `github` was the other answer and it was wrong on screen twice over — an
+  outline of a filled logo, and mangled besides, because the path data is
+  written in the spelling (`-5.5.08`) that the number lexer used to read as one
+  token. Filling a mark needs a mesh: egui fans a closed path from its first
+  point, which is right for a rounded rectangle and paints the notches shut on
+  anything else, so `icons::triangulate` ear clips it and the test is that the
+  triangles cover the outline's own area.
+
 Umber's `crates/umber-app/src/theme.rs` is the reference implementation of the
 token table. Port it rather than re-deriving it, and keep the size table
 identical — the point of the numbers is that they are the same in every app.

@@ -7,6 +7,10 @@
 //! character and updated by pasting a new line over an old one. Nothing here
 //! interprets or improves them.
 //!
+//! What it parses is SVG's path grammar rather than anything Lucide's own, so
+//! the one mark in that set which is not Lucide's — GitHub's, from Simple
+//! Icons — comes through the same door.
+//!
 //! ## Why the geometry rather than the file
 //!
 //! Muster draws its chrome rather than typing it, for the reason
@@ -404,23 +408,37 @@ impl<'a> Lexer<'a> {
     /// The next number, or zero where there is none. A malformed path is
     /// caught by the test in [`crate::icons`] rather than by a panic in front
     /// of somebody.
+    ///
+    /// **A second decimal point ends the number before it**, which is the other
+    /// half of the rule the sign follows: `-5.5.08` is two numbers, and the
+    /// separator is the point that could not belong to the first. Read
+    /// greedily it is one token, `-5.5.08` parses as nothing, and the zero that
+    /// stands in for it lands a curve's control point on the origin — which is
+    /// exactly what the GitHub mark used to draw, an arm flung out of the box,
+    /// while every icon whose numbers happened to be spelled with a leading
+    /// digit came out perfect.
     fn number(&mut self) -> f32 {
         self.skip();
         let mut end = 0;
+        let mut point = false;
+        let mut exponent = false;
         for (index, c) in self.rest.char_indices() {
             let leading_sign = (c == '-' || c == '+') && index == 0;
             let exponent_sign = (c == '-' || c == '+') && self.rest[..index].ends_with(['e', 'E']);
-            if c.is_ascii_digit()
-                || c == '.'
-                || c == 'e'
-                || c == 'E'
-                || leading_sign
-                || exponent_sign
-            {
-                end = index + c.len_utf8();
-            } else {
+            let takes = match c {
+                '0'..='9' => true,
+                // An exponent has no fraction, so a point after one ends the
+                // number the same way a second point does.
+                '.' => !point && !exponent,
+                'e' | 'E' => !exponent && index > 0,
+                _ => leading_sign || exponent_sign,
+            };
+            if !takes {
                 break;
             }
+            point |= c == '.';
+            exponent |= c == 'e' || c == 'E';
+            end = index + c.len_utf8();
         }
         let (number, rest) = self.rest.split_at(end);
         self.rest = rest;
@@ -439,6 +457,27 @@ mod tests {
         assert!((lexer.number() - 5.66).abs() < 0.001);
         assert!((lexer.number() + 5.66).abs() < 0.001);
         assert!((lexer.number() - 100.0).abs() < 0.001);
+    }
+
+    /// A number list where a second point does the separating.
+    ///
+    /// Simple Icons writes the GitHub mark this way throughout, and read
+    /// greedily every one of these is a token that parses as nothing.
+    #[test]
+    fn a_second_point_ends_the_number_before_it() {
+        let mut lexer = Lexer::new("6-5.5.08-1.25 .5.5");
+        for want in [6.0, -5.5, 0.08, -1.25, 0.5, 0.5] {
+            let got = lexer.number();
+            assert!((got - want).abs() < 0.001, "wanted {want}, got {got}");
+        }
+    }
+
+    /// An exponent still parses, and still ends where it should.
+    #[test]
+    fn an_exponent_survives_the_second_point_rule() {
+        let mut lexer = Lexer::new("1e2.5");
+        assert!((lexer.number() - 100.0).abs() < 0.001);
+        assert!((lexer.number() - 0.5).abs() < 0.001);
     }
 
     /// `M` followed by more pairs draws lines, and `z` closes what it started.

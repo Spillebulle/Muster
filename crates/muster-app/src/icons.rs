@@ -22,12 +22,20 @@
 //! column that exists so the printer can be found without reading. These name
 //! where a click goes, beside a word that already says it.
 //!
+//! **The exception is a brand mark**, and there is one: [`Icon::Github`] is
+//! GitHub's own silhouette, filled, from Simple Icons. A symbol can be drawn
+//! in whatever hand the application writes in, because what it means comes
+//! from its shape; a logo means one company and only the shape people already
+//! know says so. Tally and HomeLab draw this same mark beside their own source
+//! links, which is the other half of the argument. Filling it is why
+//! [`triangulate`] is here.
+//!
 //! Icons are authored against a 24x24 box and scaled into whatever rect they
 //! are given, so the 16 px instance in a navigation row and a larger one
 //! elsewhere are the same shape.
 
 use crate::lucide::{Node, Outline};
-use egui::{Color32, Painter, Rect, Shape, Stroke, Vec2, pos2};
+use egui::{Color32, Mesh, Painter, Pos2, Rect, Shape, Stroke, Vec2, pos2};
 use std::sync::LazyLock;
 
 /// The side of the box every icon below is drawn against.
@@ -56,13 +64,17 @@ pub enum Icon {
     /// Lucide `contrast`: a disc dark down one side, which is the light and
     /// dark of a theme.
     Contrast,
-    /// Lucide `github`: the mark, in the one stroke set everything else here
-    /// comes from.
+    /// GitHub's mark, filled, from Simple Icons.
     ///
-    /// **Not GitHub's own logo**, and that is on purpose. §11 asks for one
-    /// stroke set and a vendor's flat mark dropped in among Lucide outlines
-    /// reads as a sticker on somebody else's drawing. Lucide's version is the
-    /// same shape drawn in the same hand as the rest of the application.
+    /// **The one icon here that is not Lucide's and not a stroke**, and the
+    /// reason is that it is a brand mark rather than a symbol: it names one
+    /// company's website, so the shape people already know is the shape that
+    /// says so, and every other application in the family — Tally, HomeLab —
+    /// draws this same silhouette beside its own source link. An outline
+    /// version of a filled logo is a drawing of a logo.
+    ///
+    /// Simple Icons is CC0, so the path data travels without conditions; the
+    /// README names it anyway, next to Lucide's.
     Github,
 }
 
@@ -78,6 +90,14 @@ impl Icon {
         Self::Contrast,
         Self::Github,
     ];
+
+    /// Is this mark filled rather than stroked?
+    ///
+    /// One is, and [`Icon::Github`] says why. Everything else here is Lucide's,
+    /// which means an outline at the interface's own stroke weight.
+    fn is_filled(self) -> bool {
+        matches!(self, Self::Github)
+    }
 
     /// The icon's elements, copied from `lucide-react` v1.31.0 unchanged.
     ///
@@ -175,14 +195,25 @@ impl Icon {
                 },
                 Node::Path("M12 18a6 6 0 0 0 0-12v12z"),
             ],
-            Self::Github => &[
-                Node::Path(
-                    "M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4",
-                ),
-                Node::Path("M9 18c-4.51 2-5-2-7-2"),
-            ],
+            // Simple Icons `github`, copied verbatim the way the Lucide paths
+            // above are. It is one closed subpath and it is filled, not
+            // stroked; see [`Icon::is_filled`].
+            Self::Github => &[Node::Path(
+                "M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12",
+            )],
         }
     }
+}
+
+/// One icon, ready to draw: its outlines, and for a filled mark the triangles
+/// that cover them.
+///
+/// The triangles are indices into the outline's own points, so they survive
+/// being scaled into any rect and are worked out exactly once.
+struct Drawn {
+    outlines: Vec<Outline>,
+    /// One triangle list per outline, or nothing at all for a stroked icon.
+    fill: Vec<Vec<[u32; 3]>>,
 }
 
 /// Every icon, flattened once for the life of the process.
@@ -190,15 +221,24 @@ impl Icon {
 /// The parse and the arcs are cheap, but they are the same answer every frame
 /// for every row of the sidebar, and an icon set is drawn some dozens of times
 /// a frame. Held in the 24x24 box and scaled at the point of drawing, so one
-/// copy serves every size.
-static GEOMETRY: LazyLock<Vec<Vec<Outline>>> = LazyLock::new(|| {
+/// copy serves every size. Ear clipping the one filled mark is the expensive
+/// part and is paid here, once, for the same reason.
+static GEOMETRY: LazyLock<Vec<Drawn>> = LazyLock::new(|| {
     Icon::ALL
         .iter()
-        .map(|i| crate::lucide::flatten(i.nodes()))
+        .map(|i| {
+            let outlines = crate::lucide::flatten(i.nodes());
+            let fill = if i.is_filled() {
+                outlines.iter().map(|o| triangulate(&o.points)).collect()
+            } else {
+                Vec::new()
+            };
+            Drawn { outlines, fill }
+        })
         .collect()
 });
 
-fn geometry(icon: Icon) -> &'static [Outline] {
+fn geometry(icon: Icon) -> &'static Drawn {
     let at = Icon::ALL
         .iter()
         .position(|i| *i == icon)
@@ -219,13 +259,32 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
     let origin = rect.center() - Vec2::splat(size * 0.5);
     let width = (2.0 * scale).max(1.0);
     let stroke = Stroke::new(width, colour);
+    let drawn = geometry(icon);
+    let place = |p: &Pos2| pos2(origin.x + p.x * scale, origin.y + p.y * scale);
 
-    for outline in geometry(icon) {
-        let points: Vec<_> = outline
-            .points
-            .iter()
-            .map(|p| pos2(origin.x + p.x * scale, origin.y + p.y * scale))
-            .collect();
+    if !drawn.fill.is_empty() {
+        for (outline, triangles) in drawn.outlines.iter().zip(&drawn.fill) {
+            let points: Vec<_> = outline.points.iter().map(place).collect();
+            let mut mesh = Mesh::default();
+            for point in &points {
+                mesh.colored_vertex(*point, colour);
+            }
+            for [a, b, c] in triangles {
+                mesh.add_triangle(*a, *b, *c);
+            }
+            painter.add(Shape::mesh(mesh));
+            // **A mesh has hard edges.** egui feathers what it tessellates
+            // itself and takes triangles as given, so at 16 px the silhouette
+            // would be a staircase. A hairline of the same ink along the same
+            // outline is drawn the way every other stroke here is, and its
+            // antialiasing is what smooths the edge of the fill under it.
+            painter.add(Shape::closed_line(points, Stroke::new(1.0_f32, colour)));
+        }
+        return;
+    }
+
+    for outline in &drawn.outlines {
+        let points: Vec<_> = outline.points.iter().map(place).collect();
         // A dot is a stroke that goes nowhere, and egui would draw nothing at
         // all. Half the stroke's width is the radius SVG's round cap would have
         // given it.
@@ -237,6 +296,105 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             painter.add(Shape::line(points, stroke));
         }
     }
+}
+
+/// Twice the area a run of points encloses, signed by which way it winds.
+///
+/// The sign is the whole point: it says which turn is a corner and which is a
+/// notch, and in a y-down box that is the opposite of what a mathematician
+/// would write down. Nothing here cares which way round it is, only that one
+/// answer is used throughout.
+fn winding(points: &[Pos2]) -> f32 {
+    let mut sum = 0.0;
+    for (index, a) in points.iter().enumerate() {
+        let b = points[(index + 1) % points.len()];
+        sum += a.x * b.y - b.x * a.y;
+    }
+    sum
+}
+
+/// Which side of the line `a`→`b` the point `c` falls.
+fn turn(a: Pos2, b: Pos2, c: Pos2) -> f32 {
+    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+/// Is `p` inside the triangle `a`, `b`, `c`, which winds positively?
+fn inside(a: Pos2, b: Pos2, c: Pos2, p: Pos2) -> bool {
+    turn(a, b, p) > 0.0 && turn(b, c, p) > 0.0 && turn(c, a, p) > 0.0
+}
+
+/// Cover a closed outline with triangles, by ear clipping.
+///
+/// **egui cannot fill this shape and does not say so.** Its tessellator covers
+/// a closed path with a fan from the first point, which is right for the convex
+/// shapes the widgets are made of and quietly wrong for anything with a notch
+/// in it — the GitHub mark filled that way is a solid blob with its own arms
+/// painted across the gaps. So the one filled mark is handed to the painter as
+/// a mesh, and this is what works the mesh out: take the corner that no other
+/// point of the outline sits inside, cut it off, and go round again.
+///
+/// Quadratic in the number of points and run once for the life of the process,
+/// on one icon of some hundreds of points. The answer is indices into `points`,
+/// so it holds for every size that icon is ever drawn at.
+fn triangulate(points: &[Pos2]) -> Vec<[u32; 3]> {
+    /// Below this an ear is a sliver rather than a triangle. The box is 24
+    /// units across, so this is a millionth of it.
+    const SLIVER: f32 = 1e-5;
+
+    if points.len() < 3 {
+        return Vec::new();
+    }
+    let mut left: Vec<u32> = (0..points.len() as u32).collect();
+    // Ears are cut from a positively wound outline, so an outline that winds
+    // the other way is walked backwards instead of being copied.
+    if winding(points) < 0.0 {
+        left.reverse();
+    }
+
+    let mut out = Vec::with_capacity(points.len() - 2);
+    let at = |index: u32| points[index as usize];
+    while left.len() > 3 {
+        let before = left.len();
+        let mut i = 0;
+        while i < left.len() && left.len() > 3 {
+            let n = left.len();
+            let (a, b, c) = (left[(i + n - 1) % n], left[i], left[(i + 1) % n]);
+            let corner = turn(at(a), at(b), at(c));
+            // A corner flat enough to have no area is cut without asking what
+            // is inside it: removing a point that lies on the line between its
+            // neighbours cannot change the shape, and leaving it is how a walk
+            // finds no ear at all and stalls.
+            let ear = if corner.abs() < SLIVER {
+                true
+            } else {
+                corner > 0.0
+                    && !left.iter().any(|&other| {
+                        other != a
+                            && other != b
+                            && other != c
+                            && inside(at(a), at(b), at(c), at(other))
+                    })
+            };
+            if ear {
+                if corner.abs() >= SLIVER {
+                    out.push([a, b, c]);
+                }
+                left.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        // A whole pass without an ear means the outline crosses itself, which
+        // no icon here does. Fanning what is left keeps the mark on screen
+        // rather than dropping it, and the test below is what would catch it.
+        if left.len() == before {
+            break;
+        }
+    }
+    for k in 1..left.len().saturating_sub(1) {
+        out.push([left[0], left[k], left[k + 1]]);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -271,6 +429,95 @@ mod tests {
             assert!(
                 right - left > BOX / 2.0 || bottom - top > BOX / 2.0,
                 "{icon:?} is too small to have all of its parts: {left}..{right}, {top}..{bottom}"
+            );
+        }
+    }
+
+    /// The sum of the triangles' areas, as a check that they cover the outline
+    /// and do not overlap.
+    fn covered(points: &[Pos2], triangles: &[[u32; 3]]) -> f32 {
+        triangles
+            .iter()
+            .map(|&[a, b, c]| {
+                let (a, b, c) = (points[a as usize], points[b as usize], points[c as usize]);
+                turn(a, b, c).abs() / 2.0
+            })
+            .sum()
+    }
+
+    /// A notched shape is covered, and covered exactly once.
+    ///
+    /// This is the case a fan gets wrong: fanned from the origin, the L below
+    /// paints over the bite taken out of it, and the total comes out larger
+    /// than the shape.
+    #[test]
+    fn an_l_is_covered_by_its_triangles() {
+        let l = [
+            pos2(0.0, 0.0),
+            pos2(6.0, 0.0),
+            pos2(6.0, 2.0),
+            pos2(2.0, 2.0),
+            pos2(2.0, 6.0),
+            pos2(0.0, 6.0),
+        ];
+        let triangles = triangulate(&l);
+        assert_eq!(triangles.len(), l.len() - 2, "an ear per point but two");
+        let area = winding(&l).abs() / 2.0;
+        assert!((area - 20.0).abs() < 0.001, "the L is 20 units, got {area}");
+        let covered = covered(&l, &triangles);
+        assert!(
+            (covered - area).abs() < 0.001,
+            "the triangles cover {covered} of a shape that is {area}"
+        );
+    }
+
+    /// The same, walked the other way round.
+    #[test]
+    fn winding_does_not_change_the_answer() {
+        let mut l = vec![
+            pos2(0.0, 0.0),
+            pos2(6.0, 0.0),
+            pos2(6.0, 2.0),
+            pos2(2.0, 2.0),
+            pos2(2.0, 6.0),
+            pos2(0.0, 6.0),
+        ];
+        l.reverse();
+        let covered = covered(&l, &triangulate(&l));
+        assert!((covered - 20.0).abs() < 0.001, "got {covered}");
+    }
+
+    /// Every filled mark has a mesh, and the mesh is the mark.
+    ///
+    /// An ear clipper that gives up part way through still returns something,
+    /// so the test that matters is not that it returned triangles but that
+    /// they add up to the outline's own area. GitHub's mark is a few hundred
+    /// points with the tail and the ears folding back on themselves, which is
+    /// the shape a fan cannot do.
+    #[test]
+    fn a_filled_mark_is_covered_by_its_triangles() {
+        for icon in Icon::ALL.into_iter().filter(|i| i.is_filled()) {
+            for outline in crate::lucide::flatten(icon.nodes()) {
+                let triangles = triangulate(&outline.points);
+                assert!(!triangles.is_empty(), "{icon:?} covered by nothing");
+                let area = winding(&outline.points).abs() / 2.0;
+                let covered = covered(&outline.points, &triangles);
+                assert!(
+                    (covered - area).abs() < area * 0.001,
+                    "{icon:?}: {covered} covered of an outline enclosing {area}"
+                );
+            }
+        }
+    }
+
+    /// A stroked icon is not handed triangles it would not use.
+    #[test]
+    fn only_the_filled_marks_carry_a_mesh() {
+        for icon in Icon::ALL {
+            assert_eq!(
+                !geometry(icon).fill.is_empty(),
+                icon.is_filled(),
+                "{icon:?} carries a mesh it should not, or lacks one it should"
             );
         }
     }
