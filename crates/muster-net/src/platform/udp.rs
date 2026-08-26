@@ -160,12 +160,15 @@ impl Ask for Udp {
 ///
 /// So this fails often, and failing is fine as long as it says so: `dhcp::probe`
 /// turns the error into a sentence and the interface shows it, rather than
-/// reporting "no rogue server found" for a question that was never asked.
+/// reporting "no rogue server found" for a question that was never asked. Which
+/// sentence depends on which failure it was, and
+/// [`dhcp_hint`](super::dhcp_hint) is where the two are told apart.
 ///
-/// Sharing the port with the system's own client is possible with
-/// `SO_REUSEADDR` before the bind, which `std` cannot express — it is the next
-/// step for this feature and needs a socket built through `libc` and
-/// `windows-sys` by hand.
+/// **The port is asked for, not demanded.** On Linux the socket sets
+/// `SO_REUSEADDR` before it binds, which is what lets it sit on port 68 beside
+/// the system's own DHCP client — without it a machine with the capability and
+/// a working network answers `EADDRINUSE`, which is the one failure the old
+/// message could not explain. See [`bind_client_port`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Dhcp;
 
@@ -181,7 +184,7 @@ const TICK: Duration = Duration::from_millis(200);
 
 impl crate::dhcp::Broadcaster for Dhcp {
     fn broadcast(&self, payload: &[u8], window: Duration) -> io::Result<Vec<Vec<u8>>> {
-        let socket = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, CLIENT_PORT))?;
+        let socket = bind_client_port()?;
         socket.set_broadcast(true)?;
         socket.set_read_timeout(Some(TICK))?;
         socket.send_to(payload, (std::net::Ipv4Addr::BROADCAST, SERVER_PORT))?;
@@ -207,4 +210,75 @@ impl crate::dhcp::Broadcaster for Dhcp {
         }
         Ok(replies)
     }
+}
+
+/// Port 68, shared with whatever else on this machine is already using it.
+///
+/// **Linux, where the sharing is safe.** For UDP, `SO_REUSEADDR` lets a second
+/// socket bind a port the first is already on as long as the first set the
+/// option too, which the system DHCP clients do; a broadcast is then delivered
+/// to *both*, so Muster hears the offers without taking anything from the
+/// client that keeps this machine addressed. The DISCOVER sets the broadcast
+/// flag precisely so the answers come back that way and nothing has to be
+/// intercepted.
+///
+/// It is not free of consequence, and the consequence is bounded: while this
+/// socket exists, a *unicast* datagram to port 68 is delivered to one of the
+/// two sockets rather than both, so a lease renewal arriving inside the probe's
+/// few seconds could land here instead of on the system client, which
+/// retransmits. That is the whole of the risk, and it buys the feature on every
+/// Linux that has a DHCP client running — which is every Linux this check is
+/// worth making on.
+///
+/// On Windows the same option means something else entirely and is not used;
+/// [`dhcp_hint`](super::dhcp_hint) says why, on the screen where it matters.
+#[cfg(target_os = "linux")]
+fn bind_client_port() -> io::Result<UdpSocket> {
+    use std::os::fd::FromRawFd;
+
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Owned from here, so every path below closes the descriptor even though
+    // the socket is not usable until the bind succeeds.
+    let socket = unsafe { UdpSocket::from_raw_fd(fd) };
+
+    let on: libc::c_int = 1;
+    let set = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            std::ptr::from_ref(&on).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if set != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let addr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: CLIENT_PORT.to_be(),
+        sin_addr: libc::in_addr { s_addr: 0 },
+        sin_zero: [0; 8],
+    };
+    let bound = unsafe {
+        libc::bind(
+            fd,
+            std::ptr::from_ref(&addr).cast(),
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if bound != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(socket)
+}
+
+/// Everywhere else: the port, or the error that says who has it.
+#[cfg(not(target_os = "linux"))]
+fn bind_client_port() -> io::Result<UdpSocket> {
+    UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, CLIENT_PORT))
 }

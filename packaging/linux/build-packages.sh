@@ -186,19 +186,25 @@ EOF
 # minimal system may not have it, and a package must not fail to install over a
 # menu entry.
 #
-# **`CAP_NET_BIND_SERVICE` is granted here, and `CAP_NET_RAW` is not.** The two
-# are not the same ask and the difference is the whole of the argument:
+# **Two capabilities, and each is granted because a code path spends it.** The
+# rule has not changed — a capability handed to a binary that cannot use it is a
+# capability handed out for nothing — but `CAP_NET_RAW` now has a use:
 #
-# * `CAP_NET_RAW` is what the privileged engine will need — the SYN scan, the
-#   ARP sweep, passive fingerprinting — and that engine does not exist yet.
-#   Granting a capability to a binary with no code path that uses it is a
-#   capability handed out for nothing, so it still waits for the raw transport.
-# * `CAP_NET_BIND_SERVICE` is the right to bind a port below 1024, and there is
-#   a code path that needs it *today*: a DHCP client has to listen on port 68
-#   to hear an offer at all, so without this the DHCP check fails with
-#   "Permission denied" on every Linux where Muster is not run as root. That is
-#   a feature that never works, in exchange for a capability that grants
-#   nothing but a low port number.
+# * `CAP_NET_BIND_SERVICE` is the right to bind a port below 1024, and the DHCP
+#   check needs it: a client has to listen on port 68 to hear an offer at all,
+#   so without this that feature fails with "Permission denied" on every Linux
+#   where Muster is not run as root.
+# * `CAP_NET_RAW` buys the ICMP echo where the kernel will not sell it. A ping
+#   socket is gated on `net.ipv4.ping_group_range`, Debian, Ubuntu and Pop!_OS
+#   leave that shut for everybody, and `platform::linux::Echo` falls back to a
+#   raw socket — which is a code path, and a real one: without it a packaged
+#   Muster on those distributions reports "no echo was sent" for every device on
+#   the network and asks its user to run it from a terminal with sudo.
+#
+# It is still not the *privileged engine* — the SYN scan, the ARP sweep, the
+# passive fingerprinting — and when that lands it will want promiscuous mode and
+# `CAP_NET_ADMIN` beside this. It is the same capability `ping` itself carries on
+# these distributions, for the same reason.
 #
 # `|| true` throughout: `setcap` is in `libcap2-bin`, which a minimal system may
 # not have, and a package must not fail to install over an optional feature.
@@ -209,10 +215,11 @@ set -e
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database -q /usr/share/applications || true
 fi
-# Port 68, for the DHCP check. See the note in packaging/linux/build-packages.sh
-# and `platform::DHCP_HINT`, which names this same capability on screen.
+# Port 68 for the DHCP check, and the raw socket the ICMP echo falls back to.
+# See the note in packaging/linux/build-packages.sh and `platform::dhcp_hint`
+# and `platform::ICMP_HINT`, which name these same capabilities on screen.
 if command -v setcap >/dev/null 2>&1; then
-    setcap cap_net_bind_service=+ep /usr/bin/muster || true
+    setcap cap_net_bind_service,cap_net_raw=+ep /usr/bin/muster || true
 fi
 EOF
 # The source file is **written by this script rather than shipped in the
@@ -302,10 +309,10 @@ fi
     echo "%post"
     echo "command -v update-desktop-database >/dev/null 2>&1 && \\"
     echo "    update-desktop-database -q /usr/share/applications || :"
-    # And the same one capability, on the same terms. See the `.deb`'s scriptlet
-    # above for why it is `cap_net_bind_service` and not `cap_net_raw`.
+    # And the same two capabilities, on the same terms. See the `.deb`'s
+    # scriptlet above for what each of them buys.
     echo "command -v setcap >/dev/null 2>&1 && \\"
-    echo "    setcap cap_net_bind_service=+ep /usr/bin/muster || :"
+    echo "    setcap cap_net_bind_service,cap_net_raw=+ep /usr/bin/muster || :"
     # The archive, on the same terms as the `.deb`: created if absent, never
     # overwritten, honouring a `.disabled` marker, and never removed on the way
     # out because it is shared with every other application from the same

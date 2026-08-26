@@ -10,6 +10,8 @@
 //! found". Compiling on a platform Muster does not support should look like a
 //! platform Muster does not support.
 
+use std::io;
+
 pub mod procfs;
 pub mod tcp;
 pub mod udp;
@@ -20,11 +22,20 @@ pub mod udp;
 /// A gap the user can close is worth a sentence saying how, and this is the one
 /// gap on Linux that a person hits with no way to guess the cure: ping sockets
 /// are gated on `net.ipv4.ping_group_range`, a distribution either opens it for
-/// everybody or leaves it shut, and nothing on screen ever mentioned it. The
-/// string lives here because the remedy is the platform's, and it is the only
-/// per-platform sentence in the crate for that reason.
+/// everybody or leaves it shut, and nothing on screen ever mentioned it. Debian,
+/// Ubuntu and Pop!_OS leave it shut. The string lives here because the remedy is
+/// the platform's.
+///
+/// **Both routes are named because both were tried.** A shut sysctl is not the
+/// end of it: `linux::Echo` asks for a raw socket next, so this sentence is only
+/// ever shown by a process that has neither.
+///
+/// **The cure named is the whole capability set, not the missing half.**
+/// `setcap` replaces what a binary has rather than adding to it, so a user told
+/// to grant `cap_net_raw` alone would silently take away the port 68 the DHCP
+/// check was granted. The two messages therefore print the same command.
 #[cfg(target_os = "linux")]
-pub const ICMP_HINT: &str = "ping sockets are closed to this user, so no echo was sent. Opening them is sysctl -w net.ipv4.ping_group_range=\"0 2147483647\", or run Muster with more privilege";
+pub const ICMP_HINT: &str = "ping sockets are closed to this user and this build has no raw socket, so no echo was sent. The packaged builds are granted one on install; for this one it is sudo setcap cap_net_bind_service,cap_net_raw=+ep on the muster binary, or run Muster with sudo";
 
 /// Windows answers echoes through `IcmpSendEcho2`, which needs nothing, so a
 /// failure here is the API refusing rather than a setting to change.
@@ -37,19 +48,50 @@ pub const ICMP_HINT: &str = "Muster sends no ICMP echoes on this platform";
 /// What to do about it, when this machine will not let Muster bind port 68.
 ///
 /// The same rule as [`ICMP_HINT`]: a gap somebody can close is worth the
-/// sentence that says how. On Linux the cure is one capability — not
-/// `CAP_NET_RAW`, just the right to bind a port below 1024 — and the packaged
-/// builds grant it in their install scriptlet, so this sentence is for the
-/// tarball, the AppImage and a development tree.
+/// sentence that says how. **And it has to be the right sentence**, which is
+/// why this is a function of the error rather than one string appended to
+/// whatever the operating system said. There are two entirely different ways to
+/// fail to get port 68 and they have opposite cures:
+///
+/// * `EACCES` — the port is below 1024 and this process may not bind one. Cured
+///   by `CAP_NET_BIND_SERVICE`, which the packaged builds grant on install.
+/// * `EADDRINUSE` — the bind got *past* that check, and the machine's own DHCP
+///   client is holding the port. A capability is not the cure, and this build
+///   evidently already has one; the socket asked to share the port and that
+///   client would not.
+///
+/// Shipping the first sentence for the second error is the application
+/// misreading its own error and telling somebody to grant a privilege they can
+/// see they already have. It was doing exactly that on Pop!_OS.
 #[cfg(target_os = "linux")]
-pub const DHCP_HINT: &str = "port 68 is below 1024, so binding it needs a capability this build does not have. Granting it once is sudo setcap cap_net_bind_service=+ep on the muster binary, and the packaged builds do that on install";
+pub fn dhcp_hint(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::AddrInUse => {
+            "another DHCP client on this machine already holds port 68 and would not share it. Muster asks for the port with SO_REUSEADDR, which most system clients allow; stopping that client, or running Muster as root, is what is left"
+        }
+        _ => {
+            "port 68 is below 1024, so binding it needs a capability this build does not have. Granting it once is sudo setcap cap_net_bind_service,cap_net_raw=+ep on the muster binary, and the packaged builds do that on install"
+        }
+    }
+}
 
+/// On Windows the port belongs to the DHCP Client service, and Muster will not
+/// take it from the service this machine's own address depends on.
+///
+/// `SO_REUSEADDR` would let it: on Windows that option means *hijack*, and the
+/// datagrams the service is waiting for would start arriving here instead. A
+/// rogue-server check is not worth a machine's own lease renewal going missing,
+/// so this stays a sentence rather than becoming a socket option. Stopping the
+/// service is the honest way in, and it is the user's to decide.
 #[cfg(windows)]
-pub const DHCP_HINT: &str =
-    "the DHCP Client service usually holds port 68 already, and Muster cannot share it yet";
+pub fn dhcp_hint(_error: &io::Error) -> &'static str {
+    "the DHCP Client service holds port 68 already. Muster will not take the port from the service this machine's own address depends on, so the check needs that service stopped"
+}
 
 #[cfg(not(any(windows, target_os = "linux")))]
-pub const DHCP_HINT: &str = "port 68 could not be bound on this platform";
+pub fn dhcp_hint(_error: &io::Error) -> &'static str {
+    "port 68 could not be bound on this platform"
+}
 
 #[cfg(windows)]
 mod windows;

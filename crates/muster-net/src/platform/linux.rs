@@ -1,11 +1,15 @@
 //! The Linux readings: `getifaddrs` for the addresses, `/sys` and `/proc` for
 //! everything else.
 //!
-//! Nothing here needs `CAP_NET_RAW`. The addresses come through `getifaddrs`
+//! None of the *readings* needs `CAP_NET_RAW`. The addresses come through
+//! `getifaddrs`
 //! because there is no readable file that lists them — `/proc/net/fib_trie` is
 //! not an interface — and every other reading is text, which is why the parsing
 //! lives in [`super::procfs`] where it can be tested on any platform. This file
 //! is the part that cannot: opening files and walking a linked list from libc.
+//!
+//! The one thing here that will *take* the capability if it is offered is the
+//! echo, and it asks for it second: see [`Echo`].
 //!
 //! What is deliberately not here yet:
 //!
@@ -30,6 +34,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
 use std::path::Path;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -99,15 +104,17 @@ impl SystemProbe for Host {
 ///   are never seen by anything.
 /// * **ICMP goes through a ping socket** (`SOCK_DGRAM`, `IPPROTO_ICMP`), which
 ///   exists precisely so that `ping` need not be setuid. It is gated on
-///   `net.ipv4.ping_group_range` including the user's group — commonly it does
-///   not — so the capability is *probed* at startup rather than assumed, and a
-///   machine where it is closed reports that it could not ping instead of
-///   reporting a network of silent hosts.
+///   `net.ipv4.ping_group_range` including the user's group — on Debian,
+///   Ubuntu and Pop!_OS it does not — and where it is shut the raw socket
+///   below is tried instead, which is what makes `sudo muster` ping on a
+///   machine where an ordinary launch cannot. The capability is *probed* at
+///   startup rather than assumed, and a machine where neither is open reports
+///   that it could not ping instead of reporting a network of silent hosts.
 impl Transport for Host {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             arp: true,
-            icmp: ping_socket().is_ok(),
+            icmp: Echo::open().is_ok(),
             tcp: true,
         }
     }
@@ -204,6 +211,103 @@ fn ping_socket() -> io::Result<OwnedFd> {
     Ok(OwnedFd(fd))
 }
 
+/// Opens a raw ICMP socket, which needs `CAP_NET_RAW` or root.
+///
+/// The second half of [`Echo`], and the reason this file no longer says that
+/// nothing in it wants the capability: on Debian, Ubuntu and Pop!_OS the ping
+/// socket is shut for everybody, and a user who runs Muster with `sudo` has
+/// every right to expect an echo out of it. Asked for second, so an
+/// unprivileged process never pays for a socket it cannot have.
+fn raw_icmp_socket() -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(OwnedFd(fd))
+}
+
+/// The two ways this process can put an ICMP echo on the wire, cheapest first.
+///
+/// They are not the same socket wearing two names, and the difference is all in
+/// what comes *back*:
+///
+/// * [`Echo::Ping`] is demultiplexed by the kernel, which rewrote the
+///   identifier on the way out to one it owns and hands this socket the replies
+///   that carry it. What arrives is already ours, and it arrives as an ICMP
+///   message with no IP header on the front.
+/// * [`Echo::Raw`] is told nothing. **Every** ICMP packet the machine receives
+///   is copied to it — including the replies to other processes' pings and to
+///   the other threads of this one — and each arrives with its IP header
+///   attached. So the identifier and the sequence number are ours to choose and
+///   ours to check, and [`Echo::reply`] is where that check lives.
+enum Echo {
+    Ping(OwnedFd),
+    Raw(OwnedFd),
+}
+
+impl Echo {
+    /// A ping socket if this user may have one, a raw socket if this process
+    /// has the privilege, and otherwise the ping socket's own error.
+    ///
+    /// **The error is deliberately the first one.** `EACCES` from the ping
+    /// socket is the failure [`super::ICMP_HINT`] explains, and reporting the
+    /// raw socket's `EPERM` instead would answer a question about a shut
+    /// sysctl with a sentence about capabilities.
+    fn open() -> io::Result<Self> {
+        match ping_socket() {
+            Ok(fd) => Ok(Self::Ping(fd)),
+            Err(shut) => raw_icmp_socket().map(Self::Raw).map_err(|_| shut),
+        }
+    }
+
+    fn fd(&self) -> libc::c_int {
+        match self {
+            Self::Ping(fd) | Self::Raw(fd) => fd.0,
+        }
+    }
+
+    /// The ICMP message inside a datagram this socket received, if it is one
+    /// this call asked for.
+    ///
+    /// `None` means "not ours", which is an ordinary thing to be: a router
+    /// talking *about* the probe, a reply to another thread, or on a raw socket
+    /// the tail of somebody else's ping. The caller keeps waiting rather than
+    /// calling it silence.
+    fn reply<'a>(&self, datagram: &'a [u8], id: u16, seq: u16) -> Option<&'a [u8]> {
+        let icmp = match self {
+            Self::Ping(_) => datagram,
+            Self::Raw(_) => {
+                // An IPv4 header, whose length is in the low nibble of the
+                // first byte counted in 32-bit words. Not a constant 20: an
+                // option-carrying header is longer, and reading the ICMP type
+                // out of a fixed offset would then read a byte of the options.
+                let first = *datagram.first()?;
+                if first >> 4 != 4 {
+                    return None;
+                }
+                let header = usize::from(first & 0x0f) * 4;
+                datagram.get(header..)?
+            }
+        };
+        // Type 0 is an echo reply. Anything else is a router talking about the
+        // probe rather than the host answering it.
+        if icmp.len() < 8 || icmp[0] != 0 {
+            return None;
+        }
+        // The sequence number is ours on both sockets: the kernel rewrites the
+        // identifier of a ping socket's echo and recomputes the checksum, and
+        // it leaves the sequence alone. The identifier is only ours to compare
+        // on a raw socket, where nothing was rewritten.
+        if u16::from_be_bytes([icmp[6], icmp[7]]) != seq {
+            return None;
+        }
+        if matches!(self, Self::Raw(_)) && u16::from_be_bytes([icmp[4], icmp[5]]) != id {
+            return None;
+        }
+        Some(icmp)
+    }
+}
+
 /// A file descriptor that closes itself. Small enough to own here rather than
 /// reaching for `std::os::fd::OwnedFd`, which would need the socket to be built
 /// through a type that does not exist for ping sockets.
@@ -215,14 +319,16 @@ impl Drop for OwnedFd {
     }
 }
 
-/// One ICMP echo over a ping socket.
+/// One ICMP echo, over whichever socket [`Echo::open`] could get.
 ///
-/// The kernel rewrites the identifier to one it has assigned this socket and
-/// recomputes the checksum, so neither has to be right going out — but both are
-/// filled in anyway, because a header that is only correct by the kernel's
-/// courtesy is one that breaks the day it is sent down a raw socket instead.
+/// The header is filled in completely for both. A ping socket rewrites the
+/// identifier and recomputes the checksum, so neither has to be right going out
+/// — but a header that is only correct by the kernel's courtesy is one that
+/// breaks the day it is sent down a raw socket instead, and that day has now
+/// arrived.
 fn echo(addr: Ipv4Addr, timeout: Duration) -> io::Result<Option<Duration>> {
-    let sock = ping_socket()?;
+    let sock = Echo::open()?;
+    let fd = sock.fd();
 
     let tv = libc::timeval {
         tv_sec: timeout.as_secs() as libc::time_t,
@@ -230,7 +336,7 @@ fn echo(addr: Ipv4Addr, timeout: Duration) -> io::Result<Option<Duration>> {
     };
     unsafe {
         libc::setsockopt(
-            sock.0,
+            fd,
             libc::SOL_SOCKET,
             libc::SO_RCVTIMEO,
             std::ptr::from_ref(&tv).cast(),
@@ -240,9 +346,18 @@ fn echo(addr: Ipv4Addr, timeout: Duration) -> io::Result<Option<Duration>> {
 
     // Type 8 (echo request), code 0, checksum, identifier, sequence, then the
     // same 32 bytes `ping` sends.
+    //
+    // The identifier names this process and the sequence names this call, which
+    // on a raw socket is the whole of how a reply is told from the traffic of
+    // every other pinger on the machine. A sweep runs 254 of these at once, so
+    // the sequence has to be per call rather than the constant 1 it was when
+    // the kernel was doing the sorting.
+    let id = echo_id();
+    let seq = ECHO_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let mut packet = [0u8; 40];
     packet[0] = 8;
-    packet[6..8].copy_from_slice(&1u16.to_be_bytes());
+    packet[4..6].copy_from_slice(&id.to_be_bytes());
+    packet[6..8].copy_from_slice(&seq.to_be_bytes());
     packet[8..].fill(0x61);
     let sum = checksum(&packet);
     packet[2..4].copy_from_slice(&sum.to_be_bytes());
@@ -256,10 +371,27 @@ fn echo(addr: Ipv4Addr, timeout: Duration) -> io::Result<Option<Duration>> {
         sin_zero: [0; 8],
     };
 
+    // **A raw socket is handed every ICMP packet the machine receives**, and a
+    // sweep runs 254 of them at once: unfiltered, each socket would be given a
+    // copy of every other worker's reply and have to step over 253 of them to
+    // find its own. Connecting names the one peer this socket cares about and
+    // the kernel does the filtering. Best effort: [`Echo::reply`] checks the
+    // identifier and the sequence anyway, so a kernel that refuses this is
+    // slower and not wrong.
+    if matches!(sock, Echo::Raw(_)) {
+        unsafe {
+            libc::connect(
+                fd,
+                std::ptr::from_ref(&dest).cast(),
+                size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+        }
+    }
+
     let sent = Instant::now();
     let n = unsafe {
         libc::sendto(
-            sock.0,
+            fd,
             packet.as_ptr().cast(),
             packet.len(),
             0,
@@ -273,16 +405,17 @@ fn echo(addr: Ipv4Addr, timeout: Duration) -> io::Result<Option<Duration>> {
         return Ok(None);
     }
 
-    let mut buf = [0u8; 128];
+    // Wide enough for a raw socket's reply, which carries the IP header, its
+    // options and the 40 bytes above.
+    let mut buf = [0u8; 256];
     let deadline = sent + timeout;
     loop {
-        let got = unsafe { libc::recv(sock.0, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let got = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
         if got < 0 {
             return Ok(None); // Timed out.
         }
-        // Type 0 is an echo reply. Anything else on this socket is a router
-        // talking *about* the probe, which is not the host answering.
-        if got >= 8 && buf[0] == 0 {
+        let got = got as usize;
+        if sock.reply(&buf[..got.min(buf.len())], id, seq).is_some() {
             return Ok(Some(sent.elapsed()));
         }
         if Instant::now() >= deadline {
@@ -290,6 +423,21 @@ fn echo(addr: Ipv4Addr, timeout: Duration) -> io::Result<Option<Duration>> {
         }
     }
 }
+
+/// The identifier every echo from this process carries.
+///
+/// The process id, which is what `ping` itself uses and what makes one Muster's
+/// replies distinguishable from another's on a raw socket. Truncated to sixteen
+/// bits because the field is sixteen bits; two processes whose ids differ only
+/// above that would collide, and the sequence number then separates them.
+fn echo_id() -> u16 {
+    unsafe { libc::getpid() as u16 }
+}
+
+/// One number per echo this process sends, so a reply can name the call it
+/// belongs to. Wrapping after 65536 pings is fine: what it has to be is
+/// different from the pings in flight beside it, not unique for ever.
+static ECHO_SEQUENCE: AtomicU16 = AtomicU16::new(1);
 
 /// The internet checksum: one's complement of the one's complement sum.
 fn checksum(data: &[u8]) -> u16 {

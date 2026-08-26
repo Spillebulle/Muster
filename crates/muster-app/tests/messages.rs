@@ -4,11 +4,44 @@
 //! rather than from a call because the defect it catches is invisible at every
 //! other stage: it compiles, it passes clippy, it reads perfectly in the editor,
 //! and it is only wrong on screen.
+//!
+//! **It reads the engine as well as the interface.** Written against
+//! `muster-app` alone, it watched the crate that draws the messages and not the
+//! crate that *writes* most of them: `muster-net` had carried a joined line in
+//! a re-check's "could not send ARP requests" caveat from the day it was added,
+//! and a guard that cannot see the engine is a guard over the wrong half of the
+//! application.
 
 use std::path::{Path, PathBuf};
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The crates whose string literals are *sentences*.
+///
+/// `muster-desktop` is not one of them and is left out on purpose: the text
+/// mode draws tables, so its literals carry runs of spaces that are the column
+/// layout rather than a lost continuation, and a guard that cried wolf over
+/// every aligned header would be turned off within a week.
+const PROSE: [&str; 2] = ["muster-app", "muster-net"];
+
+/// Every `src` directory of [`PROSE`].
+///
+/// The `tests` directories are deliberately not included: this file is one of
+/// them, and the pattern it looks for is written out in it.
+fn workspace_sources() -> Vec<PathBuf> {
+    let crates = crate_root()
+        .parent()
+        .expect("the crates directory holds this crate")
+        .to_path_buf();
+    let mut out = Vec::new();
+    for name in PROSE {
+        let src = crates.join(name).join("src");
+        assert!(src.is_dir(), "{} has no src directory", src.display());
+        rust_files(&src, &mut out);
+    }
+    out
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -72,9 +105,11 @@ fn literals(line: &str) -> Vec<String> {
 /// purpose, so the run itself is the signal.
 #[test]
 fn no_message_has_a_run_of_spaces_in_it() {
-    let mut files = Vec::new();
-    rust_files(&crate_root().join("src"), &mut files);
-    assert!(!files.is_empty(), "expected to find this crate's sources");
+    let files = workspace_sources();
+    assert!(
+        files.len() > 1,
+        "expected to find the sources of both prose crates"
+    );
 
     let mut bad = Vec::new();
     for path in &files {

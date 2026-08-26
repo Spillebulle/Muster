@@ -94,20 +94,24 @@ wmclass=$(grep '^StartupWMClass=' "$desktop" | head -1 | cut -d = -f 2)
 [ "$wmclass" = "$exec_line" ] || fail "StartupWMClass is '$wmclass' but the binary is called '$exec_line'"
 ok "StartupWMClass is the binary's own name, which is X11's WM_CLASS"
 
-# --- the one capability ------------------------------------------------------
+# --- the two capabilities ----------------------------------------------------
 #
 # The DHCP check binds port 68, which is below 1024, so it needs
-# `CAP_NET_BIND_SERVICE`. Three scriptlets grant it and one string on screen
-# names it, and if those ever disagree the feature simply reports "Permission
-# denied" for ever with a message telling the user to grant something the
-# packages already granted. Same shape of defect as the archive path below.
-CAP=cap_net_bind_service
-for f in packaging/linux/build-packages.sh packaging/linux/muster.install; do
-    [ -f "$f" ] || fail "$f is missing"
-    grep -q "$CAP" "$f" || fail "$f never grants $CAP, so the DHCP check cannot bind port 68"
+# `CAP_NET_BIND_SERVICE`; the ICMP echo falls back to a raw socket where ping
+# sockets are shut, which needs `CAP_NET_RAW`. Three scriptlets grant them and
+# the messages on screen name them, and if those ever disagree a feature simply
+# reports "Permission denied" for ever with a message telling the user to grant
+# something the packages already granted. Same shape of defect as the archive
+# path below.
+for CAP in cap_net_bind_service cap_net_raw; do
+    for f in packaging/linux/build-packages.sh packaging/linux/muster.install; do
+        [ -f "$f" ] || fail "$f is missing"
+        grep -q "$CAP" "$f" || fail "$f never grants $CAP"
+    done
+    ok "the packages grant $CAP"
 done
-grep -q "$CAP" crates/muster-net/src/platform/mod.rs ||     fail "the message that explains a failed DHCP check never names $CAP"
-ok "the packages grant $CAP and the message names it"
+grep -q cap_net_bind_service crates/muster-net/src/platform/mod.rs || fail "the message that explains a failed DHCP check never names cap_net_bind_service"
+ok "the message that explains a failed DHCP check names the capability"
 
 # The Arch scriptlet only runs if the PKGBUILD names it, and makepkg only finds
 # it if the workflow copies it next to the PKGBUILD.

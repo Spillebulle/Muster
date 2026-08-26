@@ -320,7 +320,7 @@ pub fn probe<B: Broadcaster>(transport: &B, mac: MacAddr, xid: u32, window: Dura
             offers: Vec::new(),
             not_done: Some(format!(
                 "Could not ask for DHCP offers: {e}. {}.",
-                crate::platform::DHCP_HINT
+                crate::platform::dhcp_hint(&e)
             )),
         },
     }

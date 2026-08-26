@@ -1,21 +1,23 @@
-# The one capability Muster asks a package manager for.
+# The two capabilities Muster asks a package manager for.
 #
 # `CAP_NET_BIND_SERVICE` is the right to bind a port below 1024, and the DHCP
 # check needs it: a client has to be listening on port 68 to hear an offer at
 # all, so without this that feature reports "Permission denied" and nothing
 # else, on every machine, for ever.
 #
-# It is **not** `CAP_NET_RAW`. That is what the privileged engine will want when
-# the raw transport lands, and granting it to a binary with no code path that
-# uses it would be a capability handed out for nothing. See the long note in
-# `build-packages.sh`, which grants the same one to the .deb and the .rpm.
+# `CAP_NET_RAW` is the ICMP echo's fallback. Ping sockets are gated on
+# `net.ipv4.ping_group_range` and several distributions leave it shut, and
+# without a raw socket Muster reports "no echo was sent" for every device it
+# finds. It is what `ping` itself carries, and it is still short of the
+# privileged engine, which will want `CAP_NET_ADMIN` beside it. See the long
+# note in `build-packages.sh`, which grants the same two to the .deb and .rpm.
 #
 # `|| true`: setcap comes from `libcap`, and a package must not fail to install
 # over an optional feature. Without it Muster simply keeps saying what it cannot
 # do, which is what it did before.
 _grant() {
     if command -v setcap >/dev/null 2>&1; then
-        setcap cap_net_bind_service=+ep /usr/bin/muster || true
+        setcap cap_net_bind_service,cap_net_raw=+ep /usr/bin/muster || true
     fi
 }
 

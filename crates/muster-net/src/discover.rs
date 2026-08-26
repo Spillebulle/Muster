@@ -556,7 +556,8 @@ pub fn recheck<T: Transport>(
     let mut not_done = Vec::new();
     if !caps.arp && opts.arp_authoritative && address.is_ipv4() {
         not_done.push(
-            "could not send ARP requests, so a device that ignores ping and              refuses nothing may answer nothing here"
+            "could not send ARP requests, so a device that ignores ping and \
+             refuses nothing may answer nothing here"
                 .into(),
         );
     }
