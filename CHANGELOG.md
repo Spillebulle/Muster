@@ -3,6 +3,26 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.14
+
+Fixed
+
+- **The link to the source on About carried a mark nobody would recognise as
+  GitHub's.** It was Lucide's outlined `github`, drawn in the same stroke set
+  as the gear and the radar, on the reasoning that one application should draw
+  in one hand. A logo is not a symbol: what a symbol means comes from its
+  shape, so it can be redrawn, while a mark means one company and only the
+  known shape says so. About now shows GitHub's own silhouette, filled — the
+  same one every other application in the family puts beside its source link.
+- **A number written without a leading digit was read as nothing.** SVG ends a
+  number at a second decimal point, so `-5.5.08` is two of them; the icon
+  parser read straight on and got one token that parses as nothing, and a zero
+  where a number belongs puts a curve's control point on the origin. No icon
+  Muster shipped was affected, because Lucide writes its paths with the leading
+  digits in place — but that is luck rather than correctness, and the mark
+  above is written the other way throughout, which is half of why it looked the
+  way it did.
+
 ## 0.0.13
 
 Added

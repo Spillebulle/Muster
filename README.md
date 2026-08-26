@@ -28,21 +28,21 @@ naming what the sweep could not do](docs/images/window.png)
 
 ## Install
 
-**Muster 0.0.13.** Take the file for your system, or browse the
+**Muster 0.0.14.** Take the file for your system, or browse the
 [release itself](https://github.com/Spillebulle/muster/releases/latest) for the
 notes and the checksums.
 
 | Your system | x86-64 | ARM64 |
 |---|---|---|
-| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-setup-0.0.13-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-setup-0.0.13-arm64.exe) |
-| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster_0.0.13_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster_0.0.13_arm64.deb) |
-| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-1.aarch64.rpm) |
-| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-bin-0.0.13-1-x86_64.pkg.tar.zst) | not built |
-| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.13/Muster-0.0.13-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.13/Muster-0.0.13-aarch64.AppImage) |
-| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-x86_64.flatpak) | not built |
-| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-arm64.msi) |
-| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-aarch64-pc-windows-msvc.zip) |
-| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster-setup-0.0.14-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster-setup-0.0.14-arm64.exe) |
+| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster_0.0.14_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster_0.0.14_arm64.deb) |
+| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster-0.0.14-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster-0.0.14-1.aarch64.rpm) |
+| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster-bin-0.0.14-1-x86_64.pkg.tar.zst) | not built |
+| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.14/Muster-0.0.14-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.14/Muster-0.0.14-aarch64.AppImage) |
+| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster-0.0.14-x86_64.flatpak) | not built |
+| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster-0.0.14-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster-0.0.14-arm64.msi) |
+| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster-0.0.14-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster-0.0.14-aarch64-pc-windows-msvc.zip) |
+| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster-0.0.14-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.14/muster-0.0.14-aarch64-unknown-linux-gnu.tar.gz) |
 
 The `.deb` and `.rpm` add the [Spillebulle archive](https://spillebulle.github.io/packages/)
 as they install, so `apt upgrade` or your usual system update carries Muster along
@@ -459,5 +459,6 @@ cargo test                   # everything; no test touches a network
 GPL-3.0-or-later; see [LICENSE](LICENSE). The interface is set in
 [Archivo](https://github.com/Omnibus-Type/Archivo) under the SIL Open Font
 License, and its icons are [Lucide](https://lucide.dev), copyright Lucide Icons
-and Contributors, under the ISC licence. Hardware vendor names come from the
+and Contributors, under the ISC licence, with GitHub's own mark from
+[Simple Icons](https://simpleicons.org) under CC0. Hardware vendor names come from the
 IEEE MA-L, MA-M and MA-S registry.
