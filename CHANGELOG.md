@@ -3,6 +3,29 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.12
+
+Added
+
+- **The table's columns resize.** Drag the line between two headings and that
+  column follows; the edge lights up when you are on it, and double clicking one
+  puts the column back to the width it shipped with. "Made by" takes up or gives
+  back whatever the change costs, so there is never a strip of empty table down
+  the right-hand side, and no column can be dragged shut or dragged wide enough
+  to push the others off the window. The widths are remembered between runs.
+- **What does not fit in a cell is cut with an ellipsis**, where it used to run
+  on underneath the next column and make both unreadable. The whole value is
+  still in the row's tooltip. The ports and the badges already counted what they
+  could not show; this is the same rule for the columns that hold text.
+
+Fixed
+
+- **The chevron on the Copy and Actions buttons sat against the last letter of
+  the word.** The button reserved a chevron-wide box after the label and drew
+  the mark centred in it, so the only thing between the two was that box's own
+  inset — under two pixels. Both now measure the mark rather than its box, and
+  there is a proper gap.
+
 ## 0.0.11
 
 Added

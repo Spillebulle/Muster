@@ -28,21 +28,21 @@ naming what the sweep could not do](docs/images/window.png)
 
 ## Install
 
-**Muster 0.0.11.** Take the file for your system, or browse the
+**Muster 0.0.12.** Take the file for your system, or browse the
 [release itself](https://github.com/Spillebulle/muster/releases/latest) for the
 notes and the checksums.
 
 | Your system | x86-64 | ARM64 |
 |---|---|---|
-| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-setup-0.0.11-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-setup-0.0.11-arm64.exe) |
-| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster_0.0.11_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster_0.0.11_arm64.deb) |
-| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-1.aarch64.rpm) |
-| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-bin-0.0.11-1-x86_64.pkg.tar.zst) | not built |
-| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.11/Muster-0.0.11-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.11/Muster-0.0.11-aarch64.AppImage) |
-| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-x86_64.flatpak) | not built |
-| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-arm64.msi) |
-| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-aarch64-pc-windows-msvc.zip) |
-| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.11/muster-0.0.11-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-setup-0.0.12-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-setup-0.0.12-arm64.exe) |
+| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster_0.0.12_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster_0.0.12_arm64.deb) |
+| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-1.aarch64.rpm) |
+| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-bin-0.0.12-1-x86_64.pkg.tar.zst) | not built |
+| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.12/Muster-0.0.12-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.12/Muster-0.0.12-aarch64.AppImage) |
+| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-x86_64.flatpak) | not built |
+| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-arm64.msi) |
+| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-aarch64-pc-windows-msvc.zip) |
+| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-aarch64-unknown-linux-gnu.tar.gz) |
 
 The `.deb` and `.rpm` add the [Spillebulle archive](https://spillebulle.github.io/packages/)
 as they install, so `apt upgrade` or your usual system update carries Muster along
@@ -197,7 +197,7 @@ The settings are remembered, they are the same settings as the Scanning page
 under **Settings** at the foot of the sidebar, and a scan already running keeps
 the settings it started with.
 
-## Sorting
+## Sorting and resizing
 
 Every column heading sorts, including the icon column: click to sort, click
 again to reverse. Sorting by kind is how forty rows become "the three
@@ -205,6 +205,14 @@ printers"; sorting by what a device serves brings the network's own
 infrastructure to the top. Addresses sort as numbers rather than as text, so
 `.9` comes before `.10`, and a row with nothing in the sorted column stays at
 the bottom either way.
+
+**Drag the line between two headings to resize a column.** The edge lights up
+when you are on it, "Made by" takes up or gives back whatever the change costs
+so the table never leaves a strip of nothing down its side, and double clicking
+an edge puts that column back to the width it shipped with. A name too long for
+the column it is in is cut with an ellipsis rather than run under its
+neighbour — the whole of it is in the row's tooltip. The widths are remembered
+between runs.
 
 ## Marking devices, and doing something with them
 
