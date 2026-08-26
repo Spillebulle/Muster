@@ -105,6 +105,26 @@ impl Probe {
         seen
     }
 
+    /// One offer per server, in arrival order.
+    ///
+    /// A client retransmits its DISCOVER and a server answers each one, so a
+    /// healthy link produces the same offer two or three times — which is a
+    /// fact about the protocol and not about the network, and listing it twice
+    /// on screen reads as two servers agreeing rather than as one server being
+    /// heard twice. [`Self::servers`] already counts by identifier; this is the
+    /// same rule applied to what is shown.
+    pub fn distinct_offers(&self) -> Vec<&Offer> {
+        let mut seen: Vec<Ipv4Addr> = Vec::new();
+        let mut out = Vec::new();
+        for offer in &self.offers {
+            if !seen.contains(&offer.server) {
+                seen.push(offer.server);
+                out.push(offer);
+            }
+        }
+        out
+    }
+
     /// True when more than one distinct server answered.
     pub fn is_contested(&self) -> bool {
         self.servers().len() > 1
@@ -289,9 +309,8 @@ pub fn probe<B: Broadcaster>(transport: &B, mac: MacAddr, xid: u32, window: Dura
         Err(e) => Probe {
             offers: Vec::new(),
             not_done: Some(format!(
-                "Could not ask for DHCP offers: {e}. On Linux this needs \
-                 permission to use port 68; on Windows the DHCP Client service \
-                 may already hold it."
+                "Could not ask for DHCP offers: {e}. {}.",
+                crate::platform::DHCP_HINT
             )),
         },
     }
@@ -482,5 +501,38 @@ mod tests {
         let probe = probe(&Recorded(Vec::new()), MAC, XID, Duration::from_secs(1));
         assert!(!probe.is_contested());
         assert_eq!(probe.verdict(), "No DHCP server answered.");
+    }
+
+    /// A server answering a retransmitted DISCOVER twice is one server, and
+    /// the screen has to say so: two identical lines read as two servers
+    /// agreeing.
+    #[test]
+    fn one_server_heard_twice_is_shown_once() {
+        let offer = Offer {
+            server: Ipv4Addr::new(192, 168, 0, 1),
+            offered: Ipv4Addr::new(192, 168, 0, 50),
+            mask: None,
+            router: None,
+            dns: Vec::new(),
+            domain: None,
+            lease: None,
+        };
+        let probe = Probe {
+            offers: vec![offer.clone(), offer.clone()],
+            not_done: None,
+        };
+        assert_eq!(probe.distinct_offers().len(), 1);
+        assert!(!probe.is_contested());
+
+        let rogue = Offer {
+            server: Ipv4Addr::new(192, 168, 0, 77),
+            ..offer.clone()
+        };
+        let probe = Probe {
+            offers: vec![offer.clone(), rogue, offer],
+            not_done: None,
+        };
+        assert_eq!(probe.distinct_offers().len(), 2, "and two servers are two");
+        assert!(probe.is_contested());
     }
 }

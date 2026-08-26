@@ -55,9 +55,11 @@ use std::time::Duration;
 const SHOTS: [(&str, View, [f32; 2], Option<u8>); 5] = [
     ("settings.png", View::Devices, [1400.0, 700.0], Some(0)),
     ("window.png", View::Devices, [1400.0, 620.0], None),
-    // The detail window, opened on the printer: the device with the most to
-    // say about itself, so the picture shows the panel doing its job.
-    ("device.png", View::Devices, [1400.0, 520.0], Some(27)),
+    // The detail window, opened on the gateway: the device with the most to
+    // say about itself, so the picture shows the panel doing its job. It is
+    // the one row that carries both badges, and the badges are the thing the
+    // table alone cannot explain.
+    ("device.png", View::Devices, [1400.0, 520.0], Some(0)),
     ("network.png", View::Network, [720.0, 380.0], None),
     ("about.png", View::About, [720.0, 480.0], None),
 ];
@@ -380,11 +382,23 @@ fn scan() -> Outcome {
         .collect();
 
     let names = vec![
-        named(&[("router.lan", Source::ReverseDns)], None, &[]),
-        named(
-            &[("pi-hole.local", Source::Mdns)],
+        // The gateway serves both of the things a home network's gateway
+        // serves, and the Pi-hole beside it serves one of them. Between them
+        // they are why the badges exist: what a device *is* and what it
+        // *serves* are two different columns.
+        serving(
+            named(&[("router.lan", Source::ReverseDns)], None, &[]),
+            true,
             None,
-            &["_ssh._tcp", "_http._tcp"],
+        ),
+        serving(
+            named(
+                &[("pi-hole.local", Source::Mdns)],
+                None,
+                &["_ssh._tcp", "_http._tcp"],
+            ),
+            false,
+            Some("dnsmasq-pi-hole-v2.90"),
         ),
         named(
             &[("BRW001BA960143D.local", Source::Mdns)],
@@ -444,8 +458,21 @@ fn scan() -> Outcome {
             cancelled: false,
         },
         names,
+        dhcp: None,
         prefix: prefix(),
     }
+}
+
+/// Marks what a device serves the network, for the badge column.
+fn serving(mut identity: Identity, dhcp: bool, version: Option<&str>) -> Identity {
+    if dhcp {
+        identity.offers_addresses();
+    }
+    identity.resolver = Some(muster_net::identify::Resolver {
+        version: version.map(str::to_string),
+        recursive: true,
+    });
+    identity
 }
 
 fn named(names: &[(&str, Source)], workgroup: Option<&str>, services: &[&str]) -> Identity {
@@ -458,7 +485,7 @@ fn named(names: &[(&str, Source)], workgroup: Option<&str>, services: &[&str]) -
             })
             .collect(),
         workgroup: workgroup.map(str::to_string),
-        mac: None,
         services: services.iter().map(|s| (*s).to_string()).collect(),
+        ..Default::default()
     }
 }

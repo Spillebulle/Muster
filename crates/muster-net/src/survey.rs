@@ -20,6 +20,7 @@
 //! routing table therefore reports that it has no gateway *because it could not
 //! look*, and the interface above has what it needs to say so.
 
+use crate::kind::Vantage;
 use crate::prefix::Prefix;
 use crate::sysinfo::{Interface, Neighbour, Route, SystemProbe};
 use std::fmt;
@@ -79,6 +80,31 @@ pub struct Survey {
 }
 
 impl Survey {
+    /// Where a device stands relative to the machine that scanned it.
+    ///
+    /// Both facts come from this phase and from nowhere else, which is why the
+    /// answer is assembled here rather than in each caller: a scan run from
+    /// three different windows was asking the routing table the same question
+    /// three ways.
+    pub fn vantage(&self, address: IpAddr) -> Vantage {
+        Vantage {
+            gateway: self.gateways.iter().any(|g| g.address == address),
+            this_machine: self.owns(address),
+        }
+    }
+
+    /// Is this one of the machine's own addresses?
+    ///
+    /// Every interface is checked, not only the one being scanned: a laptop on
+    /// wifi and Ethernet at once appears in its own scan under whichever
+    /// address the sweep reached, and both of them are it.
+    pub fn owns(&self, address: IpAddr) -> bool {
+        self.interfaces
+            .iter()
+            .flat_map(|interface| &interface.addresses)
+            .any(|configured| configured.address == address)
+    }
+
     /// Takes the survey. Never fails: a probe that cannot answer produces gaps,
     /// because there is always something worth showing and refusing to report
     /// anything is the one outcome that helps nobody.

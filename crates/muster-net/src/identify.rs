@@ -5,19 +5,42 @@
 //! address. All of it is ordinary UDP, so all of it works with no privileges on
 //! both platforms.
 //!
-//! Three questions, in one seam:
+//! ## Asked privately, and asked of the link
+//!
+//! Per device, in [`one`]:
 //!
 //! * **Reverse DNS** to the machine's own resolver. On a home network that
 //!   resolver is usually the router, and the router knows the hostname every
 //!   device gave it with its DHCP request. It is the cheapest name there is.
-//! * **mDNS** to `224.0.0.251:5353`, which Apple devices, printers,
-//!   Chromecasts and anything running Avahi answer for themselves.
+//! * **mDNS**, twice: the reverse question, which a responder answers with its
+//!   own `.local` name, and `_services._dns-sd._udp.local`, which it answers
+//!   with the list of what it offers. The second is what turns a name into a
+//!   kind, and for a long time it was not asked: devices came back named and
+//!   silent about themselves, and the service half of [`crate::kind`] could
+//!   not fire.
+//! * **`_device-info._tcp`**, by the name the device just gave, which is where
+//!   an Apple device writes its exact model.
 //! * **NetBIOS** to port 137, which is how a Windows machine says its name —
 //!   including the ones that ignore ping.
+//! * **LLMNR** to port 5355, which is how the Windows machines that have
+//!   switched NetBIOS off still say it.
 //!
-//! Every one of them is a datagram out and a datagram back, so the whole
-//! platform surface is [`Ask`], with one method. The tests drive it with
-//! recorded replies and no test opens a socket.
+//! Once per scan, in [`many`]:
+//!
+//! * **An SSDP search** of the whole link. See [`crate::ssdp`].
+//! * **The same `_services._dns-sd._udp.local` question**, sent to the mDNS
+//!   group rather than to a device.
+//!
+//! **The link-wide pair is not redundant with the private pair, and finding
+//! that out is what these two are here for.** A great many responders — two
+//! televisions on the network this was written against, and a camera — process
+//! only what arrives on their multicast socket and ignore the identical
+//! question addressed to them alone. Asking each device privately found four
+//! devices out of twenty-one; asking the link as well found fourteen.
+//!
+//! Every question is a datagram out and one or more back, so the whole platform
+//! surface is [`Ask`], with two methods. The tests drive it with recorded
+//! replies and no test opens a socket.
 //!
 //! ## Sources are merged with a priority, never raced
 //!
@@ -29,7 +52,7 @@
 //! would make the answer depend on which reply happened to come back first,
 //! which is not a property of the device at all.
 //!
-//! The order is **self-reported first**: mDNS and NetBIOS are the device
+//! The order is **self-reported first**: mDNS, NetBIOS and LLMNR are the device
 //! speaking about itself, while reverse DNS is what the router was told once,
 //! possibly by a previous occupant of the address.
 
@@ -37,6 +60,8 @@ use crate::dns;
 use crate::mac::MacAddr;
 use crate::netbios;
 use crate::rate::Bucket;
+use crate::ssdp;
+use std::collections::BTreeMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -51,6 +76,8 @@ pub enum Source {
     Mdns,
     /// The device answered NetBIOS about itself.
     NetBios,
+    /// The device answered LLMNR about itself.
+    Llmnr,
     /// The resolver had a `PTR` record. Second-hand, and sometimes stale.
     ReverseDns,
 }
@@ -60,9 +87,67 @@ impl Source {
         match self {
             Self::Mdns => "mDNS",
             Self::NetBios => "NetBIOS",
+            Self::Llmnr => "LLMNR",
             Self::ReverseDns => "reverse DNS",
         }
     }
+}
+
+/// Something a device does *for* the rest of the network.
+///
+/// Distinct from [`crate::Kind`], and the distinction is the point: a kind is
+/// what a device **is** and a role is what it **serves**. The two are
+/// independent — a router serves both of these, a NAS often serves neither, and
+/// a Raspberry Pi running Pi-hole serves both while being a computer. So the
+/// interface shows the kind as an icon and the roles as badges beside it,
+/// rather than trying to fold "it is a DNS server" into a single label.
+///
+/// **Every role here is a service that answered.** Not a port that was open,
+/// not a vendor that usually runs one: the device was asked a question in the
+/// protocol and replied in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Role {
+    /// It offered an address in reply to a DHCP DISCOVER.
+    Dhcp,
+    /// It answered a DNS query.
+    Dns,
+}
+
+impl Role {
+    /// The badge's text.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dhcp => "DHCP",
+            Self::Dns => "DNS",
+        }
+    }
+
+    /// What the badge means, for the tooltip. §11 wants one on anything that
+    /// is not a sentence.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Dhcp => "it offered this network an address",
+            Self::Dns => "it answered a DNS query",
+        }
+    }
+}
+
+/// What a device that answers on port 53 said about itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Resolver {
+    /// Its answer to `version.bind`, where it gave one.
+    ///
+    /// `dnsmasq-2.90`, `9.18.28-1~deb12u2-Debian`, `Pi-hole-FTL 6.0`. Servers
+    /// are free to withhold it and hardened ones do, so this is [`None`] as
+    /// often as not and the role does not depend on it.
+    pub version: Option<String>,
+    /// It set `RA`, so it will resolve on a client's behalf.
+    ///
+    /// The difference between the resolver a network's devices point at and a
+    /// server that is only authoritative for its own zone — and, on a home
+    /// network, the difference between the router and a NAS running a private
+    /// zone for its containers.
+    pub recursive: bool,
 }
 
 /// A name, and who said so.
@@ -86,11 +171,53 @@ pub struct Identity {
     pub mac: Option<MacAddr>,
     /// mDNS service types seen, such as `_ipp._tcp` for a printer.
     pub services: Vec<String>,
+    /// UPnP device and service types announced over SSDP, lower cased, such as
+    /// `urn:dial-multiscreen-org:device:dial:1` for a television.
+    ///
+    /// A separate list from [`Self::services`] rather than the same one,
+    /// because the two are different vocabularies and showing a URN under
+    /// "advertises" beside `_ipp._tcp` reads as one list of nonsense.
+    pub upnp: Vec<String>,
+    /// The `SERVER` header of an SSDP reply: the product, in the device's own
+    /// words. `Linux/4.19 UPnP/1.0 LG WebOS TV/1.0`.
+    pub product: Option<String>,
+    /// The model the device named for itself in an mDNS `TXT` record:
+    /// `model=AudioAccessory5,1`, `md=SHIELD Android TV`, `ty=HP OfficeJet
+    /// 6950`.
+    ///
+    /// The most precise thing a device ever volunteers, and worth a field of
+    /// its own rather than a line in [`Self::services`]: a service type says
+    /// what a device does and this says what it is.
+    pub model: Option<String>,
+    /// It answered on port 53, and what it said.
+    pub resolver: Option<Resolver>,
+    /// It answered a DHCP DISCOVER with an offer.
+    ///
+    /// Filled in by the caller rather than by [`one`]: a DISCOVER is one
+    /// broadcast for the whole link, so the answer arrives as a list of servers
+    /// and is attributed here afterwards. See [`Identity::offers_addresses`].
+    pub dhcp: bool,
+    /// The device answered LLMNR, which on a home network means Windows or a
+    /// Linux machine running `systemd-resolved`.
+    ///
+    /// Kept as a flag rather than inferred from a name's source, because the
+    /// fact worth having is that it *responded*: a responder that answered
+    /// with a name Muster already had is still a machine saying it speaks a
+    /// protocol only general-purpose computers speak.
+    pub llmnr: bool,
 }
 
 impl Identity {
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty() && self.workgroup.is_none() && self.services.is_empty()
+        self.names.is_empty()
+            && self.workgroup.is_none()
+            && self.services.is_empty()
+            && self.upnp.is_empty()
+            && self.product.is_none()
+            && self.model.is_none()
+            && self.resolver.is_none()
+            && !self.dhcp
+            && !self.llmnr
     }
 
     /// The name to show. The highest-priority source wins; ties keep the first.
@@ -124,6 +251,64 @@ impl Identity {
             }
         }
         out
+    }
+
+    /// What this device serves the network, for the badges.
+    ///
+    /// Ordered by [`Role`]'s own order rather than by when each was learned, so
+    /// two devices with the same roles show the same badges in the same
+    /// sequence and a row does not reshuffle itself between scans.
+    pub fn roles(&self) -> Vec<Role> {
+        let mut out = Vec::new();
+        if self.dhcp {
+            out.push(Role::Dhcp);
+        }
+        if self.resolver.is_some() {
+            out.push(Role::Dns);
+        }
+        out
+    }
+
+    /// Records that this device answered a DHCP DISCOVER.
+    pub fn offers_addresses(&mut self) {
+        self.dhcp = true;
+    }
+
+    /// Folds in what a link-wide question learned about this same device.
+    ///
+    /// The device asked privately and the device that answered the group are
+    /// one device, so this is a union rather than a choice: a name is added
+    /// with its source and the deduplication in [`Self::add`] settles the rest,
+    /// and a model already learned is kept because the private answer is the
+    /// more specific of the two.
+    pub fn merge(&mut self, other: &Self) {
+        for name in &other.names {
+            self.add(name.value.clone(), name.source);
+        }
+        for service in &other.services {
+            if !self.services.contains(service) {
+                self.services.push(service.clone());
+            }
+        }
+        if self.model.is_none() {
+            self.model.clone_from(&other.model);
+        }
+    }
+
+    /// Folds one SSDP reply in.
+    ///
+    /// The first `SERVER` wins. They are the same in every reply from one
+    /// device, and a device that contradicts itself between datagrams is not
+    /// saying anything worth preferring the later half of.
+    pub fn announced(&mut self, announcement: &crate::ssdp::Announcement) {
+        for kind in announcement.types() {
+            if !self.upnp.contains(&kind) {
+                self.upnp.push(kind);
+            }
+        }
+        if self.product.is_none() {
+            self.product.clone_from(&announcement.server);
+        }
     }
 
     fn add(&mut self, value: String, source: Source) {
@@ -172,6 +357,31 @@ pub trait Ask: Sync {
     /// fresh ephemeral port per call: two identifications running at once on
     /// one socket would each receive the other's answers.
     fn ask(&self, to: SocketAddr, payload: &[u8], timeout: Duration) -> io::Result<Vec<u8>>;
+
+    /// Sends `payload` to `to` and collects every reply that arrives inside
+    /// `window`, up to `most`, each with the address it came from.
+    ///
+    /// **SSDP is why this exists**, and both halves of the signature are its
+    /// doing. A device answering `ST: ssdp:all` sends one datagram per device
+    /// and service it hosts, and the one that names what it is is rarely the
+    /// first to arrive — so the whole window is read. And the search goes to a
+    /// multicast group rather than to a device, so the sender's address is the
+    /// only thing that says which device an answer is about.
+    ///
+    /// The default answers with the single reply [`Ask::ask`] gives, attributed
+    /// to the address it was sent to, so a transport that only knows how to do
+    /// one exchange stays usable and every recorded test fake keeps working.
+    fn ask_all(
+        &self,
+        to: SocketAddr,
+        payload: &[u8],
+        window: Duration,
+        most: usize,
+    ) -> io::Result<Vec<(IpAddr, Vec<u8>)>> {
+        let _ = most;
+        self.ask(to, payload, window)
+            .map(|reply| vec![(to.ip(), reply)])
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -183,6 +393,21 @@ pub struct Options {
     pub resolver: Option<IpAddr>,
     pub mdns: bool,
     pub netbios: bool,
+    /// Ask the device for its UPnP announcements. See [`crate::ssdp`].
+    pub ssdp: bool,
+    /// Ask the device over LLMNR, which is how a Windows machine with NetBIOS
+    /// switched off still says its name.
+    pub llmnr: bool,
+    /// Ask the device whether it is a name server.
+    pub dns: bool,
+    /// How long to listen after each of the two link-wide questions.
+    ///
+    /// Much longer than [`Self::timeout`], and paid twice for a whole scan
+    /// rather than once per device. An SSDP responder is entitled to spread its
+    /// answers across `MX` seconds and a television sends seventeen of them, so
+    /// a window shorter than this loses the later ones — and on the television
+    /// it was the twelfth that named it.
+    pub link_window: Duration,
 }
 
 impl Default for Options {
@@ -195,6 +420,10 @@ impl Default for Options {
             resolver: None,
             mdns: true,
             netbios: true,
+            ssdp: true,
+            llmnr: true,
+            dns: true,
+            link_window: Duration::from_millis(2500),
         }
     }
 }
@@ -203,6 +432,89 @@ impl Default for Options {
 pub const MDNS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), 5353);
 /// NetBIOS name service.
 pub const NBNS_PORT: u16 = 137;
+/// Link-local multicast name resolution, RFC 4795.
+pub const LLMNR_PORT: u16 = 5355;
+/// Where a name server listens.
+pub const DNS_PORT: u16 = 53;
+
+/// The pseudo-record a name server answers with what it is, in the CHAOS class
+/// that exists on a modern network for this and nothing else.
+///
+/// **Asked first, because it is the question that cannot leave the network.** A
+/// name server answers `version.bind` out of itself — with the string, or with
+/// a refusal from a server that has been told not to say — and a forwarder has
+/// nowhere to forward a CHAOS query to. Either reply proves a name server is
+/// listening, and the string is a banner: the server volunteers it or it does
+/// not, and reading what is offered is the whole of the interaction
+/// `CLAUDE.md`'s conduct rules allow.
+const VERSION_BIND: &str = "version.bind";
+
+/// The fallback question, for a server that ignores CHAOS entirely.
+///
+/// `localhost`, and the choice of name is the point. Asking a stranger's
+/// resolver for anything at all may make it go out to the internet — this one
+/// does, on a router observed while this was written, despite RFC 6761 §6.3
+/// telling it to answer `localhost` itself. So the name asked for has to be one
+/// that says nothing about the network being scanned and nothing about who is
+/// asking, and `localhost` is the most-resolved name there is. What Muster must
+/// never do is put a device's own name or address into a question for somebody
+/// else's server, and it does not.
+const RESOLVER_PROBE: &str = "localhost";
+
+/// DNS-SD's enumeration query: "list the service types you offer".
+const SERVICE_ENUMERATION: &str = "_services._dns-sd._udp.local";
+
+/// How many datagrams a link-wide question will read before it stops listening.
+const MOST: usize = 512;
+
+/// Asks the whole link what it offers, and returns the answers by address.
+///
+/// **The same lesson SSDP taught, and it applies here too.** Two televisions on
+/// a real network ignored a unicast mDNS question entirely and answered this
+/// one within milliseconds: a responder that only processes what arrives on the
+/// group socket is common, and asking each device privately misses every one of
+/// them. The per-device questions stay — they are what gets a name out of the
+/// devices that do answer them — and this is asked once beside them.
+///
+/// The query goes out from an ephemeral port, which under RFC 6762 §6.7 makes
+/// it a *legacy* query: a responder answers one of those with a unicast
+/// datagram to the port that asked, rather than by multicasting to the group.
+/// That is what makes one socket able to collect the link's answers and tell
+/// them apart, and it is why nothing here has to join a multicast group.
+fn sweep_services<A: Ask + ?Sized>(ask: &A, window: Duration) -> BTreeMap<IpAddr, Identity> {
+    let question = dns::query(0, SERVICE_ENUMERATION, dns::TYPE_PTR, false);
+    let Ok(replies) = ask.ask_all(MDNS, &question, window, MOST) else {
+        return BTreeMap::new();
+    };
+
+    let mut found: BTreeMap<IpAddr, (Identity, Vec<(usize, String)>)> = BTreeMap::new();
+    for (from, reply) in replies {
+        if let Some(message) = dns::parse(&reply) {
+            let (identity, models) = found.entry(from).or_default();
+            harvest(&message, identity, models);
+        }
+    }
+    found
+        .into_iter()
+        .map(|(address, (mut identity, mut models))| {
+            models.sort_by_key(|(rank, _)| *rank);
+            identity.model = models.into_iter().next().map(|(_, value)| value);
+            (address, identity)
+        })
+        .collect()
+}
+
+/// mDNS `TXT` keys that name a model, best first.
+///
+/// `model` is Apple's, in `_device-info._tcp`, and it is an exact hardware
+/// identifier. `md` is Google Cast's and is the name on the box. `ty` and
+/// `usb_MDL` are the printing world's, and both are the model as the printer's
+/// own driver knows it. Where a device fills in more than one they agree, and
+/// the order is what settles it when they do not.
+const MODEL_KEYS: &[&str] = &["model", "md", "ty", "usb_mdl"];
+
+/// The service a device's own model lives in, and Apple's alone fills it in.
+const DEVICE_INFO: &str = "_device-info._tcp.local";
 
 /// Identifies one device.
 ///
@@ -210,6 +522,10 @@ pub const NBNS_PORT: u16 = 137;
 /// is a real answer and different from an error.
 pub fn one<A: Ask>(address: IpAddr, ask: &A, rate: &Bucket, opts: Options, id: u16) -> Identity {
     let mut found = Identity::default();
+    // Every model string any record offered, with its key's rank. Collected
+    // rather than assigned, so that the answer does not depend on which of the
+    // three mDNS questions a device happened to answer first.
+    let mut models: Vec<(usize, String)> = Vec::new();
 
     if let (Some(resolver), IpAddr::V4(v4)) = (opts.resolver, address) {
         rate.wait();
@@ -238,15 +554,49 @@ pub fn one<A: Ask>(address: IpAddr, ask: &A, rate: &Bucket, opts: Options, id: u
             if let Some(name) = msg.first_ptr() {
                 found.add(name.to_string(), Source::Mdns);
             }
-            for record in msg.records() {
-                if let dns::RData::Srv { target, .. } = &record.data {
-                    found.add(target.clone(), Source::Mdns);
-                }
-                if let Some(service) = service_type(&record.name)
-                    && !found.services.iter().any(|s| s == service)
-                {
-                    found.services.push(service.to_string());
-                }
+            harvest(&msg, &mut found, &mut models);
+        }
+
+        // **The question that asks what the device *does*.** The reverse lookup
+        // above gets a name and, if the responder is generous with its
+        // additional section, a service or two by luck. Most are not generous,
+        // which is why a network full of Chromecasts, Android televisions and
+        // printers came back as a list of names with nothing behind them: the
+        // service half of `kind`'s table could not fire because nothing had
+        // ever asked for a service.
+        //
+        // `_services._dns-sd._udp.local` is DNS-SD's own enumeration query, and
+        // its answers are one `PTR` per service type the responder offers. One
+        // datagram, and it is the difference between "SHIELDANDROIDTV, a
+        // Windows machine, because it answered NetBIOS" and "a television,
+        // because it advertises `_androidtvremote2._tcp`".
+        rate.wait();
+        let q = dns::query(0, SERVICE_ENUMERATION, dns::TYPE_PTR, true);
+        if let Ok(reply) = ask.ask(SocketAddr::new(address, 5353), &q, opts.timeout)
+            && let Some(msg) = dns::parse(&reply)
+        {
+            harvest(&msg, &mut found, &mut models);
+        }
+
+        // And the question that asks what the device *is*. `_device-info._tcp`
+        // is not enumerated by the query above — Apple's responder does not
+        // list it as a service, because it is not one — so it has to be asked
+        // for by name, and its name is built from the name the device just
+        // gave. `Ulriks-iPhone._device-info._tcp.local` answers with
+        // `model=iPhone14,2`, which is the difference between "an Apple
+        // device" and "a phone".
+        if let Some(stem) = found
+            .names
+            .iter()
+            .find(|name| name.source == Source::Mdns)
+            .map(|name| name.value.trim_end_matches(".local").to_string())
+        {
+            rate.wait();
+            let q = dns::query(0, &format!("{stem}.{DEVICE_INFO}"), dns::TYPE_TXT, true);
+            if let Ok(reply) = ask.ask(SocketAddr::new(address, 5353), &q, opts.timeout)
+                && let Some(msg) = dns::parse(&reply)
+            {
+                harvest(&msg, &mut found, &mut models);
             }
         }
     }
@@ -265,11 +615,150 @@ pub fn one<A: Ask>(address: IpAddr, ask: &A, rate: &Bucket, opts: Options, id: u
         }
     }
 
+    // LLMNR, and it is asked *because* NetBIOS often is not answered any more.
+    // A machine with NetBIOS over TCP/IP switched off — which is the default on
+    // a network Windows has classified as public, and increasingly the default
+    // full stop — answers nothing on 137 and still answers here.
+    //
+    // The flag is worth as much as the name. LLMNR is implemented by Windows
+    // and by `systemd-resolved`, and by nothing else on a home network: no
+    // television, printer, camera or light bulb has ever answered on 5355. It
+    // is a weak clue and it is ranked as one, but it is the only clue at all
+    // for the commonest silent device there is, a Windows desktop behind its
+    // own firewall.
+    if opts.llmnr
+        && let IpAddr::V4(v4) = address
+    {
+        rate.wait();
+        let q = dns::query(id, &dns::reverse_name(v4), dns::TYPE_PTR, false);
+        if let Ok(reply) = ask.ask(SocketAddr::new(address, LLMNR_PORT), &q, opts.timeout)
+            && let Some(msg) = dns::parse(&reply)
+        {
+            found.llmnr = true;
+            if let Some(name) = msg.first_ptr() {
+                found.add(name.to_string(), Source::Llmnr);
+            }
+        }
+    }
+
+    // Is this a name server?
+    //
+    // **Any well-formed reply is the answer.** A server that refuses the query,
+    // or does not have the name, or will not recurse for a stranger, has still
+    // spoken DNS on port 53 — and "there is a name server here" is what the
+    // badge claims. Requiring a successful resolution would miss every resolver
+    // configured to serve its own subnet only, which is most of the ones worth
+    // finding on a managed network.
+    //
+    // The second question is asked only when the first went unanswered, so the
+    // ordinary case is one datagram that never left the link.
+    if opts.dns {
+        rate.wait();
+        let question = dns::query_in_class(id, VERSION_BIND, dns::TYPE_TXT, dns::CLASS_CH);
+        if let Ok(reply) = ask.ask(SocketAddr::new(address, DNS_PORT), &question, opts.timeout)
+            && let Some(message) = dns::parse(&reply)
+            && message.is_response()
+            && message.id == id
+        {
+            found.resolver = Some(Resolver {
+                version: message.first_txt().filter(|v| !v.trim().is_empty()),
+                recursive: message.recursion_available(),
+            });
+        }
+
+        if found.resolver.is_none() {
+            rate.wait();
+            let question = dns::query(id, RESOLVER_PROBE, dns::TYPE_A, false);
+            if let Ok(reply) = ask.ask(SocketAddr::new(address, DNS_PORT), &question, opts.timeout)
+                && let Some(message) = dns::parse(&reply)
+                && message.is_response()
+                && message.id == id
+            {
+                found.resolver = Some(Resolver {
+                    version: None,
+                    recursive: message.recursion_available(),
+                });
+            }
+        }
+    }
+
+    models.sort_by_key(|(rank, _)| *rank);
+    found.model = models.into_iter().next().map(|(_, value)| value);
     found
 }
 
-/// The `_ipp._tcp` out of `printer._ipp._tcp.local`, where there is one.
-fn service_type(name: &str) -> Option<&str> {
+/// Takes everything worth having out of an mDNS reply.
+///
+/// Both mDNS questions read the same things, and they read them from every
+/// section: a responder answering a `PTR` commonly attaches the `SRV`, `TXT`
+/// and `A` records for the same service without being asked, and those carry
+/// the service type as their own name.
+fn harvest(msg: &dns::Message, found: &mut Identity, models: &mut Vec<(usize, String)>) {
+    let offered = |service: Option<String>, found: &mut Identity| {
+        if let Some(service) = service
+            && !found.services.contains(&service)
+        {
+            found.services.push(service);
+        }
+    };
+    for record in msg.records() {
+        match &record.data {
+            dns::RData::Srv { target, .. } => found.add(target.clone(), Source::Mdns),
+            // A `PTR` answering the enumeration query has the service type as
+            // its *data*, not as its name, which is the whole point of asking
+            // it. `_services._dns-sd._udp.local PTR _googlecast._tcp.local`.
+            dns::RData::Name(target) => offered(service_type(target), found),
+            dns::RData::Txt(strings) => {
+                for entry in strings {
+                    if let Some((rank, value)) = model_of(entry)
+                        && !models.iter().any(|(_, seen)| seen == &value)
+                    {
+                        models.push((rank, value));
+                    }
+                }
+            }
+            _ => {}
+        }
+        offered(service_type(&record.name), found);
+    }
+}
+
+/// The model out of one `TXT` entry, and how good a source its key is.
+///
+/// `TXT` entries are `key=value` with the key case-insensitive, and everything
+/// that is not one of [`MODEL_KEYS`] is somebody's protocol detail: a printer's
+/// `_ipp` record carries a dozen entries and only two of them name the printer.
+fn model_of(entry: &str) -> Option<(usize, String)> {
+    let (key, value) = entry.split_once('=')?;
+    // Avahi's `model` carries an appearance hint after an `@`, which a real
+    // network hands over as `MacPro7,1@ECOLOR=226,226,224`. It is the colour
+    // Finder should tint the icon, it is not part of the model, and it would
+    // be shown to somebody as though it were.
+    let value = value.split('@').next().unwrap_or(value).trim();
+    if value.is_empty() {
+        return None;
+    }
+    let key = key.trim().to_ascii_lowercase();
+    let rank = MODEL_KEYS.iter().position(|known| *known == key)?;
+    Some((rank, value.to_string()))
+}
+
+/// The `_ipp._tcp` out of an mDNS name, where there is one.
+///
+/// Three shapes have to come out the same, because all three arrive:
+///
+/// * `printer._ipp._tcp.local` — an instance, from a record's name.
+/// * `_ipp._tcp.local` — a bare type, which is what the enumeration query is
+///   answered with. This one used to return [`None`]: the old reader took
+///   everything after the first `._` and got `_tcp` alone, so **every answer to
+///   the question that lists a device's services was thrown away**. It was
+///   invisible because nothing asked that question yet.
+/// * `_universal._sub._ipp._tcp.local` — a subtype, which AirPrint uses. The
+///   type is what matters and the subtype is dropped.
+///
+/// So the scan is for a label beginning with `_` that is followed by `_tcp` or
+/// `_udp`, taking the last such pair rather than the first.
+fn service_type(name: &str) -> Option<String> {
     let trimmed = name.trim_end_matches('.').trim_end_matches(".local");
     // `_services._dns-sd._udp` is the meta-query used to *enumerate* service
     // types. It is not a service anything offers, and reporting it would put
@@ -277,14 +766,12 @@ fn service_type(name: &str) -> Option<&str> {
     if trimmed.starts_with("_services.") {
         return None;
     }
-    let at = trimmed.find("._")?;
-    let service = &trimmed[at + 1..];
-    // Two labels, `_ipp._tcp`, and nothing else.
-    let mut parts = service.split('.');
-    let (Some(a), Some(b), None) = (parts.next(), parts.next(), parts.next()) else {
-        return None;
-    };
-    (a.starts_with('_') && (b == "_tcp" || b == "_udp")).then_some(service)
+    let labels: Vec<&str> = trimmed.split('.').collect();
+    labels.windows(2).find_map(|pair| {
+        let (name, protocol) = (pair[0], pair[1]);
+        (name.starts_with('_') && (protocol == "_tcp" || protocol == "_udp"))
+            .then(|| format!("{name}.{protocol}"))
+    })
 }
 
 /// Identifies many devices, in parallel, cancellably.
@@ -299,6 +786,22 @@ pub fn many<A: Ask>(
     cancel: &AtomicBool,
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Vec<Identity> {
+    // One search for the whole link, before the per-device work rather than
+    // inside it: see [`crate::ssdp`] for why this is a multicast question and
+    // not twenty unicast ones. A device that answers here and was never swept
+    // is not invented into the results — this fills in what is known about the
+    // addresses the caller asked about, and nothing else.
+    let announced = if opts.ssdp && !cancel.load(Ordering::Relaxed) {
+        ssdp::discover(ask, opts.link_window)
+    } else {
+        Default::default()
+    };
+    let offered = if opts.mdns && !cancel.load(Ordering::Relaxed) {
+        sweep_services(ask, opts.link_window)
+    } else {
+        Default::default()
+    };
+
     let next = AtomicU64::new(0);
     let done = AtomicU64::new(0);
     let mut out: Vec<Identity> = vec![Identity::default(); addresses.len()];
@@ -337,6 +840,15 @@ pub fn many<A: Ask>(
             }
         }
     });
+
+    for (address, identity) in addresses.iter().zip(out.iter_mut()) {
+        if let Some(link) = offered.get(address) {
+            identity.merge(link);
+        }
+        for announcement in announced.get(address).into_iter().flatten() {
+            identity.announced(announcement);
+        }
+    }
     out
 }
 
@@ -347,20 +859,81 @@ mod tests {
     use std::sync::Mutex;
 
     /// Recorded replies, keyed by where the question went.
+    ///
+    /// `asked` keys by the question as well, because identification now sends
+    /// three different mDNS questions to one port and a fake that could only
+    /// tell them apart by address would answer all three with the same
+    /// datagram — which is the one thing a recorded transport must not do.
     #[derive(Default)]
     struct Fake {
         replies: BTreeMap<SocketAddr, Vec<u8>>,
+        asked_about: BTreeMap<(SocketAddr, String), Vec<u8>>,
         asked: Mutex<Vec<SocketAddr>>,
     }
 
+    impl Fake {
+        /// Answers `question` asked of `to`, and nothing else.
+        fn about(&mut self, to: SocketAddr, question: &str, reply: Vec<u8>) {
+            self.asked_about
+                .insert((to, question.to_ascii_lowercase()), reply);
+        }
+    }
+
     impl Ask for Fake {
-        fn ask(&self, to: SocketAddr, _payload: &[u8], _t: Duration) -> io::Result<Vec<u8>> {
+        fn ask(&self, to: SocketAddr, payload: &[u8], _t: Duration) -> io::Result<Vec<u8>> {
             self.asked.lock().unwrap().push(to);
+            let question = dns::parse(payload).and_then(|m| {
+                m.questions
+                    .first()
+                    .map(|(name, _)| name.to_ascii_lowercase())
+            });
+            if let Some(question) = question
+                && let Some(reply) = self.asked_about.get(&(to, question))
+            {
+                return Ok(reply.clone());
+            }
             match self.replies.get(&to) {
                 Some(r) => Ok(r.clone()),
                 None => Err(io::Error::new(io::ErrorKind::TimedOut, "nothing answered")),
             }
         }
+    }
+
+    /// A `REFUSED` reply with recursion available and no records, which is
+    /// what a hardened or a small name server sends.
+    fn refusal(id: u16) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&id.to_be_bytes());
+        // Response, recursion desired, recursion available, rcode 5.
+        m.extend_from_slice(&0x8185u16.to_be_bytes());
+        m.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        m
+    }
+
+    /// One `TXT` record, as an mDNS responder would send it.
+    fn txt_reply(name: &str, entries: &[&str]) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&0u16.to_be_bytes());
+        m.extend_from_slice(&0x8400u16.to_be_bytes());
+        m.extend_from_slice(&0u16.to_be_bytes()); // no question echoed
+        m.extend_from_slice(&1u16.to_be_bytes());
+        m.extend_from_slice(&[0, 0, 0, 0]);
+        for label in name.trim_end_matches('.').split('.') {
+            m.push(label.len() as u8);
+            m.extend_from_slice(label.as_bytes());
+        }
+        m.push(0);
+        m.extend_from_slice(&dns::TYPE_TXT.to_be_bytes());
+        m.extend_from_slice(&dns::CLASS_IN.to_be_bytes());
+        m.extend_from_slice(&60u32.to_be_bytes());
+        let mut body = Vec::new();
+        for entry in entries {
+            body.push(entry.len() as u8);
+            body.extend_from_slice(entry.as_bytes());
+        }
+        m.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        m.extend_from_slice(&body);
+        m
     }
 
     fn ptr_reply(question: &str, answer: &str) -> Vec<u8> {
@@ -562,21 +1135,345 @@ mod tests {
         };
         one(ip("192.168.0.9"), &fake, &Bucket::new(1_000_000), opts, 1);
         let asked = fake.asked.lock().unwrap();
+        // Port 53 is asked of the *device*, to find out whether it is itself a
+        // name server. What must not happen is a question to a resolver, and
+        // with no resolver configured there is no address to send one to.
         assert!(
-            !asked.iter().any(|a| a.port() == 53),
-            "asked something: {asked:?}"
+            asked
+                .iter()
+                .all(|a| a.port() != 53 || a.ip() == ip("192.168.0.9")),
+            "asked something that is not the device: {asked:?}"
         );
         assert!(asked.iter().any(|a| a.port() == 5353));
         assert!(asked.iter().any(|a| a.port() == 137));
     }
 
+    /// The defect this was all written for: a device that answers mDNS with a
+    /// name and is never asked what it offers.
+    ///
+    /// The enumeration query's answers carry the service type as the `PTR`
+    /// **data**, not as the record's name, which is why it needed a reader of
+    /// its own. Before this the device came back with a name and an empty
+    /// service list, and `kind` had nothing to work with.
+    #[test]
+    fn asking_what_a_device_offers_is_what_fills_the_service_list() {
+        let device = SocketAddr::new(ip("192.168.0.101"), 5353);
+        let mut fake = Fake::default();
+        fake.about(
+            device,
+            "101.0.168.192.in-addr.arpa",
+            ptr_reply("101.0.168.192.in-addr.arpa", "SHIELDANDROIDTV.local"),
+        );
+        fake.about(
+            device,
+            SERVICE_ENUMERATION,
+            ptr_reply(SERVICE_ENUMERATION, "_androidtvremote2._tcp.local"),
+        );
+
+        let found = one(
+            ip("192.168.0.101"),
+            &fake,
+            &Bucket::new(1_000_000),
+            Options::default(),
+            1,
+        );
+        assert_eq!(found.best().unwrap().value, "SHIELDANDROIDTV.local");
+        assert_eq!(found.services, vec!["_androidtvremote2._tcp"]);
+        // And the enumeration's answer is a service, not a second name for the
+        // device.
+        assert_eq!(found.names.len(), 1, "{:?}", found.names);
+    }
+
+    /// `_device-info` is asked for by name, built from the name the device just
+    /// gave, because the enumeration query does not list it.
+    #[test]
+    fn the_model_is_asked_for_under_the_name_the_device_gave() {
+        let device = SocketAddr::new(ip("192.168.0.30"), 5353);
+        let mut fake = Fake::default();
+        fake.about(
+            device,
+            "30.0.168.192.in-addr.arpa",
+            ptr_reply("30.0.168.192.in-addr.arpa", "Kitchen.local"),
+        );
+        fake.about(
+            device,
+            &format!("Kitchen.{DEVICE_INFO}"),
+            txt_reply(
+                &format!("Kitchen.{DEVICE_INFO}"),
+                &["model=AudioAccessory5,1", "osxvers=21"],
+            ),
+        );
+
+        let found = one(
+            ip("192.168.0.30"),
+            &fake,
+            &Bucket::new(1_000_000),
+            Options::default(),
+            1,
+        );
+        assert_eq!(found.model.as_deref(), Some("AudioAccessory5,1"));
+    }
+
+    /// Where two keys both name a model, the better key wins whichever record
+    /// happened to arrive first.
+    #[test]
+    fn the_best_model_key_wins_and_not_the_first_reply() {
+        assert_eq!(
+            model_of("md=Chromecast Ultra"),
+            Some((1, "Chromecast Ultra".into()))
+        );
+        assert_eq!(
+            model_of("ty=HP OfficeJet 6950"),
+            Some((2, "HP OfficeJet 6950".into()))
+        );
+        assert_eq!(model_of("rp=printers/hp"), None, "not a model key");
+        assert_eq!(model_of("model="), None, "an empty value names nothing");
+        assert_eq!(model_of("MODEL=iPhone14,2"), Some((0, "iPhone14,2".into())));
+        // As a TrueNAS box on a real network sends it.
+        assert_eq!(
+            model_of("model=MacPro7,1@ECOLOR=226,226,224"),
+            Some((0, "MacPro7,1".into())),
+            "the colour hint is not part of the model"
+        );
+    }
+
+    /// The search is one multicast question, and a reply is attributed to the
+    /// device it came from and to no other.
+    ///
+    /// Both halves matter. The whole reason SSDP moved out of the per-device
+    /// loop is that a device answers the group and ignores a question addressed
+    /// to itself, so the only thing tying an answer to a device is the address
+    /// it arrived from — and getting that wrong would put a television's name
+    /// on its neighbour.
+    #[test]
+    fn a_group_search_is_attributed_to_whoever_answered_it() {
+        struct Link;
+        impl Ask for Link {
+            fn ask(&self, _to: SocketAddr, _p: &[u8], _t: Duration) -> io::Result<Vec<u8>> {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "nothing answered"))
+            }
+            fn ask_all(
+                &self,
+                to: SocketAddr,
+                payload: &[u8],
+                _w: Duration,
+                _most: usize,
+            ) -> io::Result<Vec<(IpAddr, Vec<u8>)>> {
+                // Two link-wide questions go out now, and only one of them is
+                // this test's.
+                if to == MDNS {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "no mDNS here"));
+                }
+                assert_eq!(to, ssdp::GROUP, "the search goes to the group");
+                assert!(String::from_utf8_lossy(payload).starts_with("M-SEARCH "));
+                let television = ip("192.168.0.107");
+                Ok(vec![
+                    // The first reply from the television names nothing, which
+                    // is the usual case and the reason the window is read out.
+                    (
+                        television,
+                        b"HTTP/1.1 200 OK
+ST: upnp:rootdevice
+SERVER: WebOS/4.0.0 UPnP/1.0
+
+"
+                        .to_vec(),
+                    ),
+                    (
+                        television,
+                        b"HTTP/1.1 200 OK
+ST: urn:lge:device:tv:1
+SERVER: WebOS/4.0.0 UPnP/1.0
+
+"
+                        .to_vec(),
+                    ),
+                    (
+                        ip("192.168.0.1"),
+                        b"HTTP/1.1 200 OK
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
+SERVER: TP-LINK/TP-LINK UPnP/1.1 MiniUPnPd/2.2.2
+
+"
+                        .to_vec(),
+                    ),
+                ])
+            }
+        }
+
+        let addresses = [ip("192.168.0.1"), ip("192.168.0.9"), ip("192.168.0.107")];
+        let found = many(
+            &addresses,
+            &Link,
+            &Bucket::new(1_000_000),
+            Options::default(),
+            &AtomicBool::new(false),
+            &|_, _| {},
+        );
+        assert_eq!(found[2].upnp, vec!["urn:lge:device:tv:1"]);
+        assert_eq!(found[2].product.as_deref(), Some("WebOS/4.0.0 UPnP/1.0"));
+        assert_eq!(
+            found[0].upnp,
+            vec!["urn:schemas-upnp-org:device:internetgatewaydevice:1"]
+        );
+        assert!(
+            found[1].is_empty(),
+            "the address that said nothing is left saying nothing"
+        );
+    }
+
+    /// The link-wide mDNS question, and the reason it exists: two televisions
+    /// that answer it and ignore the same question asked of them privately.
+    #[test]
+    fn the_link_wide_mdns_question_fills_in_a_device_that_answers_nothing_privately() {
+        struct Link;
+        impl Ask for Link {
+            fn ask(&self, _to: SocketAddr, _p: &[u8], _t: Duration) -> io::Result<Vec<u8>> {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "not privately"))
+            }
+            fn ask_all(
+                &self,
+                to: SocketAddr,
+                payload: &[u8],
+                _w: Duration,
+                _most: usize,
+            ) -> io::Result<Vec<(IpAddr, Vec<u8>)>> {
+                if to != MDNS {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "no UPnP here"));
+                }
+                let asked = dns::parse(payload).expect("a query");
+                assert_eq!(asked.questions[0].0, SERVICE_ENUMERATION);
+                Ok(vec![(
+                    ip("192.168.0.107"),
+                    ptr_reply(SERVICE_ENUMERATION, "_androidtvremote2._tcp.local"),
+                )])
+            }
+        }
+
+        let addresses = [ip("192.168.0.9"), ip("192.168.0.107")];
+        let found = many(
+            &addresses,
+            &Link,
+            &Bucket::new(1_000_000),
+            Options::default(),
+            &AtomicBool::new(false),
+            &|_, _| {},
+        );
+        assert_eq!(found[1].services, vec!["_androidtvremote2._tcp"]);
+        assert!(found[0].is_empty(), "and nobody else is given its services");
+    }
+
+    /// A name server is anything that answers in the protocol, including a
+    /// server that answers by refusing.
+    ///
+    /// The router this was tested against replies `REFUSED` to `version.bind`
+    /// and carries no version string, and it is unmistakably a name server. A
+    /// probe that only counted successful answers would have missed it, and
+    /// with it most of the resolvers on managed networks.
+    #[test]
+    fn a_refusal_on_port_53_is_still_a_name_server() {
+        let mut fake = Fake::default();
+        fake.replies.insert(
+            SocketAddr::new(ip("192.168.0.1"), DNS_PORT),
+            // A reply to transaction 7: response, recursion available, REFUSED,
+            // and no records at all.
+            refusal(7),
+        );
+        let found = one(
+            ip("192.168.0.1"),
+            &fake,
+            &Bucket::new(1_000_000),
+            Options::default(),
+            7,
+        );
+        assert_eq!(found.roles(), vec![Role::Dns]);
+        let resolver = found.resolver.expect("a name server");
+        assert_eq!(resolver.version, None, "it refused to say");
+        assert!(resolver.recursive, "and it resolves for clients");
+    }
+
+    /// The version string, where a server gives one.
+    #[test]
+    fn a_server_that_names_itself_is_recorded_with_its_version() {
+        let mut fake = Fake::default();
+        fake.about(
+            SocketAddr::new(ip("192.168.0.1"), DNS_PORT),
+            VERSION_BIND,
+            txt_reply(VERSION_BIND, &["dnsmasq-2.90"]),
+        );
+        let found = one(
+            ip("192.168.0.1"),
+            &fake,
+            &Bucket::new(1_000_000),
+            Options::default(),
+            0,
+        );
+        let resolver = found.resolver.expect("a name server");
+        assert_eq!(resolver.version.as_deref(), Some("dnsmasq-2.90"));
+    }
+
+    /// A device that says nothing on 53 gets no badge, which is the whole
+    /// point: the badge is a service that answered.
+    #[test]
+    fn silence_on_port_53_is_not_a_name_server() {
+        let found = one(
+            ip("192.168.0.9"),
+            &Fake::default(),
+            &Bucket::new(1_000_000),
+            Options::default(),
+            1,
+        );
+        assert_eq!(found.resolver, None);
+        assert!(found.roles().is_empty());
+    }
+
+    /// The badges come out in a stated order, so a row does not reshuffle
+    /// itself between two scans that learned the same things.
+    #[test]
+    fn the_roles_are_ordered_by_the_enum_and_not_by_arrival() {
+        let mut identity = Identity {
+            resolver: Some(Resolver::default()),
+            ..Default::default()
+        };
+        identity.offers_addresses();
+        assert_eq!(identity.roles(), vec![Role::Dhcp, Role::Dns]);
+    }
+
+    /// A responder on 5355 is the flag, whether or not it gave a new name.
+    #[test]
+    fn an_llmnr_answer_is_recorded_even_when_the_name_is_already_known() {
+        let mut fake = Fake::default();
+        fake.replies.insert(
+            SocketAddr::new(ip("192.168.0.150"), LLMNR_PORT),
+            ptr_reply("150.0.168.192.in-addr.arpa", "HOME-GAMING"),
+        );
+        let found = one(
+            ip("192.168.0.150"),
+            &fake,
+            &Bucket::new(1_000_000),
+            Options::default(),
+            1,
+        );
+        assert!(found.llmnr);
+        assert_eq!(found.best().unwrap().source, Source::Llmnr);
+    }
+
     #[test]
     fn service_types_are_read_out_of_mdns_names() {
-        assert_eq!(service_type("brother._ipp._tcp.local"), Some("_ipp._tcp"));
+        let read = |name: &str| service_type(name).unwrap_or_default();
+        assert_eq!(read("brother._ipp._tcp.local"), "_ipp._tcp");
         assert_eq!(
-            service_type("Living Room._googlecast._tcp.local."),
-            Some("_googlecast._tcp")
+            read("Living Room._googlecast._tcp.local."),
+            "_googlecast._tcp"
         );
+        // A bare type, which is what the enumeration query is answered with.
+        assert_eq!(
+            read("_androidtvremote2._tcp.local"),
+            "_androidtvremote2._tcp"
+        );
+        assert_eq!(read("_spotify-connect._tcp"), "_spotify-connect._tcp");
+        // A subtype names its type, not itself.
+        assert_eq!(read("_universal._sub._ipp._tcp.local"), "_ipp._tcp");
         assert_eq!(service_type("host.local"), None);
         assert_eq!(service_type("_services._dns-sd._udp.local"), None);
     }

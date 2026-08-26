@@ -25,6 +25,47 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::Duration;
+
+/// How long to listen for DHCP offers.
+///
+/// A server on a healthy link answers in milliseconds. The window is this long
+/// because the *second* server is the one being looked for, and a rogue is
+/// often a slow one: a small router doing NAT on a busy uplink, or a virtual
+/// machine that has to be woken.
+const DHCP_WINDOW: Duration = Duration::from_secs(3);
+
+/// What a scan is asked to do.
+///
+/// Built from the settings, and passed down rather than read from a global: a
+/// scan running on its own thread must not be able to change its mind halfway
+/// because somebody moved a slider. Every field is a decision somebody made
+/// once, in the scan menu or in the settings page, and both write the same
+/// [`crate::prefs::Prefs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Options {
+    /// Probes a second, shared by every probe in the scan.
+    pub rate: u32,
+    /// Ask each device what it is. Off leaves a list of addresses and vendors.
+    pub identify: bool,
+    /// Ask each device that answered whether it is a name server.
+    pub dns: bool,
+    /// Broadcast a DHCP DISCOVER and collect every offer.
+    pub dhcp: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            rate: muster_net::rate::DEFAULT_RATE,
+            identify: true,
+            dns: true,
+            // See `prefs::Prefs::scan_dhcp`: asking servers to reserve an
+            // address is a deliberate act, so it is off until somebody says so.
+            dhcp: false,
+        }
+    }
+}
 
 /// What the scan thread reports.
 pub enum Update {
@@ -52,6 +93,13 @@ pub struct Outcome {
     pub sweep: discover::Sweep,
     pub names: Vec<Identity>,
     pub prefix: Prefix,
+    /// What answered a DHCP DISCOVER, where one was sent.
+    ///
+    /// [`None`] means the question was not asked, which is a different thing
+    /// from nobody answering and is shown as a different thing:
+    /// `dhcp::Probe::not_done` covers "asked and could not", and this covers
+    /// "not asked".
+    pub dhcp: Option<Box<muster_net::dhcp::Probe>>,
 }
 
 /// Which part of a scan is running.
@@ -111,14 +159,22 @@ impl State {
     }
 
     /// Starts a scan of one prefix.
-    pub fn start(survey: &Survey, prefix: Prefix, on_link: bool) -> Self {
+    pub fn start(survey: &Survey, prefix: Prefix, on_link: bool, opts: Options) -> Self {
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let resolver = survey.resolvers.iter().copied().find(|a| a.is_ipv4());
+        // The hardware address of the interface a scan would go out of. A
+        // DISCOVER is answered to whoever sent it, so an address nothing on
+        // this link owns collects nothing.
+        let mac = survey
+            .interfaces
+            .iter()
+            .find(|i| i.is_scannable())
+            .and_then(|i| i.mac);
 
         {
             let cancel = Arc::clone(&cancel);
-            std::thread::spawn(move || run(prefix, on_link, resolver, cancel, tx));
+            std::thread::spawn(move || run(prefix, on_link, resolver, mac, opts, cancel, tx));
         }
 
         Self::Running {
@@ -276,18 +332,39 @@ fn run(
     prefix: Prefix,
     on_link: bool,
     resolver: Option<std::net::IpAddr>,
+    mac: Option<muster_net::MacAddr>,
+    opts: Options,
     cancel: Arc<AtomicBool>,
     tx: Sender<Update>,
 ) {
     let transport = muster_net::platform::Host;
-    let rate = Bucket::polite();
-    let opts = if on_link {
+    let rate = Bucket::new(opts.rate);
+
+    // **Started first and collected last.** A DISCOVER is one broadcast and
+    // then a wait on a socket, which overlaps the sweep and the identification
+    // for nothing: by the time there is a device list to attribute offers to,
+    // the offers are already in. Running it as a phase of its own would have
+    // added its whole window to every scan.
+    let dhcp = (opts.dhcp && mac.is_some()).then(|| {
+        let mac = mac.expect("checked");
+        std::thread::spawn(move || {
+            // A fresh transaction id per probe, from the clock rather than a
+            // counter: a predictable id on a real network collects somebody
+            // else's negotiation.
+            let xid = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0x4d75_7374, |d| d.subsec_nanos() ^ d.as_secs() as u32);
+            muster_net::dhcp::probe(&muster_net::platform::udp::Dhcp, mac, xid, DHCP_WINDOW)
+        })
+    });
+
+    let sweep_opts = if on_link {
         discover::Options::on_link()
     } else {
         discover::Options::default()
     };
 
-    let sweep = discover::sweep(prefix, &transport, &rate, opts, &cancel, &|p, hit| {
+    let sweep = discover::sweep(prefix, &transport, &rate, sweep_opts, &cancel, &|p, hit| {
         let _ = tx.send(Update::Swept {
             probed: p.probed,
             total: p.total,
@@ -297,12 +374,17 @@ fn run(
     });
 
     let addresses: Vec<_> = sweep.found.iter().map(|f| f.address).collect();
-    let names = identify::many(
+    let mut names = identify::many(
         &addresses,
         &muster_net::platform::udp::Udp,
         &rate,
         identify::Options {
             resolver,
+            mdns: opts.identify,
+            netbios: opts.identify,
+            ssdp: opts.identify,
+            llmnr: opts.identify,
+            dns: opts.dns,
             ..Default::default()
         },
         &cancel,
@@ -311,10 +393,27 @@ fn run(
         },
     );
 
+    // The offers, and who made them. A server that answered is a device on the
+    // list — usually the gateway — so the badge goes on its row rather than
+    // only into a paragraph on another screen.
+    //
+    // A thread that panicked gives `None`, which is "not asked" rather than
+    // "nobody answered". The two must not collapse into one another.
+    let dhcp = dhcp.and_then(|handle| handle.join().ok());
+    if let Some(probe) = &dhcp {
+        for server in probe.servers() {
+            let server = IpAddr::V4(server);
+            if let Some(i) = addresses.iter().position(|a| *a == server) {
+                names[i].offers_addresses();
+            }
+        }
+    }
+
     let _ = tx.send(Update::Done(Box::new(Outcome {
         sweep,
         names,
         prefix,
+        dhcp: dhcp.map(Box::new),
     })));
 }
 

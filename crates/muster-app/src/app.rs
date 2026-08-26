@@ -6,12 +6,18 @@
 //! device list is the app, so it is a dense table of figures in the monospaced
 //! face with its columns aligned.
 //!
+//! Every navigation row carries an icon from [`crate::icons`], and the sidebar
+//! is in two groups: the places to work at the top, and Settings and About at
+//! the foot. That is the family's arrangement rather than this application's
+//! invention — see [`sidebar`], which says where it comes from.
+//!
 //! The rule that shapes most of what follows: **selection is a neutral fill plus
 //! strong text plus a small accent mark, and never an accent background.** It is
 //! the defect the whole design language exists to avoid, so it is drawn in one
 //! place ([`nav_row`]) rather than at each call site.
 
-use crate::scan::State;
+use crate::icons::{self, Icon};
+use crate::scan::{self, State};
 use crate::theme::{self, Mode, Palette, metrics, text};
 use crate::update::{Exit, Updates};
 use crate::{deviceicon, dhcpcheck, ports, prefs, settings, updatedlg};
@@ -33,11 +39,31 @@ pub enum View {
 impl View {
     pub const ALL: [Self; 3] = [Self::Devices, Self::Network, Self::About];
 
+    /// The views that are *destinations*, in the order the sidebar lists them.
+    ///
+    /// About is not one. It is where the version, the licence and the update
+    /// check live, and the family puts those at the foot of the sidebar rather
+    /// than at the top with the places a person actually goes: Tally's sidebar
+    /// keeps Settings and the version strip below the navigation, and
+    /// HomeLab's keeps the account and the version there. So About is still a
+    /// view, and still selects like one, but it is grouped with Settings at
+    /// the bottom instead of sitting above This network as a third place to
+    /// work.
+    pub const DESTINATIONS: [Self; 2] = [Self::Devices, Self::Network];
+
     fn label(self) -> &'static str {
         match self {
             Self::Devices => "Devices",
             Self::Network => "This network",
             Self::About => "About",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Self::Devices => Icon::Devices,
+            Self::Network => Icon::Network,
+            Self::About => Icon::Info,
         }
     }
 }
@@ -71,6 +97,13 @@ pub struct App {
     target_text: String,
     /// The filter over the device table.
     search: String,
+    /// Which column the table is ordered by, and which way.
+    ///
+    /// Not persisted, and that is a choice: a sort is a question somebody is
+    /// asking of the scan in front of them — "which of these are printers",
+    /// "which answered slowest" — and it should not still be asked of a
+    /// different network tomorrow morning.
+    sort: Sort,
     /// The settings page, and everything it remembers.
     settings: settings::State,
     /// The settings themselves, as loaded and as edited.
@@ -80,11 +113,16 @@ pub struct App {
     /// A re-probe in flight: which device, and where its answer will arrive.
     ping: Option<(
         std::net::IpAddr,
-        std::sync::mpsc::Receiver<Option<std::time::Duration>>,
+        std::sync::mpsc::Receiver<muster_net::discover::Recheck>,
     )>,
-    /// What the last re-probe said, and about which device. `None` inside the
-    /// tuple means nothing came back, which is **not** the same as gone.
-    pinged: Option<(std::net::IpAddr, Option<std::time::Duration>)>,
+    /// What the last re-probe said, and about which device.
+    ///
+    /// The whole [`muster_net::discover::Recheck`] rather than the round trip
+    /// alone, because the round trip cannot tell "it did not answer" from "the
+    /// question was never asked". A machine that cannot open a ping socket
+    /// sends no echo at all, and reporting that as silence from the device is
+    /// the failure `CLAUDE.md` calls the worst this application can produce.
+    pinged: Option<(std::net::IpAddr, muster_net::discover::Recheck)>,
     /// The update check and the dialog it raises.
     ///
     /// Its two settings are loaded from [`prefs`] at start-up and written back
@@ -128,6 +166,7 @@ impl App {
             mode,
             target,
             selected: None,
+            sort: Sort::default(),
             ports: ports::State::Idle,
             dhcp: dhcpcheck::State::Idle,
             saved_last_check: saved.last_check,
@@ -177,6 +216,7 @@ impl App {
             mode,
             target,
             selected: None,
+            sort: Sort::default(),
             ports: ports::State::Idle,
             dhcp: dhcpcheck::State::Idle,
             saved_last_check: 0,
@@ -215,17 +255,13 @@ impl App {
             } else {
                 muster_net::discover::Options::default()
             };
-            let found = muster_net::discover::probe(
+            let found = muster_net::discover::recheck(
                 address,
                 &muster_net::platform::Host,
                 &muster_net::rate::Bucket::polite(),
                 opts,
             );
-            // `None` for "nothing came back" collapses with "found but no round
-            // trip measured", and that is deliberate: neither is a time to
-            // show, and the screen distinguishes them by whether a device is
-            // still in the table at all.
-            let _ = tx.send(found.and_then(|f| f.rtt));
+            let _ = tx.send(found);
         });
         self.ping = Some((address, rx));
     }
@@ -236,15 +272,22 @@ impl App {
             return false;
         };
         match rx.try_recv() {
-            Ok(rtt) => {
-                self.pinged = Some((*address, rtt));
+            Ok(answer) => {
+                self.pinged = Some((*address, answer));
                 self.ping = None;
                 true
             }
             // The worker ended without answering, which can only be a panic in
-            // it. Stop waiting rather than leaving "asking…" on screen.
+            // it. Stop waiting rather than leaving "asking…" on screen, and say
+            // that the probe itself failed rather than blaming the device.
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.pinged = Some((*address, None));
+                self.pinged = Some((
+                    *address,
+                    muster_net::discover::Recheck {
+                        found: None,
+                        not_done: vec!["the probe did not finish".into()],
+                    },
+                ));
                 self.ping = None;
                 true
             }
@@ -316,7 +359,23 @@ impl App {
             .filter(|i| i.is_scannable())
             .flat_map(|i| i.v4_prefixes())
             .any(|l| l.contains(prefix.network()));
-        self.scan = State::start(&self.survey, prefix, on_link);
+        self.scan = State::start(&self.survey, prefix, on_link, self.scan_options());
+        // A scan that asked about DHCP has the answer the DHCP view wants, so
+        // the view shows it rather than making somebody ask the same question
+        // twice from two screens.
+        if self.prefs.scan_dhcp {
+            self.dhcp = dhcpcheck::State::Idle;
+        }
+    }
+
+    /// What a scan is asked to do, out of the settings.
+    fn scan_options(&self) -> scan::Options {
+        scan::Options {
+            rate: self.prefs.rate,
+            identify: self.prefs.identify,
+            dns: self.prefs.scan_dns,
+            dhcp: self.prefs.scan_dhcp,
+        }
     }
 }
 
@@ -476,19 +535,200 @@ fn top_bar(ctx: &egui::Context, p: Palette, app: &mut App) {
                 );
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // §6.1: the 34 px bar is the mark, the name and a
-                    // right-aligned gear. The scan control used to sit here
-                    // too, and it belongs in the options strip with the range
-                    // it acts on — a control in one strip acting on a field in
-                    // another is how a reader loses the connection between
-                    // them.
-                    if gear_button(ui, p).clicked() {
-                        app.settings.open();
-                    }
+                    // §6.2 keeps navigation out of the top bar, and a gear is
+                    // navigation: it went to the settings page from the one
+                    // corner of the window furthest from every other way of
+                    // getting somewhere. It is a row at the foot of the
+                    // sidebar now, beside About, which is where the rest of
+                    // the family keeps both. See [`sidebar`].
+                    //
+                    // The scan control used to sit here too, and it belongs in
+                    // the options strip with the range it acts on — a control
+                    // in one strip acting on a field in another is how a
+                    // reader loses the connection between them.
+                    //
+                    // What a scan *does*, as against where it goes. The range
+                    // is a field in the strip above the table because it
+                    // changes with every scan; these change once and are then
+                    // remembered, so they live behind a menu rather than
+                    // spending width on the densest screen in the application.
+                    scan_menu(ui, p, app);
                 });
             });
         });
 }
+
+/// The scan menu: what a scan asks, and how hard.
+///
+/// A §7.17 popover hung off the top bar. Everything in it writes
+/// [`crate::prefs::Prefs`] and is saved as it changes, so this and the settings
+/// page's Scanning pane are two views of one set of values rather than two sets
+/// that can drift apart.
+///
+/// **A running scan does not read these again.** [`scan::Options`] is taken
+/// once at the start, so moving a control here changes the *next* scan and
+/// never the one on screen. The note at the foot says so rather than leaving
+/// somebody to wonder why nothing happened.
+fn scan_menu(ui: &mut egui::Ui, p: Palette, app: &mut App) {
+    let response = menu_button(ui, p, "Scan");
+    let mut changed = false;
+    let mode = app.mode;
+    egui::Popup::menu(&response)
+        .gap(metrics::S1)
+        .frame(
+            egui::Frame::NONE
+                .fill(p.popover.to_opaque())
+                .stroke(Stroke::new(metrics::HAIRLINE, p.line_popover))
+                .corner_radius(metrics::RADIUS_MODAL)
+                .inner_margin(egui::Margin::same(metrics::PAD_PANEL as i8))
+                .shadow(theme::shadow::menu(mode)),
+        )
+        .show(|ui| {
+            ui.set_width(SCAN_MENU_WIDTH);
+            ui.label(
+                RichText::new("WHAT A SCAN ASKS")
+                    .size(text::EYEBROW)
+                    .color(p.placeholder),
+            );
+            ui.add_space(metrics::S2);
+
+            for (label, explain, value) in [
+                (
+                    "Identify devices",
+                    "mDNS, SSDP and NetBIOS, and the model a device names for itself.",
+                    &mut app.prefs.identify,
+                ),
+                (
+                    "Find name servers",
+                    "One DNS query per device that answered.",
+                    &mut app.prefs.scan_dns,
+                ),
+                (
+                    "Find DHCP servers",
+                    "Broadcasts a DISCOVER and keeps every offer. Nothing is accepted.",
+                    &mut app.prefs.scan_dhcp,
+                ),
+            ] {
+                changed |= menu_toggle(ui, p, label, explain, value);
+            }
+
+            ui.add_space(metrics::S2);
+            ui.label(
+                RichText::new("RATE")
+                    .size(text::EYEBROW)
+                    .color(p.placeholder),
+            );
+            ui.add_space(metrics::S2);
+            ui.horizontal(|ui| {
+                let mut value = app.prefs.rate as f32;
+                crate::settings::slider(ui, p, &mut value, 50.0, 5000.0, 50.0);
+                if value as u32 != app.prefs.rate {
+                    app.prefs.rate = value as u32;
+                    changed = true;
+                }
+                ui.add_space(metrics::S2);
+                ui.label(
+                    RichText::new(format!("{} /s", app.prefs.rate))
+                        .size(text::TINY)
+                        .monospace()
+                        .color(p.text_muted),
+                );
+            });
+
+            if app.scan.is_running() {
+                ui.add_space(metrics::S2);
+                ui.label(
+                    RichText::new("The scan running now keeps the settings it started with.")
+                        .size(text::TINY)
+                        .color(p.text_dim),
+                );
+            }
+        });
+
+    if changed {
+        prefs::save(&app.prefs);
+    }
+}
+
+/// How wide the scan menu is: enough for its longest sentence on one line.
+const SCAN_MENU_WIDTH: f32 = 320.0;
+
+/// The width a toggle occupies at the right of a menu row, from `settings`.
+const TOGGLE_W: f32 = 34.0;
+
+/// One switched line in a menu: a label, a sentence under it, a toggle.
+fn menu_toggle(
+    ui: &mut egui::Ui,
+    p: Palette,
+    label: &str,
+    explain: &str,
+    value: &mut bool,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(SCAN_MENU_WIDTH - TOGGLE_W - metrics::S3);
+            ui.label(
+                RichText::new(label)
+                    .size(text::CONTROL)
+                    .color(p.text_strong),
+            );
+            ui.label(RichText::new(explain).size(text::TINY).color(p.text_dim));
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            changed = crate::settings::toggle(ui, p, value);
+        });
+    });
+    ui.add_space(metrics::S2);
+    changed
+}
+
+/// A button that opens a menu: §7.6's secondary with a chevron after the label.
+///
+/// Icon-only controls need a tooltip and this one is not icon-only, but the
+/// chevron is the only thing saying it opens rather than acts, so it carries
+/// the cursor change that says the same.
+fn menu_button(ui: &mut egui::Ui, p: Palette, label: &str) -> egui::Response {
+    let font = FontId::proportional(text::CONTROL);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font.clone(), p.text);
+    let width = galley.size().x + metrics::S3 * 2.0 + CHEVRON;
+    let (rect, response) = ui.allocate_exact_size(vec2(width, metrics::BUTTON), Sense::click());
+    let fill = if response.hovered() {
+        p.control_hover
+    } else {
+        p.control
+    };
+    ui.painter().rect_filled(rect, metrics::RADIUS, fill);
+    ui.painter().text(
+        pos2(rect.left() + metrics::S3, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font,
+        p.text,
+    );
+
+    // Two strokes, from the same set as the close mark and the gear, rather
+    // than a letter pretending to be an icon.
+    let c = pos2(rect.right() - metrics::S3 - CHEVRON / 2.0, rect.center().y);
+    let (w, h) = (CHEVRON * 0.34, CHEVRON * 0.18);
+    let ink = if response.hovered() {
+        p.text_strong
+    } else {
+        p.text_muted
+    };
+    for arm in [-w, w] {
+        ui.painter().line_segment(
+            [pos2(c.x + arm, c.y - h), pos2(c.x, c.y + h)],
+            Stroke::new(1.4_f32, ink),
+        );
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The chevron's box on a menu button.
+const CHEVRON: f32 = 12.0;
 
 /// Start, or stop. Cancelling is available throughout a scan and takes effect
 /// at the next probe, so the control never has to be disabled mid-run.
@@ -622,6 +862,17 @@ pub(crate) fn button(
     }
 }
 
+/// The 240 px navigation column: where to go at the top, the two chrome rows
+/// at the foot.
+///
+/// The split is the family's. Tally's sidebar carries its destinations in a
+/// scrolling column and hangs Settings and the version strip off the bottom of
+/// it, and HomeLab's does the same with the account; §6.2 keeps page
+/// navigation out of the top bar entirely, which is where Muster's gear used
+/// to be. So the foot is where the two rows that are not places to work live,
+/// separated by a hairline and read in the order they are wanted: Settings
+/// first, and under it About, which is the version and the licence and is
+/// therefore the last thing on the column in every application in the house.
 fn sidebar(ctx: &egui::Context, p: Palette, app: &mut App) {
     egui::SidePanel::left("nav")
         .exact_width(metrics::SIDEBAR)
@@ -630,16 +881,52 @@ fn sidebar(ctx: &egui::Context, p: Palette, app: &mut App) {
         .show_separator_line(false)
         .show(ctx, |ui| {
             hairline_right(ui, p);
-            ui.add_space(metrics::S2);
-            for view in View::ALL {
-                if nav_row(ui, p, view.label(), app.view == view).clicked() {
-                    app.view = view;
+
+            // Bottom up, so the foot is pinned to the bottom of the column
+            // however tall the window is, and the destinations fill what is
+            // left above it. Read this block from the last line back: the
+            // hairline, Settings, About, and the padding under the panel edge.
+            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                ui.add_space(metrics::S2);
+                if nav_row(
+                    ui,
+                    p,
+                    View::About.icon(),
+                    View::About.label(),
+                    app.view == View::About,
+                )
+                .clicked()
+                {
+                    app.view = View::About;
                 }
-            }
+                // Settings is a modal rather than a view, so its row is never
+                // the selected one: it opens something over the window and the
+                // window keeps whichever destination it was on.
+                if nav_row(ui, p, Icon::Gear, "Settings", false).clicked() {
+                    app.settings.open();
+                }
+                ui.add_space(metrics::S2);
+                // `min_rect` is what this layout has actually placed, so its
+                // top is the top of the foot however many rows it holds.
+                hairline_across(ui, p, ui.min_rect().top());
+
+                // And the destinations, top down, in the space above.
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    ui.add_space(metrics::S2);
+                    for view in View::DESTINATIONS {
+                        if nav_row(ui, p, view.icon(), view.label(), app.view == view).clicked() {
+                            app.view = view;
+                        }
+                    }
+                });
+            });
         });
 }
 
-/// One navigation row.
+/// The space between a navigation row's icon and its label.
+const NAV_GAP: f32 = 10.0;
+
+/// One navigation row: an icon, a label, and the selected state.
 ///
 /// The selected state is the design language's, and getting it wrong here would
 /// be getting it wrong everywhere: a **neutral** fill (`control`), **strong**
@@ -648,6 +935,7 @@ fn sidebar(ctx: &egui::Context, p: Palette, app: &mut App) {
 pub(crate) fn nav_row(
     ui: &mut egui::Ui,
     p: Palette,
+    icon: Icon,
     label: &str,
     selected: bool,
 ) -> egui::Response {
@@ -667,16 +955,25 @@ pub(crate) fn nav_row(
             .rect_filled(rect, metrics::RADIUS, p.control_hover);
     }
 
+    // The icon takes the row's own colour, so it is muted at rest and strong
+    // when the row is selected without being told twice.
+    let ink = if selected {
+        p.text_strong
+    } else {
+        p.text_muted
+    };
+    let glyph = Rect::from_center_size(
+        rect.left_center() + vec2(metrics::PAD_PANEL + metrics::ICON / 2.0, 0.0),
+        Vec2::splat(metrics::ICON),
+    );
+    icons::draw(ui.painter(), glyph, icon, ink);
+
     ui.painter().text(
-        rect.left_center() + vec2(metrics::PAD_PANEL, 0.0),
+        pos2(glyph.right() + NAV_GAP, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
         FontId::proportional(text::CONTROL),
-        if selected {
-            p.text_strong
-        } else {
-            p.text_muted
-        },
+        ink,
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -761,7 +1058,7 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
     // Read once for the whole table rather than per row: the routing table
     // cannot change while a frame is being drawn, and `kind::identify` only
     // wants the answer to "is this the way out".
-    let gateways: Vec<std::net::IpAddr> = app.survey.gateways.iter().map(|g| g.address).collect();
+    let survey = app.survey.clone();
 
     // Above the empty state as well as above the table: a scan that found
     // nothing is exactly when somebody wants to change the range.
@@ -779,24 +1076,48 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
         return;
     }
 
+    // The order to draw in, as a list of indices into the two parallel
+    // vectors. Sorting the devices themselves would break that pairing, and
+    // sorting pairs would copy an identity per row per frame.
+    let empty = Identity::default();
+    let mut order: Vec<usize> = (0..devices.len()).collect();
+    let sort = app.sort;
+    order.sort_by(|a, b| {
+        let key = |i: usize| {
+            let host = &devices[i];
+            let named = names.get(i);
+            let vantage = survey.vantage(host.address);
+            let kind = muster_net::kind::kind_of(host, named.unwrap_or(&empty), vantage);
+            sort_key(sort.column, host, named, kind)
+        };
+        let (left, right) = (key(*a), key(*b));
+        // The emptiness flag is the first element of the key and is compared
+        // ascending whichever way the column points, so blank cells stay at
+        // the bottom. See `sort_key`.
+        left.0.cmp(&right.0).then_with(|| {
+            let rest = (left.1, left.2).cmp(&(right.1, right.2));
+            if sort.ascending { rest } else { rest.reverse() }
+        })
+    });
+
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(metrics::S2);
-            table_header(ui, p);
+            table_header(ui, p, &mut app.sort);
             let mode = app.mode;
-            let empty = Identity::default();
             let mut shown = 0usize;
-            for (i, host) in devices.iter().enumerate() {
+            for i in order {
+                let host = &devices[i];
                 let named = names.get(i);
-                let is_gateway = gateways.contains(&host.address);
-                let kind = muster_net::kind::kind_of(host, named.unwrap_or(&empty), is_gateway);
+                let vantage = survey.vantage(host.address);
+                let kind = muster_net::kind::kind_of(host, named.unwrap_or(&empty), vantage);
                 if !matches(&app.search, host, named, kind) {
                     continue;
                 }
                 shown += 1;
                 let selected = app.selected == Some(host.address);
-                let response = device_row(ui, p, mode, host, named, is_gateway, selected);
+                let response = device_row(ui, p, mode, host, named, vantage, selected);
                 if response.clicked() {
                     // Clicking the open row shuts the window, which is the way
                     // back to the table without reaching for a close button.
@@ -835,37 +1156,261 @@ const COL_ADDRESS: f32 = 130.0;
 const COL_NAME: f32 = 190.0;
 const COL_MAC: f32 = 150.0;
 const COL_TIME: f32 = 64.0;
+/// The badges: what a device serves the network. Two fit side by side.
+const COL_SERVES: f32 = 84.0;
 
-fn table_header(ui: &mut egui::Ui, p: Palette) {
+/// Which column the table is ordered by.
+///
+/// **Every column, including the ones that are pictures.** Sorting by kind is
+/// how a list of forty becomes "the three printers"; sorting by what a device
+/// serves is how the network's own infrastructure comes to the top. The
+/// variants are in the order the columns are drawn, so the header can pair them
+/// off without a second list to keep in step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Column {
+    Kind,
+    /// The default, and it is the sweep's own order: an address is the one
+    /// column with a total order everybody already agrees on.
+    #[default]
+    Address,
+    Name,
+    Mac,
+    Time,
+    Serves,
+    Vendor,
+}
+
+/// A column, and which way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sort {
+    pub column: Column,
+    pub ascending: bool,
+}
+
+impl Default for Sort {
+    fn default() -> Self {
+        Self {
+            column: Column::Address,
+            ascending: true,
+        }
+    }
+}
+
+impl Sort {
+    /// Click a heading: the same column reverses, a different one starts
+    /// ascending.
+    ///
+    /// Starting a new column *descending* would be the other reasonable choice
+    /// for time and for the badges, where the interesting end is the big one.
+    /// It is not taken, because a table whose direction depends on which
+    /// heading was clicked cannot be predicted from the heading.
+    fn clicked(&mut self, column: Column) {
+        if self.column == column {
+            self.ascending = !self.ascending;
+        } else {
+            *self = Self {
+                column,
+                ascending: true,
+            };
+        }
+    }
+}
+
+/// The key one row sorts on, as text or as a number.
+///
+/// Text is compared case-insensitively and **an empty cell always sorts last**,
+/// whichever way the column is pointing. That is the one asymmetry here and it
+/// is deliberate: a device with no name is not "before A", it is a row with
+/// nothing in that column, and burying forty of them at the top of an ascending
+/// sort would hide everything the sort was for.
+fn sort_key(
+    column: Column,
+    host: &muster_net::discover::Found,
+    named: Option<&Identity>,
+    kind: muster_net::Kind,
+) -> (bool, String, u128) {
+    let text = |value: String| (value.is_empty(), value.to_ascii_lowercase(), 0u128);
+    match column {
+        Column::Kind => (
+            kind == muster_net::Kind::Unknown,
+            kind.label().to_ascii_lowercase(),
+            0,
+        ),
+        // Ordered as a number, not as the text of one: `192.168.0.9` before
+        // `192.168.0.10`, which sorting the strings gets backwards.
+        Column::Address => (false, String::new(), address_key(host.address)),
+        Column::Name => text(
+            named
+                .and_then(Identity::best)
+                .map(|n| n.value.clone())
+                .unwrap_or_default(),
+        ),
+        Column::Mac => text(host.mac.map(|m| m.to_string()).unwrap_or_default()),
+        // A device that never gave a time has none, rather than a time of zero.
+        Column::Time => (
+            host.rtt.is_none(),
+            String::new(),
+            host.rtt.map_or(0, |t| t.as_micros()),
+        ),
+        // Most-serving first when descending, and the badge names break the
+        // ties so two routers do not swap places between scans.
+        Column::Serves => {
+            let roles = named.map(Identity::roles).unwrap_or_default();
+            (
+                roles.is_empty(),
+                roles
+                    .iter()
+                    .map(|r| r.label())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase(),
+                roles.len() as u128,
+            )
+        }
+        Column::Vendor => text(match host.mac.map(muster_net::vendor::lookup) {
+            Some(muster_net::vendor::Origin::Randomised) => "randomised address".to_string(),
+            Some(other) => other.label().to_string(),
+            None => String::new(),
+        }),
+    }
+}
+
+/// An address as one number, so both families order sensibly and v4 sorts
+/// before v6.
+fn address_key(address: std::net::IpAddr) -> u128 {
+    match address {
+        std::net::IpAddr::V4(v4) => u128::from(u32::from(v4)),
+        std::net::IpAddr::V6(v6) => u128::from(v6) | 1 << 127,
+    }
+}
+
+/// The table's headings, which are also its sort controls.
+///
+/// Every heading is a click target, including the icon column's, whose label is
+/// deliberately empty: "Kind" over a column of pictures labels the obvious and
+/// adds a word to the densest screen in the application. It still sorts, and
+/// the caret is what says so.
+fn table_header(ui: &mut egui::Ui, p: Palette, sort: &mut Sort) {
     // §7.16: a table header is a 26 px row in `text_dim`. It was 20 px in
     // `placeholder`, which is the eyebrow's colour and a different rank.
     let (rect, _) =
         ui.allocate_exact_size(vec2(ui.available_width(), metrics::ROW), Sense::hover());
     let mut x = rect.left() + metrics::PAD_PANEL;
-    for (label, width) in [
-        // The icon column's heading is deliberately empty: "Kind" over a column
-        // of pictures labels the obvious and adds a word to the densest screen
-        // in the application.
-        ("", COL_KIND),
-        ("Address", COL_ADDRESS),
-        ("Name", COL_NAME),
-        ("Hardware", COL_MAC),
-        ("Time", COL_TIME),
-        ("Made by", 0.0),
+    let last = rect.right() - metrics::PAD_PANEL;
+    for (label, width, column) in [
+        ("", COL_KIND, Column::Kind),
+        ("Address", COL_ADDRESS, Column::Address),
+        ("Name", COL_NAME, Column::Name),
+        ("Hardware", COL_MAC, Column::Mac),
+        ("Time", COL_TIME, Column::Time),
+        ("Serves", COL_SERVES, Column::Serves),
+        ("Made by", 0.0, Column::Vendor),
     ] {
+        let span = if width > 0.0 { width } else { last - x };
+        let cell = Rect::from_min_max(pos2(x, rect.top()), pos2(x + span, rect.bottom()));
+        let response = ui.interact(
+            cell,
+            ui.id().with(("sort", label, column as usize)),
+            Sense::click(),
+        );
+        if response.clicked() {
+            sort.clicked(column);
+        }
+        let active = sort.column == column;
+        let ink = if active {
+            p.text_strong
+        } else if response.hovered() {
+            p.text_muted
+        } else {
+            p.text_dim
+        };
         ui.painter().text(
             pos2(x, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
             FontId::proportional(text::TINY),
-            p.text_dim,
+            ink,
         );
-        x += width;
+        if active {
+            // The caret sits after the label rather than at the column's right
+            // edge, so it stays attached to the word it qualifies in a column
+            // whose content is right-aligned.
+            let after = ui
+                .painter()
+                .layout_no_wrap(label.to_string(), FontId::proportional(text::TINY), ink)
+                .size()
+                .x;
+            caret(
+                ui,
+                pos2(x + after + metrics::S1 + CARET / 2.0, rect.center().y),
+                sort.ascending,
+                p.accent,
+            );
+        }
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        x += span;
     }
     // `line`, not `line_soft`: this is the edge of a strip, and `line_soft`
     // belongs between rows inside a list.
     hairline_strip(ui, p, rect.bottom());
 }
+
+/// The sort caret's box.
+const CARET: f32 = 8.0;
+
+/// Which way a column is pointing: two strokes, from the same set as the
+/// chevron on a menu button.
+fn caret(ui: &mut egui::Ui, centre: egui::Pos2, up: bool, ink: Color32) {
+    let (w, h) = (CARET * 0.34, CARET * 0.20);
+    let tip = if up { -h } else { h };
+    for arm in [-w, w] {
+        ui.painter().line_segment(
+            [
+                pos2(centre.x + arm, centre.y - tip),
+                pos2(centre.x, centre.y + tip),
+            ],
+            Stroke::new(1.3_f32, ink),
+        );
+    }
+}
+
+/// The badges: what a device serves the network.
+///
+/// §2.5 reserves colour for state and a badge is not a state, so these are a
+/// neutral fill with strong text — the same recipe a selected row uses, which
+/// is what keeps them from reading as warnings. The kind icon beside them is
+/// the one coloured thing in the row and it stays that way.
+fn badges(ui: &egui::Ui, p: Palette, rect: Rect, roles: &[muster_net::identify::Role]) {
+    let font = FontId::proportional(text::TINY);
+    let mut x = rect.left();
+    for role in roles {
+        let galley =
+            ui.painter()
+                .layout_no_wrap(role.label().to_string(), font.clone(), p.text_strong);
+        let width = galley.size().x + metrics::S1 * 2.0;
+        if x + width > rect.right() {
+            return;
+        }
+        let pill =
+            Rect::from_center_size(pos2(x + width / 2.0, rect.center().y), vec2(width, BADGE_H));
+        ui.painter()
+            .rect_filled(pill, metrics::RADIUS_TIGHT, p.control);
+        ui.painter().text(
+            pill.center(),
+            egui::Align2::CENTER_CENTER,
+            role.label(),
+            font.clone(),
+            p.text_strong,
+        );
+        x += width + metrics::S1;
+    }
+}
+
+/// A badge's height. Short enough to sit inside a 20 px row with air above and
+/// below it.
+const BADGE_H: f32 = 14.0;
 
 /// One device.
 ///
@@ -878,7 +1423,7 @@ fn device_row(
     mode: Mode,
     host: &muster_net::discover::Found,
     named: Option<&Identity>,
-    is_gateway: bool,
+    vantage: muster_net::kind::Vantage,
     selected: bool,
 ) -> egui::Response {
     let (rect, response) =
@@ -906,7 +1451,7 @@ fn device_row(
     // What this device appears to be, and why. The guess is `muster-net`'s;
     // this file only decides how big to draw it.
     let empty = Identity::default();
-    let guess = muster_net::kind::identify(host, named.unwrap_or(&empty), is_gateway);
+    let guess = muster_net::kind::identify(host, named.unwrap_or(&empty), vantage);
     let kind = guess.map_or(muster_net::Kind::Unknown, |g| g.kind);
     let icon = Rect::from_center_size(pos2(x + metrics::ICON / 2.0, y), Vec2::splat(metrics::ICON));
     // The cut-outs are filled with whatever the row is sitting on, so a hovered
@@ -973,6 +1518,18 @@ fn device_row(
     );
     x += COL_TIME;
 
+    // What this device serves the network, as against what it is. The icon
+    // says the one and these say the other; a router that is also the name
+    // server shows both, which no single label could.
+    let roles = named.map(Identity::roles).unwrap_or_default();
+    badges(
+        ui,
+        p,
+        Rect::from_min_max(pos2(x, rect.top()), pos2(x + COL_SERVES, rect.bottom())),
+        &roles,
+    );
+    x += COL_SERVES;
+
     // The vendor, and the one thing that is *not* a vendor: a randomised
     // address is reported as randomised rather than as an unknown maker, which
     // `Origin` keeps separable all the way to here.
@@ -997,6 +1554,9 @@ fn device_row(
     if response.hovered() {
         let why: Vec<String> = host.evidence.iter().map(|e| e.reason()).collect();
         let mut tip = String::new();
+        for role in &roles {
+            tip.push_str(&format!("{}: {}\n", role.label(), role.reason()));
+        }
         // The claim first, with its reason attached. `CLAUDE.md`: every claim
         // about a device is shown beside the reason for it, and an icon with no
         // way to ask "why do you think that" is a guess wearing a confident
@@ -1120,10 +1680,11 @@ fn about_view(ui: &mut egui::Ui, p: Palette, updates: &mut Updates) {
     });
 }
 
-/// The update check, and the one switch that governs it.
+/// The update check, and what it reports.
 ///
-/// `CLAUDE.md` puts the setting in one place, and this is it: there is no
-/// second copy of it in a settings page, because there is no settings page.
+/// The switch that governs it is not here. `CLAUDE.md` puts it in one place
+/// and that place is Settings, General; this screen says where, and offers the
+/// check a person asks for, which is never held back by the throttle.
 fn updates_section(ui: &mut egui::Ui, p: Palette, updates: &mut Updates) {
     ui.label(
         RichText::new("UPDATES")
@@ -1390,8 +1951,7 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
 
     let host = app.scan.devices()[index].clone();
     let named = app.scan.names().get(index).cloned().unwrap_or_default();
-    let is_gateway = app.survey.gateways.iter().any(|g| g.address == address);
-    let guess = muster_net::kind::identify(&host, &named, is_gateway);
+    let guess = muster_net::kind::identify(&host, &named, app.survey.vantage(address));
     let kind = guess.map_or(muster_net::Kind::Unknown, |g| g.kind);
     let mode = app.mode;
 
@@ -1481,6 +2041,28 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
                 }
             });
 
+            // What it serves the network, under the claim about what it is:
+            // the two are independent, and a router that is also the name
+            // server has to be able to say both.
+            let roles = named.roles();
+            if !roles.is_empty() {
+                ui.add_space(metrics::S2);
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(
+                        vec2(DETAIL_WIDTH, metrics::ROW_PLAIN),
+                        Sense::hover(),
+                    );
+                    badges(ui, p, rect, &roles);
+                });
+                for role in &roles {
+                    ui.label(
+                        RichText::new(role.reason())
+                            .size(text::TINY)
+                            .color(p.text_dim),
+                    );
+                }
+            }
+
             ui.add_space(metrics::S2);
             fact_row(ui, p, "Address", &address.to_string());
             if let Some(mac) = host.mac {
@@ -1491,6 +2073,12 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
                 };
                 fact_row(ui, p, "Made by", &vendor);
             }
+            // The model the device named for itself, above the names other
+            // people gave it: it is the most specific thing on the row and it
+            // is what the guess above was usually made from.
+            if let Some(model) = &named.model {
+                fact_row(ui, p, "Model", model);
+            }
             if let Some(workgroup) = &named.workgroup {
                 fact_row(ui, p, "Workgroup", workgroup);
             }
@@ -1499,6 +2087,28 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
             }
             if !named.services.is_empty() {
                 fact_row(ui, p, "Advertises", &named.services.join(", "));
+            }
+            // The UPnP half, kept in its own row rather than folded in with the
+            // mDNS services: they are two vocabularies, and one list holding
+            // `_ipp._tcp` beside `urn:schemas-upnp-org:device:Printer:1` reads
+            // as neither.
+            if !named.upnp.is_empty() {
+                fact_row(ui, p, "UPnP", &named.upnp.join(", "));
+            }
+            if let Some(product) = &named.product {
+                fact_row(ui, p, "Announces", product);
+            }
+            if let Some(resolver) = &named.resolver {
+                // What the server said about itself, and what it will do for a
+                // client. A server that would not say has answered the
+                // question all the same, and the row says which.
+                let what = match (&resolver.version, resolver.recursive) {
+                    (Some(version), true) => format!("{version}, resolves for clients"),
+                    (Some(version), false) => format!("{version}, its own zones only"),
+                    (None, true) => "would not name itself, resolves for clients".to_string(),
+                    (None, false) => "would not name itself".to_string(),
+                };
+                fact_row(ui, p, "Name server", &what);
             }
             fact_row(
                 ui,
@@ -1526,10 +2136,17 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
 
 /// Ask this one device again, now.
 ///
-/// The same three probes the sweep uses, through `discover::probe`, so a
+/// The same three probes the sweep uses, through `discover::recheck`, so a
 /// re-check and the sweep cannot disagree about what counts as an answer. It is
 /// the question somebody actually has in front of a device list: *is it still
 /// there?*
+///
+/// **And it answers a second question the first one hides.** A probe that could
+/// not run is not a device that did not answer, so what this reports is which
+/// of the two happened: a machine with ping sockets closed — a Linux where
+/// `net.ipv4.ping_group_range` excludes the user — sends no echo at all, and
+/// saying "nothing came back this time" there is the application blaming a
+/// device for its own missing permission.
 fn ping_section(
     ui: &mut egui::Ui,
     p: Palette,
@@ -1544,24 +2161,55 @@ fn ping_section(
         }
         ui.add_space(metrics::S2);
 
+        let answer = app.pinged.as_ref().filter(|(a, _)| *a == address);
         let line = if waiting {
             "asking…".to_string()
         } else {
-            match app.pinged {
-                Some((a, Some(rtt))) if a == address => {
-                    format!("answered in {} ms", rtt.as_millis())
-                }
-                // **Not "it is gone".** Silence is a device that is off, a
-                // device that drops, or a probe that was rate limited into the
-                // next second. The sweep's own rule, kept here.
-                Some((a, None)) if a == address => "nothing came back this time".to_string(),
-                _ => match swept_rtt {
+            match answer {
+                Some((_, r)) => match r.found.as_ref().and_then(|f| f.rtt) {
+                    Some(rtt) => format!("answered in {} ms", rtt.as_millis()),
+                    // A gap first, and it is the whole point of the change: a
+                    // probe that never ran has nothing to say about the
+                    // device, so it says something about this machine
+                    // instead.
+                    None if !r.not_done.is_empty() => {
+                        format!("no time to report: {}", r.not_done.join("; "))
+                    }
+                    // It answered something, just not an echo, so the line
+                    // names what did answer. "Nothing came back" about a
+                    // device that answered ARP a moment ago is the same lie in
+                    // a smaller way.
+                    None if r.found.is_some() => {
+                        let how: Vec<String> = r
+                            .found
+                            .iter()
+                            .flat_map(|f| f.evidence.iter())
+                            .map(muster_net::discover::Evidence::reason)
+                            .collect();
+                        format!("still there ({}), but no ICMP reply", how.join(", "))
+                    }
+                    // **Not "it is gone".** Silence is a device that is off, a
+                    // device that drops, or a probe that was rate limited into
+                    // the next second. The sweep's own rule, kept here.
+                    None => "nothing came back this time".to_string(),
+                },
+                None => match swept_rtt {
                     Some(rtt) => format!("{} ms when it was swept", rtt.as_millis()),
                     None => String::new(),
                 },
             }
         };
-        ui.label(RichText::new(line).size(text::TINY).color(p.text_dim));
+        // Amber where the machine could not ask, because that is a state the
+        // reader has to act on rather than a reading of the network.
+        let ink = match answer {
+            Some((_, r))
+                if !r.not_done.is_empty() && r.found.as_ref().is_none_or(|f| f.rtt.is_none()) =>
+            {
+                p.caution
+            }
+            _ => p.text_dim,
+        };
+        ui.label(RichText::new(line).size(text::TINY).color(ink));
     });
 }
 
@@ -1745,9 +2393,10 @@ fn ports_section(ui: &mut egui::Ui, p: Palette, app: &mut App, address: std::net
 
 /// Who offers addresses on this link, and whether more than one does.
 ///
-/// A button rather than part of a scan: a DISCOVER asks every server on the
-/// link to reserve an address, and `CLAUDE.md`'s conduct rules make anything
-/// beyond looking a deliberate act. Nothing takes the offer.
+/// A button, and — when the scan menu says so — a part of every scan. Both send
+/// the same DISCOVER through the same engine, and this screen shows whichever
+/// answer is newer, so nobody has to ask the same question twice from two
+/// places. Nothing ever takes an offer.
 fn dhcp_check(ui: &mut egui::Ui, p: Palette, app: &mut App) {
     // The hardware address of the interface a scan would use. A DISCOVER is
     // answered to whoever sent it, so an address nothing on this link owns
@@ -1789,7 +2438,14 @@ fn dhcp_check(ui: &mut egui::Ui, p: Palette, app: &mut App) {
         }
     });
 
-    let Some(probe) = app.dhcp.result() else {
+    // The last scan's answer, where it asked. A check made from this button is
+    // newer by construction — it cannot have run before a scan that is already
+    // finished — so it wins.
+    let from_scan = match &app.scan {
+        State::Finished(outcome) => outcome.dhcp.as_deref(),
+        _ => None,
+    };
+    let Some(probe) = app.dhcp.result().or(from_scan) else {
         return;
     };
 
@@ -1811,7 +2467,7 @@ fn dhcp_check(ui: &mut egui::Ui, p: Palette, app: &mut App) {
         );
     });
 
-    for offer in &probe.offers {
+    for offer in probe.distinct_offers() {
         let mut detail = format!("offered {}", offer.offered);
         if let Some(router) = offer.router {
             detail.push_str(&format!(", gateway {router}"));
@@ -2017,40 +2673,121 @@ pub(crate) fn close_button(ui: &mut egui::Ui, p: Palette) -> egui::Response {
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// The settings gear: a ring with teeth, drawn rather than lettered.
-///
-/// Icon-only, so §11 requires the tooltip.
-fn gear_button(ui: &mut egui::Ui, p: Palette) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(metrics::ICON), Sense::click());
-    let ink = if response.hovered() {
-        p.text_strong
-    } else {
-        p.text_muted
-    };
-    let c = rect.center();
-    let r = metrics::ICON * 0.30;
-    ui.painter().circle_stroke(c, r, Stroke::new(1.6_f32, ink));
-    // Six teeth, which reads as a gear at 16 px where eight reads as a blur.
-    for k in 0..6 {
-        let a = std::f32::consts::TAU * k as f32 / 6.0;
-        let (sin, cos) = a.sin_cos();
-        ui.painter().line_segment(
-            [
-                pos2(c.x + cos * r, c.y + sin * r),
-                pos2(c.x + cos * (r + 3.0), c.y + sin * (r + 3.0)),
-            ],
-            Stroke::new(1.6_f32, ink),
-        );
-    }
-    response
-        .clone()
-        .on_hover_text("Settings")
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muster_net::discover::{Evidence, Found};
+    use muster_net::identify::{Resolver, Role};
+    use muster_net::mac::MacAddr;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn at(address: &str) -> Found {
+        Found {
+            address: address.parse().unwrap(),
+            mac: None,
+            evidence: vec![Evidence::Arp(MacAddr::new([0, 0, 0, 0, 0, 1]))],
+            rtt: None,
+        }
+    }
+
+    /// `192.168.0.9` comes before `192.168.0.10`, which sorting the text of an
+    /// address gets backwards — and gets backwards on exactly the networks
+    /// people scan.
+    #[test]
+    fn addresses_sort_as_numbers_and_not_as_text() {
+        let mut rows = ["192.168.0.10", "192.168.0.9", "192.168.0.100"].map(at);
+        rows.sort_by_key(|host| address_key(host.address));
+        let order: Vec<String> = rows.iter().map(|h| h.address.to_string()).collect();
+        assert_eq!(order, ["192.168.0.9", "192.168.0.10", "192.168.0.100"]);
+    }
+
+    /// And both families order, with v4 first, so a dual-stack table does not
+    /// interleave them at random.
+    #[test]
+    fn the_two_address_families_do_not_interleave() {
+        let v4 = address_key(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)));
+        let v6 = address_key("::1".parse().unwrap());
+        assert!(v4 < v6, "every v4 address sorts before every v6 one");
+    }
+
+    /// An empty cell sorts last whichever way the column points. See
+    /// `sort_key`: burying the unnamed rows at the top of an ascending sort
+    /// would hide everything the sort was for.
+    #[test]
+    fn a_blank_cell_sorts_last_in_both_directions() {
+        let named = Identity {
+            names: vec![muster_net::identify::Name {
+                value: "printer".into(),
+                source: muster_net::identify::Source::Mdns,
+            }],
+            ..Default::default()
+        };
+        let with = sort_key(
+            Column::Name,
+            &at("192.0.2.1"),
+            Some(&named),
+            muster_net::Kind::Unknown,
+        );
+        let without = sort_key(
+            Column::Name,
+            &at("192.0.2.2"),
+            None,
+            muster_net::Kind::Unknown,
+        );
+        assert!(!with.0 && without.0, "emptiness is the first key");
+    }
+
+    /// Clicking the heading that is already sorted reverses it; clicking
+    /// another starts that one ascending.
+    #[test]
+    fn a_second_click_reverses_and_a_different_column_starts_over() {
+        let mut sort = Sort::default();
+        assert_eq!(sort.column, Column::Address);
+        assert!(sort.ascending);
+
+        sort.clicked(Column::Address);
+        assert!(!sort.ascending, "the same column turns around");
+
+        sort.clicked(Column::Time);
+        assert_eq!(sort.column, Column::Time);
+        assert!(sort.ascending, "a new column always starts ascending");
+    }
+
+    /// The badges sort by how many a device has, so the network's own
+    /// infrastructure comes to one end of the table.
+    #[test]
+    fn serving_more_sorts_above_serving_less() {
+        let router = Identity {
+            resolver: Some(Resolver::default()),
+            dhcp: true,
+            ..Default::default()
+        };
+        let resolver = Identity {
+            resolver: Some(Resolver::default()),
+            ..Default::default()
+        };
+        assert_eq!(router.roles(), vec![Role::Dhcp, Role::Dns]);
+        let both = sort_key(
+            Column::Serves,
+            &at("192.0.2.1"),
+            Some(&router),
+            muster_net::Kind::Router,
+        );
+        let one = sort_key(
+            Column::Serves,
+            &at("192.0.2.2"),
+            Some(&resolver),
+            muster_net::Kind::Server,
+        );
+        let none = sort_key(
+            Column::Serves,
+            &at("192.0.2.3"),
+            None,
+            muster_net::Kind::Unknown,
+        );
+        assert!(both.2 > one.2);
+        assert!(!one.0 && none.0, "and a device serving nothing is blank");
+    }
 
     #[test]
     fn every_view_has_a_label() {
@@ -2058,6 +2795,22 @@ mod tests {
             assert!(!view.label().is_empty());
         }
         assert_eq!(View::Devices.label(), "Devices");
+    }
+
+    /// Every view needs a row somewhere, and the sidebar draws its two groups
+    /// from two lists: a view added to [`View::ALL`] and to neither group is a
+    /// screen with no way in, and one in both is a screen with two.
+    #[test]
+    fn every_view_has_exactly_one_row_in_the_sidebar() {
+        for view in View::ALL {
+            let destination = View::DESTINATIONS.contains(&view);
+            let foot = view == View::About;
+            assert!(
+                destination != foot,
+                "{view:?} has {} rows",
+                destination as u8 + foot as u8
+            );
+        }
     }
 
     /// The columns are laid out by adding widths along a row, so they only line

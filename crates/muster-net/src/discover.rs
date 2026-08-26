@@ -270,6 +270,17 @@ impl Notes {
     fn gap(&self, line: String) {
         self.gaps.lock().expect("sweep notes poisoned").insert(line);
     }
+
+    /// Everything recorded, in the order a `BTreeSet` keeps it: stable, so two
+    /// runs of the same scan report the same lines in the same order.
+    fn drain(&self) -> Vec<String> {
+        self.gaps
+            .lock()
+            .expect("sweep notes poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
 }
 
 /// Progress, reported as the sweep runs.
@@ -353,7 +364,7 @@ pub fn sweep<T: Transport>(
         );
     }
     if !caps.icmp {
-        result.not_done.push("could not send ICMP echoes".into());
+        result.not_done.push(no_icmp());
     }
 
     let next = AtomicU64::new(0);
@@ -473,6 +484,16 @@ pub fn sweep<T: Transport>(
     result
 }
 
+/// The one sentence for "no echo was sent", with the platform's remedy in it.
+///
+/// Written once and used by both the sweep and a re-check, because the two must
+/// not describe the same machine differently: a scan that says the echoes were
+/// skipped and a Ping button that says the device is silent is a contradiction
+/// the reader has to resolve, and only one of the two is true.
+fn no_icmp() -> String {
+    format!("could not send ICMP echoes: {}", crate::platform::ICMP_HINT)
+}
+
 /// Probe one address, once.
 ///
 /// The single-host form of the sweep, with everything available tried cheapest
@@ -492,18 +513,70 @@ pub fn probe<T: Transport>(
     rate: &Bucket,
     opts: Options,
 ) -> Option<Found> {
-    // One address asked once is never cancelled and has nowhere to put a gap:
-    // the caller is a re-check of a device already on screen, and what it wants
-    // to know is whether the thing still answers.
-    probe_one(
+    recheck(address, transport, rate, opts).found
+}
+
+/// One address asked again, **and what could not be asked**.
+///
+/// [`probe`] answers "did it reply", and for a long time that was the whole of
+/// what a re-check could say. It is not enough, and the reason is the rule
+/// `CLAUDE.md` states most sharply: *never degrade silently*. A machine where
+/// ping sockets are closed skips the echo entirely — [`Capabilities::icmp`] is
+/// false, so nothing is sent and nothing fails — and the device came back with
+/// no round trip measured, which the interface then reported as **"nothing
+/// came back this time"**. That is the application saying a device did not
+/// answer a question it never asked, about a device that is very often sitting
+/// there answering ARP in the same second.
+///
+/// So a re-check carries the same [`Sweep::not_done`] list a sweep does, built
+/// the same way from the same two sources: the capabilities the transport does
+/// not have, and any mechanism that failed while it ran.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recheck {
+    /// The device, where anything answered at all.
+    pub found: Option<Found>,
+    /// What was not asked, and why. Empty when every probe ran.
+    pub not_done: Vec<String>,
+}
+
+/// Ask one address again, reporting the gaps as well as the answer.
+pub fn recheck<T: Transport>(
+    address: IpAddr,
+    transport: &T,
+    rate: &Bucket,
+    opts: Options,
+) -> Recheck {
+    let caps = transport.capabilities();
+    let notes = Notes::default();
+
+    // The same two gaps [`sweep`] opens with, in the same words, so a re-check
+    // and the scan that found the device cannot describe the machine
+    // differently. Only claimed where the probe would have used it: off-link
+    // ARP is not asked for at all.
+    let mut not_done = Vec::new();
+    if !caps.arp && opts.arp_authoritative && address.is_ipv4() {
+        not_done.push(
+            "could not send ARP requests, so a device that ignores ping and              refuses nothing may answer nothing here"
+                .into(),
+        );
+    }
+    if !caps.icmp {
+        not_done.push(no_icmp());
+    }
+
+    // One address asked once is never cancelled.
+    let found = probe_one(
         address,
         transport,
         rate,
-        &transport.capabilities(),
+        &caps,
         opts,
         &AtomicBool::new(false),
-        &Notes::default(),
-    )
+        &notes,
+    );
+
+    not_done.extend(notes.drain());
+    Recheck { found, not_done }
 }
 
 /// The probes for one address.
@@ -899,6 +972,84 @@ mod tests {
             "{:?}",
             s.not_done
         );
+    }
+
+    /// The Ping button's defect, in the smallest form it takes: a machine that
+    /// cannot open a ping socket sends no echo, and the device still answers
+    /// ARP, so the re-check used to hand back a device with no round trip and
+    /// the interface reported **"nothing came back this time"** about a
+    /// question nobody asked.
+    #[test]
+    fn a_recheck_says_when_the_echo_was_never_sent() {
+        let mut fake = Fake::new();
+        fake.caps.icmp = false;
+        fake.arp.insert(
+            "192.168.1.7".parse().unwrap(),
+            MacAddr::new([0x02, 0, 0, 0, 0, 7]),
+        );
+
+        let r = recheck(
+            ip("192.168.1.7"),
+            &fake,
+            &Bucket::new(1_000_000),
+            Options::on_link(),
+        );
+
+        let found = r.found.expect("ARP answered, so the device is there");
+        assert_eq!(found.rtt, None, "no echo was sent, so there is no time");
+        assert_eq!(
+            fake.count("ping"),
+            0,
+            "and the transport was never asked to send one"
+        );
+        assert!(
+            r.not_done.iter().any(|line| line.contains("ICMP")),
+            "so the re-check has to say so: {:?}",
+            r.not_done
+        );
+    }
+
+    /// A re-check and the sweep that found the device must describe the same
+    /// machine in the same words. Two screens disagreeing about whether the
+    /// echoes went out is a contradiction the reader has to resolve, and only
+    /// one of the two can be right.
+    #[test]
+    fn a_recheck_and_a_sweep_report_the_same_gap() {
+        let mut fake = Fake::new();
+        fake.caps.icmp = false;
+
+        let swept = run("192.168.1.0/30", &fake, Options::on_link());
+        let r = recheck(
+            ip("192.168.1.1"),
+            &fake,
+            &Bucket::new(1_000_000),
+            Options::on_link(),
+        );
+
+        let gap = swept
+            .not_done
+            .iter()
+            .find(|line| line.contains("ICMP"))
+            .expect("the sweep says it");
+        assert!(r.not_done.contains(gap), "{:?}", r.not_done);
+    }
+
+    /// And where nothing is missing, nothing is said. A re-check that could run
+    /// every probe must not decorate a plain answer with caveats.
+    #[test]
+    fn a_recheck_with_nothing_missing_says_nothing() {
+        let mut fake = Fake::new();
+        fake.pings.push(ip("192.168.1.5"));
+
+        let r = recheck(
+            ip("192.168.1.5"),
+            &fake,
+            &Bucket::new(1_000_000),
+            Options::default(),
+        );
+
+        assert!(r.found.is_some());
+        assert!(r.not_done.is_empty(), "{:?}", r.not_done);
     }
 
     /// The same rule one layer along: a transport that cannot ping the family

@@ -14,6 +14,7 @@ pub mod app;
 pub mod art;
 pub mod deviceicon;
 pub mod dhcpcheck;
+pub mod icons;
 pub mod ports;
 pub mod prefs;
 pub mod scan;
@@ -27,6 +28,22 @@ pub mod themelib;
 /// payload back with, so the writer and the reader cannot drift.
 pub mod update;
 pub mod updatedlg;
+
+/// The application id, which is also the name of the desktop entry.
+///
+/// One string, because on Wayland it is the *only* thing that gives the running
+/// window an icon. A Wayland client cannot hand the compositor a picture the way
+/// X11's `_NET_WM_ICON` lets it, so `with_icon` below reaches the title bar on
+/// Windows and X11 and is discarded on Wayland; the taskbar there looks up
+/// `<app_id>.desktop` and takes the icon out of that. Set nothing and winit
+/// sends no app id at all, which is how the launcher — reading the same desktop
+/// entry by name — could show the mark while the taskbar showed a blank square.
+///
+/// So this must stay character for character `packaging/io.github.spillebulle.muster.desktop`'s
+/// name, and `packaging/check.sh` fails when the two drift apart. It is also
+/// what `eframe` names the preferences directory, so it is not a string to
+/// change lightly.
+pub const APP_ID: &str = "io.github.spillebulle.muster";
 
 /// Opens the window.
 ///
@@ -44,11 +61,14 @@ pub fn run() -> eframe::Result {
             .with_title("Muster")
             // The mark, rasterised from the palette rather than loaded
             // from a file, so the taskbar cannot show a stale accent.
-            .with_icon(art::window_icon()),
+            .with_icon(art::window_icon())
+            // And on Wayland, where that picture is dropped, the name of the
+            // desktop entry the compositor reads one out of. See [`APP_ID`].
+            .with_app_id(APP_ID),
         ..Default::default()
     };
     eframe::run_native(
-        "io.github.spillebulle.muster",
+        APP_ID,
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     )

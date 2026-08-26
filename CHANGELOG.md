@@ -3,6 +3,75 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.9
+
+Added
+
+- **Muster asks the whole link, and many more devices answer.** A great many
+  televisions, set-top boxes and cameras ignore a question addressed to them
+  alone and answer the same question broadcast to the network. Muster now asks
+  both ways, over SSDP and mDNS, and attributes each reply to the device it came
+  from. On the network this was built against that is the difference between one
+  device answering and every television, set-top box and camera in the house.
+- **Devices are named by the model they give for themselves.** An SSDP reply
+  carries a product string and an mDNS record often carries a model, and a
+  device that advertises no service at all can still say what it is. A model
+  ranks below a service, because a service is a protocol a device has to
+  implement and a model is free text: Samba asks macOS to draw it a Mac, so
+  every storage box on a network claims to be one.
+- **What a device serves the network, beside what it is.** A router is a router
+  and also the DHCP server and also the resolver, and one label cannot say all
+  three, so the table carries `DNS` and `DHCP` badges next to the kind. A badge
+  is only ever a service that answered: never an open port, never a guess from a
+  vendor. The device window adds the software a name server named itself as, and
+  whether it resolves for anyone or serves its own zones only.
+- **The DHCP check can run as part of a scan**, under Scan in the top bar,
+  rather than only from This network. It collects every offer rather than the
+  first, because two servers answering is the fault worth finding.
+- **The gateway and the machine you are sitting at are known without being
+  asked.** A machine's own responders do not answer its own packets, so your own
+  computer used to be the one permanently blank row in the middle of the list.
+- **A Windows machine with its firewall up is no longer a blank row.** It
+  answers no mDNS, no NetBIOS and no SSDP, and it does answer LLMNR, which only
+  a general purpose computer speaks.
+- **Payment terminals are a kind of their own**, with an icon of their own, for
+  the makers whose hardware addresses name them.
+- **A laptop that says nothing is identified by the network card inside it.** An
+  Intel address is a network card, and a network card of that kind is in a
+  computer.
+- **Every column sorts, including the column of pictures.** Sorting by kind is
+  how forty rows become "the three printers", and addresses sort as numbers, so
+  `.9` comes before `.10`.
+- **The Linux packages put the machine on the Spillebulle archive as they
+  install**, so `apt upgrade`, `dnf upgrade` or your usual system update carries
+  Muster along with everything else. Nothing to configure.
+- Settings and About now sit at the foot of the sidebar rather than in two
+  different corners of the window, and every navigation row carries an icon.
+
+Changed
+
+- The mark stands a sixth over the wordmark's caps in the banner and the
+  installer, which is the measure the rest of the family uses.
+
+Fixed
+
+- **Muster had no icon in the taskbar on Linux.** On Wayland a window is matched
+  to its icon by an application id, and Muster set none, so the launcher showed
+  the mark and the taskbar showed a blank square.
+- **The Ping button said "nothing came back this time" about echoes it never
+  sent.** Where the kernel does not allow ping sockets, Muster sends no echo at
+  all, and it was blaming the device for the silence. It now says which of the
+  two happened, and names the setting that would let it ask.
+- **The DHCP check said only "Permission denied".** It now names the one
+  capability it needs and the command that grants it, and the `.deb`, the `.rpm`
+  and the Arch package grant that capability on install, so a packaged Muster
+  can simply ask.
+- **The updater told `.deb` users to run a command that could not work.**
+  `apt install --only-upgrade muster` needs an archive to upgrade from, and
+  there was none, so apt answered "already the newest version" in the voice of
+  something that had checked. With the archive it prints the upgrade command;
+  without it, it names the exact file to download.
+
 ## 0.0.8
 
 Changed

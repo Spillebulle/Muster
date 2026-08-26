@@ -43,6 +43,7 @@ pub mod portscan;
 pub mod prefix;
 pub mod rate;
 pub mod siphash;
+pub mod ssdp;
 pub mod survey;
 pub mod sysinfo;
 pub mod vendor;

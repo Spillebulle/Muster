@@ -10,7 +10,8 @@ Windows and Linux, installable and self-updating.
 
 **Released and building out.** The survey, the sweep, identification by name
 and vendor, device-kind inference, the `connect()` port scan, DHCP discovery,
-the window, the text mode, the packaging and the updater are all built. The
+SSDP and UPnP, the window, the text mode, the packaging and the updater are all
+built. The
 **privileged engine** is not: no raw transport, so no SYN scan, no ARP sweep,
 no passive fingerprinting and no LLDP or CDP. Neither is IPv6 sweeping.
 `README.md`'s "What is not there yet" is the user-facing list and is kept
@@ -183,7 +184,12 @@ Unprivileged, and more capable than it sounds:
 
 The capability probe runs at start-up and is a pure function of injected
 readings, the same rule `install::detect` follows. **Never degrade silently.** A
-scan that fell back to `connect()` says so, and says what it could not do.
+scan that fell back to `connect()` says so, and says what it could not do. That
+rule reaches further than the scan: `discover::recheck` exists because the Ping
+button reported **"nothing came back this time"** on a machine whose ping
+sockets were closed, which is the application blaming a device for a question
+it never asked. A single re-check now carries the same `not_done` list a sweep
+does, and the interface prints it.
 "No devices found" from an engine that could not send an ARP request is the
 worst failure this application can produce, because it looks like an answer.
 
@@ -193,11 +199,12 @@ The devices announce themselves. Ask before probing:
 
 | Source | Gives |
 |---|---|
-| mDNS / DNS-SD (`_services._dns-sd._udp.local`) | hostnames, service list, Apple `_device-info._tcp` model strings, printers, Chromecasts |
-| SSDP / UPnP | a description URL, and from it manufacturer, model and serial |
+| mDNS / DNS-SD (`_services._dns-sd._udp.local`) | hostnames, service list, Apple `_device-info._tcp` model strings, printers, Chromecasts. Built |
+| SSDP / UPnP | device type URNs and a `SERVER` product string, from the headers; a description URL, and from it manufacturer, model and serial, which is not fetched yet. Built |
 | NetBIOS name service (UDP 137) | Windows names and workgroup |
-| LLMNR | names on modern Windows networks |
-| DHCP (`dhcp.rs`) | **all** offers, not the first — two offers is a rogue DHCP server, and detecting that is a feature, not an error case. Built |
+| LLMNR | names on modern Windows networks. Asked; no device on the network this was developed against has answered one, and it stays because it costs a datagram and is the only question a Windows machine with NetBIOS switched off answers |
+| DHCP (`dhcp.rs`) | **all** offers, not the first — two offers is a rogue DHCP server, and detecting that is a feature, not an error case. Built, and part of a scan when the scan menu says so |
+| DNS (`version.bind`, CHAOS) | which devices are name servers, and what software they run. Built |
 | LLDP / CDP (privileged, passive) | the switch, and the port a device is on |
 | TLS certificates on any open port | subject and SAN, often the best identifier on the network |
 
@@ -224,21 +231,75 @@ wearing a confident face.
   window from a single SYN-ACK give a coarse OS class for free and should be
   taken; nmap-grade active fingerprinting is a much larger probe set and a much
   larger claim. Label which one answered.
+- **A question asked of the link is answered by devices that ignore the same
+  question asked of them.** This is the single largest thing identification
+  learned from a real network: a unicast SSDP `M-SEARCH` found one device out
+  of twenty, and the multicast one found every television, set-top box and
+  camera on the link. mDNS is the same — two televisions answer
+  `_services._dns-sd._udp.local` sent to `224.0.0.251` and ignore it sent to
+  themselves. So the link-wide questions are asked once per scan beside the
+  per-device ones, and replies are attributed by the address they came from.
+- **The machine running the scan is on its own list and answers none of its own
+  questions.** Its mDNS, NetBIOS and SSDP responders do not reply to datagrams
+  it sent out of its own interface, so it was the one permanently blank row.
+  `kind::Vantage` carries what the survey knows about where the scan stands —
+  the gateway, and this machine — and both are facts rather than inferences.
+- **What a device *is* and what it *serves* are two answers, not one.**
+  `Kind` is what a device is and `identify::Role` is what it does for the rest
+  of the network, and the interface shows the first as an icon and the second
+  as badges beside it. A gateway is a router *and* the DHCP server *and* the
+  resolver; folding that into one label loses two of the three. **A role is
+  only ever a service that answered** — never an open port, never a vendor that
+  usually runs one — which is what keeps a badge from being a guess.
+- **A question put to somebody else's resolver carries nothing about this
+  network.** The DNS probe asks `version.bind` in the CHAOS class, which a name
+  server answers out of itself and a forwarder has nowhere to forward; the
+  fallback for servers that ignore CHAOS asks for `localhost` and nothing else.
+  A device's own name or address must never appear in a question sent to a
+  server that is not this machine's own resolver.
 - **What a device *is* comes from ranked clues, never from its name.**
-  `kind.rs` infers a [`Kind`] from four sources in a fixed order: the routing
-  table (the gateway is not a guess), a service the device advertises about
-  itself, an open port only one kind of thing listens on, and — weakest — a
-  vendor that makes only one kind of thing. The order is an `enum`'s `Ord` and
+  `kind.rs` infers a [`Kind`] from ranked sources in a fixed order: where the
+  scan stands (the gateway and this machine are not guesses), a service the
+  device advertises about itself, a model it names for itself, an open port
+  only one kind of thing listens on, and — weakest — a vendor that makes only
+  one kind of thing. **A model ranks below a service**, because a service is a
+  protocol a device has to implement and a model is free text: Samba's
+  `fruit:model` has every NAS on the network advertising `model=MacPro7,1`. The order is an `enum`'s `Ord` and
   the tables are data, so the priority is stated once rather than emerging from
-  the shape of an `if` chain. A **hostname is deliberately not a clue**:
+  the shape of an `if` chain. Every guess carries the clue that produced it and
+  the interface shows both.
+- **A hostname is deliberately not a clue, and it stays that way.**
   `HP-Printer` is usually right and `daves-old-printer-pc` is a desktop, so a
-  name is evidence about whoever set the device up. Every guess carries the
-  clue that produced it and the interface shows both.
+  name is evidence about whoever set the device up. **This was built the other
+  way once and taken out again**, which is worth knowing before building it a
+  third time: a name table did reach a printer, a television, a laptop and four
+  card terminals that nothing else here can touch, and ranked last it lost to
+  every other clue, so the desktop above stayed a desktop. It was still removed,
+  because the standard this project holds identification to is certainty and a
+  name cannot meet it. **A blank row is an answer.** The devices it would have
+  named are kept as a test in `kind.rs`, with what would name each of them
+  honestly written beside it, so the cost is on the record rather than being
+  rediscovered.
+- **The silicon is a separate claim from the vendor.** Component makers stay
+  out of the vendor table for the reason below, but the laptop trade is the
+  exception that the rule was getting wrong: an Intel Corporate block is a
+  network card, and that card is in a computer. `CHIPSETS` says so as
+  `Clue::Chipset`, worded for what is actually true, and the bar for a row is
+  that every product the block turns up in is the same kind. Murata is not on
+  it, and the reason is a payment terminal that was wearing one.
 - **The vendor table earns its place by what is missing from it.** Apple,
   Samsung, Google and Amazon each make five of the kinds, so a match on one is a
   coin toss wearing a confident face. Only vendors with one product category are
   listed. Adding a broad vendor to make a screenshot look fuller is the failure
   mode to refuse.
+- **A payment terminal is a kind.** Not a stretch of `Computer`: on the
+  networks that have one there are eight, and they are what somebody is looking
+  for. They are also the hardest thing here to name, because a terminal is
+  built on somebody else's radio module — the four observed carried Huaqin,
+  Zhong Ge, Murata and Quectel addresses — so the makers who own their blocks
+  are in `VENDORS` and the rest cannot be named at all until one of them
+  answers something. Reading the model out of their hostname is the thing that
+  was tried and refused; see the rule above.
 - **Identity is a merge of independent sources with a priority, not a race.** A
   UPnP model string beats an OUI vendor; a `_device-info` record beats a TTL
   guess. Where sources disagree, keep both — a device answering as two things is
@@ -297,9 +358,21 @@ consequences:
 
 ### Linux capabilities, and the packages that cannot grant them
 
+**Two capabilities, and they are not the same ask.**
+
+`CAP_NET_BIND_SERVICE` is the right to bind a port below 1024, and the DHCP
+check needs it *today*: a client has to listen on port 68 to hear an offer at
+all, so without it that feature answers "Permission denied" on every Linux
+where Muster is not root. The `.deb`, the `.rpm` and the Arch package grant it
+in their install scriptlets, `packaging/check.sh` fails when a scriptlet or the
+message that names it drifts, and `platform::DHCP_HINT` prints the same
+`setcap` line for everyone else.
+
 `CAP_NET_RAW` (plus `CAP_NET_ADMIN` for promiscuous mode) is what the privileged
-engine needs. `.deb`, `.rpm` and the Arch package can `setcap` the binary in a
-post-install script, and should. **AppImage and Flatpak cannot**: an AppImage is
+engine will need, and it is deliberately **not** granted: there is no code path
+that would use it yet, and a capability handed to a binary that cannot spend it
+is a capability handed out for nothing. It belongs in the same scriptlets the
+moment the raw transport lands. **AppImage and Flatpak cannot**: an AppImage is
 extracted at run time and loses file capabilities, and a Flatpak sandbox has no
 mechanism to grant them. Those two builds are unprivileged-only, they must say
 so on the screen where it matters rather than in a README, and the Flatpak
@@ -322,8 +395,44 @@ Port these from Umber rather than designing them again. Its `packaging/` and
 application id consistent across the AppStream file, the desktop entry, the
 icons and all three packaging scripts.
 
+**The Linux packages enrol the machine in the house archive**, `../Packages`,
+published at `spillebulle.github.io/packages`. This exists because the updater
+told every `.deb` user to run `sudo apt install --only-upgrade muster` and that
+command cannot ever have worked: the packages come from a release page, apt only
+consults archives it has been given, and a machine with none answers "already
+the newest version" in the voice of something that had checked. So the `.deb`
+carries the archive's public key in `/usr/share/keyrings` and writes
+`/etc/apt/sources.list.d/spillebulle.sources` from its `postinst`, the `.rpm`
+does the same with `/etc/yum.repos.d/spillebulle.repo`, and from then on the
+package manager keeps Muster current the way it keeps everything else current.
+Three rules come with it:
+
+- **The source file is written by the scriptlet, never shipped in the package.**
+  A file under `/etc` that dpkg owns is a conffile, and dpkg removes a conffile
+  on purge, so a source shared by four applications would be cut off the moment
+  the first of them was uninstalled. Written by the scriptlet it belongs to
+  nobody, every application creates it if it is missing, and `postrm` leaves it
+  alone. `spillebulle.sources.disabled` is the opt-out and is honoured.
+- **The path is stated in two languages and checked by `packaging/check.sh`.**
+  The scriptlet writes it and `update::install::detect` looks for it; if they
+  ever disagree nothing breaks visibly, and every user of the archive is simply
+  told to download a file by hand for ever.
+- **The updater says which of the two situations a machine is in.** With the
+  archive it prints the upgrade command; without it, it names the exact package
+  file to fetch. It never prints an upgrade command to a machine that has
+  nowhere to upgrade from, and `install.rs` has a test that fails on any of the
+  four commands that used to be printed.
+
 The rules that were bought with broken releases:
 
+- **A release is not finished when the tag is.** `release.yml`'s last step
+  dispatches to `Spillebulle/packages`, which rebuilds the house apt and rpm
+  archive from the newest release of every project it carries. Until that run
+  is green, every Linux machine with the archive is still being offered the old
+  version, and nothing in this repository will say so. Check it alongside the
+  release page. It needs `ARCHIVE_DISPATCH_TOKEN` in this repository's secrets;
+  the step is skipped when that is absent, so a release can still be cut
+  without it, and the archive's weekly run is the backstop.
 - **Cutting a release is pushing a tag**, and the tag waits for CI to be green
   on that exact commit. A local pass is not evidence; three of Umber's releases
   broke on a platform the release machine was not.
@@ -393,14 +502,16 @@ already designed.** `portscan::Cookie` is written and tested with no transport
 under it; ARP, DHCP from port 68 without fighting the system client, passive
 fingerprinting and LLDP all wait on the same thing — raw packet access, which
 is Npcap on Windows and `CAP_NET_RAW` on Linux. When it lands, the Linux
-packages get their `setcap` back (see `build-packages.sh`, which says why they
-do not have it yet) and the README's first "not there yet" entry goes.
+packages add `cap_net_raw` beside the `cap_net_bind_service` they already grant
+(see `build-packages.sh`, which argues the difference) and the README's first
+"not there yet" entry goes.
 
 Cheap and unprivileged, so worth doing before that:
 
-- **SSDP and UPnP.** One multicast datagram, and the description URL it returns
-  carries manufacturer, model and serial — the best identification on most home
-  networks, and it would feed `kind.rs` a clue stronger than any vendor guess.
+- **The UPnP description.** SSDP itself is built and its headers are read; the
+  `LOCATION` they carry points at an XML document with the manufacturer, the
+  model name and often a serial number, and fetching it is a TCP request per
+  device that belongs with the banner grabbing below.
 - **TLS certificate reading** on any open port. Subject and SAN are often the
   only place a device's real name is written. Reading a certificate is not
   authenticating, so it stays inside the conduct rules.
@@ -414,8 +525,6 @@ Cheap and unprivileged, so worth doing before that:
 
 Interface work the device list is starting to ask for:
 
-- **Filter and sort.** A /24 with forty devices is already past what an
-  unsorted table serves well.
 - **Export**, as CSV and JSON. The obvious next question after a scan is "put
   this in a ticket".
 - **User labels**, kept beside the scan: somebody who knows their network can

@@ -18,6 +18,7 @@
 //! reporting and doing are not settings — but the switch itself is on this page
 //! and nowhere else.
 
+use crate::icons::Icon;
 use crate::prefs::{self, Prefs, Theme};
 use crate::theme::{self, Palette, metrics, text};
 use crate::themelib::CustomTheme;
@@ -41,6 +42,17 @@ impl Pane {
             Pane::General => "General",
             Pane::Scanning => "Scanning",
             Pane::Themes => "Themes",
+        }
+    }
+
+    /// The rail's icon, which every navigation row in the family carries:
+    /// Tally's settings rail names each of its panes with one, and so does its
+    /// sidebar. See [`crate::icons`].
+    const fn icon(self) -> Icon {
+        match self {
+            Pane::General => Icon::Sliders,
+            Pane::Scanning => Icon::Radar,
+            Pane::Themes => Icon::Contrast,
         }
     }
 
@@ -168,7 +180,7 @@ fn rail(ui: &mut egui::Ui, p: Palette, state: &mut State) {
         });
         ui.add_space(metrics::S3);
         for pane in Pane::ALL {
-            if crate::app::nav_row(ui, p, pane.label(), state.pane == pane).clicked() {
+            if crate::app::nav_row(ui, p, pane.icon(), pane.label(), state.pane == pane).clicked() {
                 state.pane = pane;
             }
         }
@@ -316,6 +328,52 @@ fn general(
 }
 
 fn scanning(ui: &mut egui::Ui, p: Palette, prefs: &mut Prefs) {
+    // The same three values the scan menu in the top bar carries, because they
+    // are the same three fields of `Prefs`. Somebody looking for what a scan
+    // does will look in Settings, and a Settings page that does not have it is
+    // a page that is lying by omission.
+    eyebrow(ui, p, "WHAT A SCAN ASKS");
+    row(
+        ui,
+        p,
+        "Identify devices",
+        Some("mDNS, SSDP and NetBIOS, and the model a device names for itself."),
+        |ui| {
+            let mut on = prefs.identify;
+            if toggle(ui, p, &mut on) {
+                prefs.identify = on;
+            }
+        },
+    );
+    row(
+        ui,
+        p,
+        "Find name servers",
+        Some("One DNS query to each device that answered. It never asks for a real name."),
+        |ui| {
+            let mut on = prefs.scan_dns;
+            if toggle(ui, p, &mut on) {
+                prefs.scan_dns = on;
+            }
+        },
+    );
+    row(
+        ui,
+        p,
+        "Find DHCP servers",
+        Some(
+            "Broadcasts a DISCOVER and keeps every offer, which is how a second \
+             DHCP server is found. Nothing is ever accepted.",
+        ),
+        |ui| {
+            let mut on = prefs.scan_dhcp;
+            if toggle(ui, p, &mut on) {
+                prefs.scan_dhcp = on;
+            }
+        },
+    );
+
+    ui.add_space(metrics::S4);
     eyebrow(ui, p, "TARGET");
     row(
         ui,
@@ -611,7 +669,7 @@ fn segmented<T: Copy + PartialEq>(
 }
 
 /// A slider, §7.10: a 3 px rail with an accent fill and a round knob.
-fn slider(
+pub(crate) fn slider(
     ui: &mut egui::Ui,
     p: Palette,
     value: &mut f32,
@@ -647,7 +705,7 @@ fn slider(
 }
 
 /// A toggle, §7.8: 34 x 18, knob left when off and right when on.
-fn toggle(ui: &mut egui::Ui, p: Palette, on: &mut bool) -> bool {
+pub(crate) fn toggle(ui: &mut egui::Ui, p: Palette, on: &mut bool) -> bool {
     let (rect, response) = ui.allocate_exact_size(vec2(34.0, 18.0), Sense::click());
     let changed = response.clicked();
     if changed {

@@ -28,10 +28,26 @@
 //!   says almost nothing on its own; Sonos makes speakers and nothing else, so
 //!   it says a great deal. The table below carries only the vendors whose range
 //!   is narrow enough for the inference to hold.
+//! * The **silicon** is a separate and narrower claim: an Intel Corporate block
+//!   is a network card, and a network card of that kind is in a computer. See
+//!   [`CHIPSETS`], which exists because the vendor rule above had ruled out the
+//!   one thing that could be said about most of the laptops on an office LAN.
 //!
 //! A hostname is deliberately **not** a clue. `HP-Printer` is usually right and
 //! `daves-old-printer-pc` is a desktop; a name is written by whoever set the
 //! device up and is evidence about them, not about the hardware.
+//!
+//! **This was tried the other way and taken out again**, so it is worth saying
+//! what the trade actually is rather than leaving somebody to rediscover it. A
+//! name table reaches a lot of devices that nothing else here can touch: a
+//! printer answering only ARP called `HPLaserJet`, a television called
+//! `LGwebOSTV-4`, a laptop with a randomised address called
+//! `Janickes-MacBook-Pro`, card terminals called `VFI-347-262-554`. Ranked
+//! last it also loses to every other clue, so the desktop above stays a
+//! desktop. What it cannot do is be *certain*: a name is the one piece of
+//! evidence a person can type, and this project would rather leave a row blank
+//! than fill it with something that is usually true. `Unknown` is an answer
+//! here, and the honest one.
 //!
 //! Nothing here opens a socket. Everything it reads was already collected by
 //! [`crate::discover`] and [`crate::identify`], so the whole module is a pure
@@ -67,6 +83,24 @@ pub enum Kind {
     GameConsole,
     /// A light, a plug, a thermostat, a sensor. Small, fixed function.
     SmartHome,
+    /// A card terminal: the thing a customer taps or a shop keeps by the till.
+    ///
+    /// Added because a real shop network came back as a column of blank rows.
+    /// It earns a kind of its own rather than folding into [`Self::Computer`]
+    /// because it is a fleet: on the networks that have one of these there are
+    /// usually eight, they are the devices somebody is actually looking for,
+    /// and nothing else on the list is that.
+    ///
+    /// **The hardware address is no help at all**, which is what makes this
+    /// kind hard. A terminal is built around somebody else's radio module, so
+    /// the four observed so far carried Huaqin, Zhong Ge, Murata and Quectel
+    /// addresses — an ODM, a components house, a components house and a
+    /// cellular module maker, none of which say anything about the finished
+    /// product. The terminals that do own their blocks are in [`VENDORS`]; the
+    /// rest are not found at all: their name is the only thing that says what
+    /// they are, and a name is not evidence this module will act on. See the
+    /// note at the top about what that costs.
+    PaymentTerminal,
     /// Nothing said anything. **Not a failure**: most devices on most networks
     /// answer a ping and volunteer nothing else, and saying so is honest where
     /// guessing is not.
@@ -89,6 +123,7 @@ impl Kind {
             Self::Camera => "Camera",
             Self::GameConsole => "Console",
             Self::SmartHome => "Smart home",
+            Self::PaymentTerminal => "Payment terminal",
             Self::Unknown => "Unknown",
         }
     }
@@ -104,12 +139,57 @@ impl Kind {
 pub enum Clue {
     /// It is the default gateway. Not an inference.
     Gateway,
+    /// It is the machine the scan is running on. Not an inference either.
+    ///
+    /// **The one device on the list that answers none of the questions.** A
+    /// machine's own mDNS, NetBIOS and SSDP responders do not reply to
+    /// datagrams the same machine sent out of its own interface, so the row for
+    /// the computer somebody is sitting at came back with a hardware address, a
+    /// motherboard vendor and nothing else — a blank icon in the middle of the
+    /// list, and the one device whose identity was never in any doubt.
+    ThisMachine,
     /// It advertised a service that says what it is.
     Service,
+    /// It named its own model, over UPnP or in an mDNS `TXT` record.
+    ///
+    /// **Below [`Self::Service`], and it was written the other way round
+    /// first.** A model string is more *specific* than a service type, which
+    /// is the argument for ranking it above: `_airplay._tcp` cannot tell an
+    /// Apple TV from a HomePod and `model=AudioAccessory5,1` can. What settles
+    /// it the other way is that a service type is a protocol a device has to
+    /// actually implement, and a model string is free text it can put anything
+    /// in — and one very common kind of device puts something else in on
+    /// purpose.
+    ///
+    /// Samba's `fruit:model` makes a file server advertise
+    /// `model=MacPro7,1`, so that macOS draws a Mac in the sidebar instead of
+    /// a generic box. TrueNAS, Synology, unRAID and OpenMediaVault all ship
+    /// with it set. Ranked above the services, that one decoration turned
+    /// every network-attached storage box on a real network into a desktop,
+    /// beating the `_smb._tcp` the same device was honestly advertising.
+    ///
+    /// So the HomePod stays the known wrong answer `SERVICES` already
+    /// documents, and a device that advertises no service at all — which is
+    /// most televisions, and the case this clue was added for — is still named
+    /// by its product string.
+    Product,
     /// A port that only one kind of thing listens on.
     Port,
     /// Its hardware vendor makes one kind of thing.
     Vendor,
+    /// The silicon inside it only ever goes into one kind of thing.
+    ///
+    /// A separate clue from [`Self::Vendor`] because it is a separate claim,
+    /// and printing the vendor's reason against it would be a false one: Intel
+    /// does not "make only computers", it makes the wireless card in one. What
+    /// is true is the other direction — an Intel Corporate block ends up in a
+    /// laptop, a desktop or a NUC and in nothing else — and that is a real
+    /// clue about a device that answers nothing, which on an office network is
+    /// most of the machines people sit in front of. [`CHIPSETS`] is kept to
+    /// the blocks where that holds; the ones where it does not are named in
+    /// [`VENDORS`]'s note about component makers, and Murata is in that note
+    /// because a payment terminal was found wearing one.
+    Chipset,
     /// It answered NetBIOS with a workgroup.
     ///
     /// **Ranked last, below the vendor, and that placement is the point.** It
@@ -119,6 +199,18 @@ pub enum Clue {
     /// desktop, because the workgroup beat a vendor that makes nothing but
     /// storage.
     Workgroup,
+    /// It answered LLMNR.
+    ///
+    /// Ranked below even the workgroup, and it is the weakest thing here that
+    /// is still worth saying. LLMNR is spoken by Windows and by
+    /// `systemd-resolved` and by nothing else that turns up on a home network,
+    /// so a responder on 5355 is a general-purpose computer — but it is a
+    /// *protocol* answering, not a device describing itself, and anything that
+    /// knows better should beat it. It exists because a Windows desktop with
+    /// its firewall on the public profile answers nothing else at all: no
+    /// NetBIOS, no SSDP, no open port, and an mDNS name with no services
+    /// behind it. That device was the commonest blank row on a real network.
+    Llmnr,
 }
 
 impl Clue {
@@ -126,10 +218,14 @@ impl Clue {
     pub const fn reason(self) -> &'static str {
         match self {
             Self::Gateway => "it is this network's gateway",
+            Self::ThisMachine => "it is the machine running the scan",
             Self::Service => "it advertises a service only this kind offers",
+            Self::Product => "it names a model only this kind has",
             Self::Port => "a port only this kind listens on is open",
             Self::Vendor => "its hardware vendor makes only this kind",
+            Self::Chipset => "the silicon in it only goes into this kind",
             Self::Workgroup => "it answers NetBIOS with a workgroup, as Windows machines do",
+            Self::Llmnr => "it answers LLMNR, which only computers do",
         }
     }
 }
@@ -197,11 +293,22 @@ const SERVICES: &[(&str, Kind)] = &[
     ("_uscan.", Kind::Printer),
     ("_uscans.", Kind::Printer),
     ("_axis-video.", Kind::Camera),
+    // D-Link's own camera service. The camera it was taken from advertises
+    // `_workstation._tcp` as well, and read as a desktop because of it.
+    // `_dhnap._tcp` is on the same box and is deliberately not here: that is
+    // D-Link's administration protocol and their routers speak it too.
+    ("_dcamera.", Kind::Camera),
+    // Thread's commissioning service, which a border router offers and nothing
+    // else does.
+    ("_meshcop.", Kind::SmartHome),
     // Media receivers that name their own brand, and so name the device.
     ("_sonos.", Kind::Speaker),
     ("_roku.", Kind::Television),
     ("_amzn-wplay.", Kind::Television),
     ("_androidtvremote2.", Kind::Television),
+    ("_viziocast.", Kind::Television),
+    // The Apple TV's pairing service, which no other Apple device offers.
+    ("_appletv-v2.", Kind::Television),
     // The Apple TV's own remote protocol: the one signal that tells it apart
     // from every other AirPlay receiver in the house.
     ("_mediaremotetv.", Kind::Television),
@@ -230,6 +337,11 @@ const SERVICES: &[(&str, Kind)] = &[
     ("_daap.", Kind::Server),
     ("_rfb.", Kind::Computer),
     ("_ssh.", Kind::Computer),
+    // Windows' own two: Delivery Optimization's peer cache and the remote
+    // assistance service. Both are a Windows machine and neither is anything
+    // else.
+    ("_dosvc.", Kind::Computer),
+    ("_teamviewer.", Kind::Computer),
     ("_sftp-ssh.", Kind::Computer),
     // Avahi advertises this for the machine itself, so it is a Linux or BSD
     // host saying it is a host.
@@ -512,6 +624,192 @@ const VENDORS: &[(Match, &str, Kind)] = &[
     (Match::Prefix, "dell inc", Kind::Computer),
     (Match::Prefix, "micro-star", Kind::Computer),
     (Match::Prefix, "framework computer", Kind::Computer),
+    // ---- Payment terminals ----------------------------------------------
+    // The makers whose own name is on the block, which is the minority: most
+    // terminals are built on somebody else's radio module and are found by
+    // by their name alone, which is not a clue here. See
+    // [`Kind::PaymentTerminal`].
+    (Match::Contains, "verifone", Kind::PaymentTerminal),
+    (Match::Prefix, "ingenico", Kind::PaymentTerminal),
+    (Match::Prefix, "pax computer", Kind::PaymentTerminal),
+    (Match::Prefix, "castles technology", Kind::PaymentTerminal),
+    (Match::Contains, "sunmi", Kind::PaymentTerminal),
+    (Match::Prefix, "shenzhen xinguodu", Kind::PaymentTerminal), // NEXGO
+    (
+        Match::Prefix,
+        "fujian newland payment",
+        Kind::PaymentTerminal,
+    ),
+    (Match::Prefix, "fujian landi", Kind::PaymentTerminal),
+    (Match::Prefix, "spire payments", Kind::PaymentTerminal),
+    (Match::Prefix, "equinox payments", Kind::PaymentTerminal),
+    (Match::Prefix, "ccv deutschland", Kind::PaymentTerminal),
+    (Match::Prefix, "miura systems", Kind::PaymentTerminal),
+    (Match::Prefix, "vanstone electronic", Kind::PaymentTerminal),
+    (Match::Prefix, "beijing wiseasy", Kind::PaymentTerminal),
+    // ---- Added after a real network came back blank ---------------------
+    // Each of these was checked against the registry rather than guessed at,
+    // which `every_vendor_needle_matches_the_registry` then keeps true.
+    (Match::Prefix, "hmd global", Kind::Phone), // Nokia handsets, and only those
+    (Match::Prefix, "hangzhou ezviz", Kind::Camera),
+    (Match::Prefix, "cambium networks", Kind::NetworkGear),
+    (Match::Contains, "meross", Kind::SmartHome),
+];
+
+/// Silicon and assembly houses whose blocks only ever end up in a computer.
+///
+/// [`VENDORS`] excludes the component makers on purpose and gives the reason:
+/// a block held by a radio maker names the radio and not the thing it is
+/// soldered into. That is right about most of them — a Murata address turned
+/// out to be a card terminal, and a Realtek one is as likely to be a
+/// television — and it is **wrong about the laptop trade**, where the part and
+/// the product go together. An Intel Corporate block is a wireless card or an
+/// Ethernet controller, and those go into laptops, desktops and NUCs and into
+/// nothing else on a network; the ODMs below build the machines themselves
+/// under other people's brands.
+///
+/// This was the commonest blank row on an office network by a distance. Intel
+/// alone holds some six hundred and sixty blocks, and every laptop wearing one
+/// came back as "nothing said anything" because the one thing that could be
+/// said about it was ruled out by a rule aimed at somebody else.
+///
+/// The claim is narrower than a vendor's, so it makes a different one:
+/// [`Clue::Chipset`] rather than [`Clue::Vendor`], ranked below it and worded
+/// for what is actually true. The bar for a row here is that **every** product
+/// the block turns up in is the same kind, which is why Hon Hai, Realtek,
+/// AzureWave, Liteon and Murata are not on it: those are in phones,
+/// televisions, set-top boxes, printers and card terminals as well.
+const CHIPSETS: &[(Match, &str, Kind)] = &[
+    (Match::Prefix, "intel corporate", Kind::Computer),
+    (Match::Prefix, "intel corporation", Kind::Computer),
+    // The notebook builders. Between them they assemble most of the laptops
+    // that carry somebody else's badge.
+    (Match::Prefix, "compal information", Kind::Computer),
+    (Match::Prefix, "quanta computer", Kind::Computer),
+    (Match::Prefix, "wistron", Kind::Computer),
+    (Match::Prefix, "pegatron", Kind::Computer),
+    (Match::Prefix, "clevo", Kind::Computer),
+];
+
+/// UPnP device and service types that name a kind.
+///
+/// Matched as a substring of the lower-cased URN, because the version suffix
+/// changes (`:1`, `:2`) and some vendors prefix their own namespace.
+///
+/// **The general types are deliberately absent.** `upnp:rootdevice` says only
+/// that a UPnP stack is running; `device:Basic` is the type for anything that
+/// did not fit; and `device:MediaRenderer` is a television, a soundbar, an AV
+/// receiver or a speaker, which is four kinds and therefore no clue. What is
+/// here is the handful where the type is the device.
+const UPNP: &[(&str, Kind)] = &[
+    // DIAL: the second-screen launch protocol. Televisions, streaming sticks
+    // and the boxes that behave like them, and nothing else at all.
+    ("dial-multiscreen-org", Kind::Television),
+    ("device:tvdevice", Kind::Television),
+    // LG uses two namespaces of its own, and one real television answered with
+    // both: `urn:lge:device:tv:1` and `urn:lge-com:service:webos-second-screen`.
+    ("lge:device:tv", Kind::Television),
+    ("lge-com", Kind::Television),
+    ("roku:ecp", Kind::Television),
+    ("samsung.com:device:remotecontrolreceiver", Kind::Television),
+    ("schemas-sony-com:service:scalarweb", Kind::Television),
+    ("device:zoneplayer", Kind::Speaker), // Sonos
+    ("schemas-denon-com", Kind::Speaker),
+    ("device:printer", Kind::Printer),
+    ("service:printbasic", Kind::Printer),
+    ("device:mediaserver", Kind::Server),
+    // The router half of UPnP: port mapping, and the TR-064 configuration
+    // service a modem or a Fritz!Box offers.
+    ("device:internetgatewaydevice", Kind::NetworkGear),
+    ("device:wandevice", Kind::NetworkGear),
+    ("device:wanconnectiondevice", Kind::NetworkGear),
+    ("dslforum-org", Kind::NetworkGear),
+];
+
+/// Product names, as a device writes them about itself.
+///
+/// Two sources, one table, because they are the same kind of statement: the
+/// `SERVER` header of an SSDP reply (`Linux/4.19 UPnP/1.0 LG WebOS TV/1.0`) and
+/// the model in an mDNS `TXT` record (`model=AudioAccessory5,1` from
+/// `_device-info._tcp`, `md=SHIELD Android TV` from `_googlecast._tcp`).
+///
+/// Matched as a substring of the lower-cased string, and the needles have to be
+/// chosen for that: a `SERVER` header is mostly boilerplate — `Linux/3.4`,
+/// `UPnP/1.0`, `MiniUPnPd/1.9` — and every one of those boilerplate tokens
+/// appears on routers, televisions and network-attached storage alike, so none
+/// of them is here. The needle has to be the part a vendor wrote.
+const PRODUCTS: &[(Match, &str, Kind)] = &[
+    // Apple's model identifiers, which are the most precise self-report on any
+    // network: `iPhone14,2`, `Mac14,2`, `AppleTV11,1`, `AudioAccessory5,1`.
+    // Every one is a [`Match::Prefix`], because an identifier is the whole of
+    // what the device said and a substring would go looking for it inside
+    // other people's product names.
+    (Match::Prefix, "appletv", Kind::Television),
+    (Match::Prefix, "audioaccessory", Kind::Speaker),
+    (Match::Prefix, "homepod", Kind::Speaker),
+    (Match::Prefix, "iphone", Kind::Phone),
+    // No `Tablet` kind, and an iPad is a general purpose machine, so it lands
+    // where a laptop does.
+    (Match::Prefix, "ipad", Kind::Computer),
+    (Match::Prefix, "imac", Kind::Computer),
+    // Every Mac since 2022 reports `Mac<n>,<n>` and the older ones report
+    // `MacBookPro`, `Macmini` and `MacPro`, so one prefix covers the family.
+    // As a substring it would also match Sagemcom, which makes routers.
+    (Match::Prefix, "mac", Kind::Computer),
+    (Match::Prefix, "airport", Kind::NetworkGear), // Express, Extreme, Time Capsule
+    // Streaming and casting, by the name on the box. These arrive inside a
+    // `SERVER` header as often as alone, so they reach.
+    (Match::Contains, "shield android tv", Kind::Television),
+    (Match::Contains, "chromecast", Kind::Television),
+    (Match::Contains, "android tv", Kind::Television),
+    (Match::Contains, "fire tv", Kind::Television),
+    (Match::Contains, "webos", Kind::Television),
+    (Match::Contains, "tizen", Kind::Television),
+    (Match::Contains, "bravia", Kind::Television),
+    (Match::Contains, "roku", Kind::Television),
+    (Match::Contains, "nest hub", Kind::Speaker),
+    (Match::Contains, "google home", Kind::Speaker),
+    (Match::Contains, "nest audio", Kind::Speaker),
+    (Match::Contains, "nest mini", Kind::Speaker),
+    (Match::Contains, "sonos", Kind::Speaker),
+    (Match::Contains, "soundtouch", Kind::Speaker),
+    (Match::Contains, "heos", Kind::Speaker),
+    (Match::Contains, "xbox", Kind::GameConsole),
+    (Match::Contains, "playstation", Kind::GameConsole),
+    // Storage and the things that serve from it. `plex` is a prefix and not a
+    // substring, because it is also the back half of "duplexer".
+    (Match::Contains, "synology", Kind::Server),
+    (Match::Contains, "qnap", Kind::Server),
+    (Match::Contains, "asustor", Kind::Server),
+    (Match::Contains, "truenas", Kind::Server),
+    (Match::Prefix, "plex", Kind::Server),
+    // Printers, by the series name in an `_ipp` record's `ty=`.
+    (Match::Contains, "laserjet", Kind::Printer),
+    (Match::Contains, "officejet", Kind::Printer),
+    (Match::Contains, "deskjet", Kind::Printer),
+    (Match::Contains, "pixma", Kind::Printer),
+    (Match::Contains, "ecotank", Kind::Printer),
+    (Match::Contains, "workforce", Kind::Printer),
+    // HP's embedded server, which is on their printers and on nothing else.
+    (Match::Contains, "hp-chaisoe", Kind::Printer),
+    (Match::Contains, "hikvision", Kind::Camera),
+    (Match::Contains, "dahua", Kind::Camera),
+    (Match::Contains, "reolink", Kind::Camera),
+    (Match::Contains, "ipbridge", Kind::SmartHome), // the Philips Hue bridge
+    (Match::Contains, "shelly", Kind::SmartHome),
+    // Router firmware, named by the people who wrote it.
+    (Match::Contains, "mikrotik", Kind::NetworkGear),
+    (Match::Contains, "asuswrt", Kind::NetworkGear),
+    (Match::Contains, "openwrt", Kind::NetworkGear),
+    (Match::Contains, "dd-wrt", Kind::NetworkGear),
+    (Match::Contains, "fritz", Kind::NetworkGear),
+    (Match::Contains, "unifi", Kind::NetworkGear),
+    // **Last, and that placement is the table's only tie-break that matters.**
+    // A Windows machine running Plex answers with both, and the box is a
+    // computer that happens to serve rather than a server; every other needle
+    // above names a purpose-built device, so anything matching one of those as
+    // well as this is that device.
+    (Match::Contains, "microsoft-windows", Kind::Computer),
 ];
 
 /// Is this address one of the ten blocks that cannot be told from a
@@ -529,11 +827,33 @@ fn is_placeholder(mac: MacAddr) -> bool {
     mac.oui() <= 0x00_0009
 }
 
-/// What this device appears to be, and why.
+/// What the scan knows about a device without having asked it anything.
 ///
-/// `is_gateway` is the caller's, because only the survey knows the routing
-/// table; everything else is read from the scan.
-pub fn identify(found: &Found, identity: &Identity, is_gateway: bool) -> Option<Guess> {
+/// Two facts, both of them the caller's, because they come from where the scan
+/// is standing rather than from the device: only the survey knows the routing
+/// table and the machine's own addresses. They are grouped rather than passed
+/// as a pair of booleans so that a third one — a switch port from LLDP, when
+/// the privileged engine lands — has somewhere to go.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Vantage {
+    /// This device is a default gateway.
+    pub gateway: bool,
+    /// This device is the machine the scan is running on.
+    pub this_machine: bool,
+}
+
+impl Vantage {
+    /// The gateway, and nothing else known.
+    pub const fn gateway(gateway: bool) -> Self {
+        Self {
+            gateway,
+            this_machine: false,
+        }
+    }
+}
+
+/// What this device appears to be, and why.
+pub fn identify(found: &Found, identity: &Identity, vantage: Vantage) -> Option<Guess> {
     let mut best: Option<Guess> = None;
     let mut consider = |kind: Kind, clue: Clue| {
         if kind == Kind::Unknown {
@@ -546,8 +866,14 @@ pub fn identify(found: &Found, identity: &Identity, is_gateway: bool) -> Option<
         }
     };
 
-    if is_gateway {
+    if vantage.gateway {
         consider(Kind::Router, Clue::Gateway);
+    }
+
+    // Ranked below the gateway, because a machine that is both is more useful
+    // described as the way off the network than as somebody's desktop.
+    if vantage.this_machine {
+        consider(Kind::Computer, Clue::ThisMachine);
     }
 
     // A NetBIOS node status reply carrying a workgroup is a machine saying it
@@ -556,6 +882,28 @@ pub fn identify(found: &Found, identity: &Identity, is_gateway: bool) -> Option<
     // list. It is a self-report, so it ranks with the services.
     if identity.workgroup.is_some() {
         consider(Kind::Computer, Clue::Workgroup);
+    }
+
+    // Weaker than the workgroup and, on the machines this was added for, the
+    // only thing there is. See [`Clue::Llmnr`].
+    if identity.llmnr {
+        consider(Kind::Computer, Clue::Llmnr);
+    }
+
+    // What the device says it *is*, before what it says it *does*. Both the
+    // SSDP `SERVER` header and an mDNS model string are searched against one
+    // table, so a device that names itself in either place is read the same
+    // way; the table is the outer loop for the same reason it is below.
+    let named: Vec<String> = identity
+        .product
+        .iter()
+        .chain(identity.model.iter())
+        .map(|product| product.to_ascii_lowercase())
+        .collect();
+    for (mode, needle, kind) in PRODUCTS {
+        if named.iter().any(|product| mode.matches(needle, product)) {
+            consider(*kind, Clue::Product);
+        }
     }
 
     // The table is the outer loop and the device's own list is the inner one,
@@ -568,6 +916,15 @@ pub fn identify(found: &Found, identity: &Identity, is_gateway: bool) -> Option<
         .collect();
     for (name, kind) in SERVICES {
         if advertised.iter().any(|service| service.starts_with(name)) {
+            consider(*kind, Clue::Service);
+        }
+    }
+
+    // UPnP device types, which are the same class of self-report as an mDNS
+    // service and are ranked with them. `identity.upnp` is already lower cased
+    // by [`crate::ssdp::Announcement::types`].
+    for (needle, kind) in UPNP {
+        if identity.upnp.iter().any(|urn| urn.contains(needle)) {
             consider(*kind, Clue::Service);
         }
     }
@@ -589,14 +946,23 @@ pub fn identify(found: &Found, identity: &Identity, is_gateway: bool) -> Option<
         {
             consider(*kind, Clue::Vendor);
         }
+        // Below the vendor, and only where the vendor said nothing: the same
+        // registry name, read for what the part goes into rather than for what
+        // the company sells. See [`CHIPSETS`].
+        if let Some((_, _, kind)) = CHIPSETS
+            .iter()
+            .find(|(mode, needle, _)| mode.matches(needle, &name))
+        {
+            consider(*kind, Clue::Chipset);
+        }
     }
 
     best
 }
 
 /// The kind alone, with [`Kind::Unknown`] where nothing was learned.
-pub fn kind_of(found: &Found, identity: &Identity, is_gateway: bool) -> Kind {
-    identify(found, identity, is_gateway).map_or(Kind::Unknown, |guess| guess.kind)
+pub fn kind_of(found: &Found, identity: &Identity, vantage: Vantage) -> Kind {
+    identify(found, identity, vantage).map_or(Kind::Unknown, |guess| guess.kind)
 }
 
 #[cfg(test)]
@@ -618,16 +984,221 @@ mod tests {
 
     fn advertising(services: &[&str]) -> Identity {
         Identity {
-            names: Vec::new(),
-            workgroup: None,
-            mac: None,
             services: services.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
         }
+    }
+
+    /// A device that answered SSDP with these types and this `SERVER`.
+    fn announcing(types: &[&str], server: Option<&str>) -> Identity {
+        Identity {
+            upnp: types.iter().map(|t| t.to_ascii_lowercase()).collect(),
+            product: server.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// A device that named its own model over mDNS.
+    fn modelled(model: &str) -> Identity {
+        Identity {
+            model: Some(model.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The case that started this: a device answering NetBIOS with a workgroup
+    /// and nothing else was read as a Windows desktop, and it is a television.
+    ///
+    /// Nothing about the workgroup rule was wrong. What was missing is that
+    /// nobody had asked the device what it offers, so the service that names it
+    /// never reached this function.
+    #[test]
+    fn a_shield_that_answers_netbios_is_still_a_television() {
+        let mut identity = advertising(&["_androidtvremote2._tcp", "_googlecast._tcp"]);
+        identity.workgroup = Some("WORKGROUP".into());
+        let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
+        assert_eq!(guess.kind, Kind::Television);
+        assert_eq!(guess.clue, Clue::Service);
+    }
+
+    /// A UPnP device type is the same class of statement as an mDNS service and
+    /// is ranked with it. DIAL is on televisions and streaming boxes only.
+    #[test]
+    fn a_upnp_type_names_a_kind() {
+        let guess = identify(
+            &host(&[], None),
+            &announcing(&["urn:dial-multiscreen-org:device:dial:1"], None),
+            Vantage::default(),
+        )
+        .expect("a guess");
+        assert_eq!(guess.kind, Kind::Television);
+        assert_eq!(guess.clue, Clue::Service);
+    }
+
+    /// The LG television from a real scan: two addresses, one MAC, a vendor
+    /// that makes five of the kinds, no open ports and no mDNS at all. The
+    /// `SERVER` header is the only thing on the wire that says what it is.
+    #[test]
+    fn a_server_header_names_a_product_where_the_vendor_cannot() {
+        let guess = identify(
+            &host(&[], None),
+            &announcing(&[], Some("Linux/4.19 UPnP/1.0 LG WebOS TV/1.0")),
+            Vantage::default(),
+        )
+        .expect("a guess");
+        assert_eq!(guess.kind, Kind::Television);
+        assert_eq!(guess.clue, Clue::Product);
+    }
+
+    /// Found on a real network within a minute of the model clue existing: a
+    /// TrueNAS box advertising `_smb._tcp` and `model=MacPro7,1`, which is
+    /// Samba's `fruit:model` asking macOS to draw it a Mac.
+    ///
+    /// The service is what the device does and the model is what it would like
+    /// to be taken for, so the service wins. See [`Clue::Product`].
+    #[test]
+    fn a_file_server_pretending_to_be_a_mac_is_still_a_server() {
+        let mut identity = advertising(&["_smb._tcp", "_device-info._tcp"]);
+        identity.model = Some("MacPro7,1".into());
+        let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
+        assert_eq!(guess.kind, Kind::Server);
+        assert_eq!(guess.clue, Clue::Service);
+    }
+
+    /// And with nothing else to go on the model is still taken, which is the
+    /// whole point of having it.
+    #[test]
+    fn a_model_names_a_device_that_advertises_nothing() {
+        let guess = identify(&host(&[], None), &modelled("MacPro7,1"), Vantage::default())
+            .expect("a guess");
+        assert_eq!(guess.kind, Kind::Computer);
+        assert_eq!(guess.clue, Clue::Product);
+    }
+
+    #[test]
+    fn a_cast_model_is_read_as_the_name_on_the_box() {
+        for (model, kind) in [
+            ("SHIELD Android TV", Kind::Television),
+            ("Chromecast Ultra", Kind::Television),
+            ("Google Nest Mini", Kind::Speaker),
+            ("iPhone14,2", Kind::Phone),
+            ("Mac14,2", Kind::Computer),
+            ("MacBookPro18,3", Kind::Computer),
+            ("HP OfficeJet 6950", Kind::Printer),
+        ] {
+            let guess = identify(&host(&[], None), &modelled(model), Vantage::default())
+                .unwrap_or_else(|| panic!("{model} names nothing"));
+            assert_eq!(guess.kind, kind, "{model}");
+            assert_eq!(guess.clue, Clue::Product, "{model}");
+        }
+    }
+
+    /// `Mac14,2` is a computer and `Mac` is not a needle that may match
+    /// anything else, so the table spells the families out.
+    #[test]
+    fn a_product_needle_does_not_reach_past_its_own_product() {
+        // "roku" must not be found inside an unrelated word, and "plex" must
+        // not match "Plexus" — the substring rule is what makes both possible,
+        // so both are asserted rather than assumed.
+        assert!(
+            identify(
+                &host(&[], None),
+                &modelled("Duplexer 3000"),
+                Vantage::default()
+            )
+            .is_none()
+        );
+        assert!(
+            identify(
+                &host(&[], None),
+                &modelled("Kodak Verite"),
+                Vantage::default()
+            )
+            .is_none()
+        );
+    }
+
+    /// The Windows desktop behind its own firewall: no NetBIOS, no services,
+    /// no open ports, a motherboard vendor that makes five kinds of thing.
+    #[test]
+    fn llmnr_is_the_last_thing_that_still_says_computer() {
+        let identity = Identity {
+            llmnr: true,
+            ..Default::default()
+        };
+        let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
+        assert_eq!(guess.kind, Kind::Computer);
+        assert_eq!(guess.clue, Clue::Llmnr);
+    }
+
+    /// And it is beaten by everything, including the weakest clue above it.
+    #[test]
+    fn anything_at_all_beats_llmnr() {
+        let identity = Identity {
+            llmnr: true,
+            ..advertising(&["_ipp._tcp"])
+        };
+        assert_eq!(
+            identify(&host(&[], None), &identity, Vantage::default())
+                .unwrap()
+                .kind,
+            Kind::Printer
+        );
+        // A vendor is the weakest clue above it, and it still wins.
+        let identity = Identity {
+            llmnr: true,
+            ..Default::default()
+        };
+        let sonos = identify(&host(&[], None), &identity, Vantage::default());
+        assert_eq!(
+            sonos.unwrap().clue,
+            Clue::Llmnr,
+            "with no vendor to beat it"
+        );
+        let with_vendor = identify(
+            &host(&[], Some([0x00, 0x0e, 0x58, 1, 2, 3])),
+            &identity,
+            Vantage::default(),
+        )
+        .expect("a guess");
+        assert_eq!(with_vendor.kind, Kind::Speaker, "the Sonos block");
+        assert_eq!(with_vendor.clue, Clue::Vendor);
+    }
+
+    /// The blank row in the middle of every scan: the machine somebody is
+    /// sitting at. Its own responders do not answer its own datagrams, so it
+    /// arrives here with a hardware address and nothing else.
+    #[test]
+    fn the_machine_running_the_scan_is_known_without_asking_it() {
+        let vantage = Vantage {
+            gateway: false,
+            this_machine: true,
+        };
+        let guess = identify(&host(&[], None), &Identity::default(), vantage).expect("a guess");
+        assert_eq!(guess.kind, Kind::Computer);
+        assert_eq!(guess.clue, Clue::ThisMachine);
+    }
+
+    /// And a machine that routes for the network is described as the way off
+    /// it, which is the more useful of two true things.
+    #[test]
+    fn a_machine_that_is_also_the_gateway_is_the_gateway() {
+        let vantage = Vantage {
+            gateway: true,
+            this_machine: true,
+        };
+        let guess = identify(&host(&[], None), &Identity::default(), vantage).expect("a guess");
+        assert_eq!(guess.kind, Kind::Router);
     }
 
     #[test]
     fn the_gateway_is_not_a_guess() {
-        let guess = identify(&host(&[], None), &Identity::default(), true).expect("a guess");
+        let guess = identify(
+            &host(&[], None),
+            &Identity::default(),
+            Vantage::gateway(true),
+        )
+        .expect("a guess");
         assert_eq!(guess.kind, Kind::Router);
         assert_eq!(guess.clue, Clue::Gateway);
     }
@@ -639,7 +1210,7 @@ mod tests {
         let guess = identify(
             &host(&[80, 5000], None),
             &advertising(&["_ipp._tcp.local"]),
-            false,
+            Vantage::default(),
         )
         .expect("a guess");
         assert_eq!(guess.kind, Kind::Printer);
@@ -651,8 +1222,12 @@ mod tests {
         // Ubiquiti make network gear, but this one is answering RTSP: a camera
         // they also make. The narrower signal is the open port.
         let ubiquiti = [0x44, 0xd9, 0xe7, 0x00, 0x00, 0x01];
-        let guess =
-            identify(&host(&[554], Some(ubiquiti)), &Identity::default(), false).expect("a guess");
+        let guess = identify(
+            &host(&[554], Some(ubiquiti)),
+            &Identity::default(),
+            Vantage::default(),
+        )
+        .expect("a guess");
         assert_eq!(guess.kind, Kind::Camera);
         assert_eq!(guess.clue, Clue::Port);
     }
@@ -662,8 +1237,12 @@ mod tests {
         // Sonos make speakers and nothing else, which is the whole test for
         // whether a vendor belongs in the table.
         let sonos = [0x00, 0x0e, 0x58, 0x00, 0x00, 0x01];
-        let guess =
-            identify(&host(&[], Some(sonos)), &Identity::default(), false).expect("a guess");
+        let guess = identify(
+            &host(&[], Some(sonos)),
+            &Identity::default(),
+            Vantage::default(),
+        )
+        .expect("a guess");
         assert_eq!(guess.kind, Kind::Speaker);
         assert_eq!(guess.clue, Clue::Vendor);
     }
@@ -673,11 +1252,11 @@ mod tests {
         // The common case on a real network, and the one a scanner is most
         // tempted to fill in with a guess.
         assert_eq!(
-            identify(&host(&[], None), &Identity::default(), false),
+            identify(&host(&[], None), &Identity::default(), Vantage::default()),
             None
         );
         assert_eq!(
-            kind_of(&host(&[], None), &Identity::default(), false),
+            kind_of(&host(&[], None), &Identity::default(), Vantage::default()),
             Kind::Unknown
         );
     }
@@ -688,7 +1267,11 @@ mod tests {
         // there is no manufacturer behind it to reason from.
         let randomised = [0x7a, 0x0e, 0x58, 0x00, 0x00, 0x01];
         assert_eq!(
-            identify(&host(&[], Some(randomised)), &Identity::default(), false),
+            identify(
+                &host(&[], Some(randomised)),
+                &Identity::default(),
+                Vantage::default()
+            ),
             None,
             "a made-up address must not be read as its accidental OUI"
         );
@@ -703,7 +1286,7 @@ mod tests {
             identify(
                 &host(&[], None),
                 &advertising(&["_device-info._tcp.local"]),
-                false
+                Vantage::default()
             ),
             None
         );
@@ -718,7 +1301,7 @@ mod tests {
             workgroup: Some("WORKGROUP".to_string()),
             ..Identity::default()
         };
-        let guess = identify(&host(&[], None), &identity, false).expect("a guess");
+        let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
         assert_eq!(guess.kind, Kind::Computer);
         assert_eq!(guess.clue, Clue::Workgroup);
     }
@@ -733,15 +1316,20 @@ mod tests {
             workgroup: Some("WORKGROUP".to_string()),
             ..Identity::default()
         };
-        let guess = identify(&host(&[], Some(synology)), &identity, false).expect("a guess");
+        let guess =
+            identify(&host(&[], Some(synology)), &identity, Vantage::default()).expect("a guess");
         assert_eq!(guess.kind, Kind::Server);
         assert_eq!(guess.clue, Clue::Vendor);
     }
 
     #[test]
     fn advertising_ssh_makes_it_a_computer() {
-        let guess =
-            identify(&host(&[], None), &advertising(&["_ssh._tcp.local"]), false).expect("a guess");
+        let guess = identify(
+            &host(&[], None),
+            &advertising(&["_ssh._tcp.local"]),
+            Vantage::default(),
+        )
+        .expect("a guess");
         assert_eq!(guess.kind, Kind::Computer);
     }
 
@@ -755,17 +1343,165 @@ mod tests {
             }],
             ..Identity::default()
         };
-        assert_eq!(identify(&host(&[], None), &identity, false), None);
+        assert_eq!(
+            identify(&host(&[], None), &identity, Vantage::default()),
+            None
+        );
+    }
+
+    /// Eight devices a real shop network could not name, kept as a record of
+    /// what the rule above costs and of what would answer each of them.
+    ///
+    /// These are recorded observations rather than inventions, which is what
+    /// `CLAUDE.md` asks a fingerprint table to be driven from. Every one of
+    /// them has a name that says exactly what it is, and every one of them is
+    /// [`Kind::Unknown`] here, because a name is not evidence this module acts
+    /// on. **That is the intended answer, not a defect**, and this test exists
+    /// so that a change which starts reading names has to come here and say so
+    /// out loud rather than quietly turning eight rows into guesses.
+    ///
+    /// What would name them honestly is written against each: for most, a port
+    /// scan or an SSDP reply the sweep did not have.
+    #[test]
+    fn the_devices_a_real_shop_network_could_not_name() {
+        for (name, mac, would_answer_it) in [
+            // HP make laptops as well as printers, so the block says nothing.
+            // Port 9100 or 631 would settle it, and neither was scanned.
+            (
+                "HPLaserJet.local",
+                [0x28, 0xc5, 0xc8, 0x1c, 0x72, 0xd9],
+                "an open 9100 or 631, or the _ipp record it did not send",
+            ),
+            // Four card terminals on four component makers' blocks: an ODM, a
+            // components house, another, and a cellular module maker. See
+            // [`Kind::PaymentTerminal`].
+            (
+                "S1F4Pro-000195254265067",
+                [0xc4, 0x60, 0x0a, 0x78, 0x6f, 0xf5],
+                "nothing on the wire; the block is Huaqin's, an ODM",
+            ),
+            (
+                "S1F2-000158223788345",
+                [0xc4, 0x6e, 0x33, 0x7c, 0x76, 0xfd],
+                "nothing on the wire; the block is a components house's",
+            ),
+            (
+                "VFI-347-262-554",
+                [0x58, 0xd5, 0x0a, 0xab, 0x6a, 0x6f],
+                "nothing on the wire; the block is Murata's, a radio maker",
+            ),
+            (
+                "P630-452345389",
+                [0xec, 0x1d, 0x9e, 0xdb, 0x79, 0xed],
+                "nothing on the wire; the block is Quectel's, a module maker",
+            ),
+            // LG Innotek make camera modules and lighting as well as the
+            // radios in televisions. A multicast SSDP M-SEARCH would have had
+            // this one: an LG television answers `urn:lge:device:tv:1`, which
+            // `UPNP` already reads.
+            (
+                "LGwebOSTV-4.local",
+                [0x60, 0xab, 0x14, 0x68, 0x2b, 0x44],
+                "the SSDP reply an LG television gives to a multicast M-SEARCH",
+            ),
+            // A MacBook with a randomised address: no vendor, no services, and
+            // the name is all there is. Nothing would answer this one without
+            // asking the machine something it did not answer.
+            (
+                "Janickes-MacBook-Pro.local",
+                [0xae, 0xcc, 0x66, 0x8e, 0xda, 0xd8],
+                "an _rfb, _ssh or _companion-link record, or an open 5900",
+            ),
+        ] {
+            let identity = Identity {
+                names: vec![Name {
+                    value: name.to_string(),
+                    source: Source::Mdns,
+                }],
+                ..Identity::default()
+            };
+            let guess = identify(&host(&[], Some(mac)), &identity, Vantage::default());
+            assert_eq!(
+                guess, None,
+                "{name} is deliberately blank; what would name it is {would_answer_it}"
+            );
+        }
+    }
+
+    /// The eighth of them, and the one that is answered: a laptop whose name is
+    /// a fleet number and whose wireless card is the evidence.
+    #[test]
+    fn the_card_in_a_laptop_names_it_where_the_name_could_not() {
+        let identity = Identity {
+            names: vec![Name {
+                value: "LT-00036".to_string(),
+                source: Source::ReverseDns,
+            }],
+            ..Identity::default()
+        };
+        let guess = identify(
+            &host(&[], Some([0x30, 0xf6, 0xef, 0x7c, 0x07, 0xea])),
+            &identity,
+            Vantage::default(),
+        )
+        .expect("an Intel block is a network card, and that card is in a computer");
+        assert_eq!(guess.kind, Kind::Computer);
+        assert_eq!(guess.clue, Clue::Chipset);
+    }
+
+    /// Both halves of the registry read the same way, so the same casing rule
+    /// applies to the second table as to the first.
+    #[test]
+    fn the_chipset_needles_are_lower_case() {
+        for (_, needle, _) in CHIPSETS {
+            assert_eq!(*needle, needle.to_ascii_lowercase(), "{needle}");
+        }
+    }
+
+    #[test]
+    fn every_chipset_needle_matches_the_registry() {
+        let names = registry_organisations();
+        let dead: Vec<_> = CHIPSETS
+            .iter()
+            .filter(|(mode, needle, _)| !names.iter().any(|name| mode.matches(needle, name)))
+            .map(|(mode, needle, kind)| format!("{mode:?}({needle:?}) -> {kind:?}"))
+            .collect();
+        assert!(
+            dead.is_empty(),
+            "these match no organisation in data/oui.tsv: {dead:#?}"
+        );
     }
 
     #[test]
     fn the_clue_order_is_the_priority_order() {
         // The ranking is load-bearing: `identify` sorts on it, so a variant
         // inserted in the wrong place silently changes every answer.
-        assert!(Clue::Gateway < Clue::Service);
-        assert!(Clue::Service < Clue::Port);
+        assert!(Clue::Gateway < Clue::ThisMachine);
+        assert!(Clue::ThisMachine < Clue::Service);
+        assert!(Clue::Service < Clue::Product);
+        assert!(Clue::Product < Clue::Port);
         assert!(Clue::Port < Clue::Vendor);
-        assert!(Clue::Vendor < Clue::Workgroup);
+        assert!(Clue::Vendor < Clue::Chipset);
+        assert!(Clue::Chipset < Clue::Workgroup);
+        assert!(Clue::Workgroup < Clue::Llmnr);
+    }
+
+    /// Every needle is compared against a lower-cased string, so a needle with
+    /// a capital in it can never match. Cheap to write and impossible to see
+    /// by reading the table.
+    #[test]
+    fn no_needle_can_be_ruled_out_by_its_own_casing() {
+        for (_, needle, _) in PRODUCTS {
+            assert_eq!(*needle, needle.to_ascii_lowercase(), "{needle}");
+        }
+        for (needle, _) in UPNP {
+            assert_eq!(*needle, needle.to_ascii_lowercase(), "{needle}");
+        }
+        for (needle, _) in SERVICES {
+            assert_eq!(*needle, needle.to_ascii_lowercase(), "{needle}");
+            assert!(needle.starts_with('_'), "a service type begins with _");
+            assert!(needle.ends_with('.'), "{needle} must end at a label break");
+        }
     }
 
     /// The registry as `build.rs` reads it, so a needle can be checked against
@@ -853,7 +1589,11 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                identify(&host(&[], Some(mac)), &Identity::default(), false),
+                identify(
+                    &host(&[], Some(mac)),
+                    &Identity::default(),
+                    Vantage::default()
+                ),
                 None,
                 "{company} was read as {was}"
             );
@@ -869,7 +1609,11 @@ mod tests {
             ([0x40, 0x11, 0xdc, 0x00, 0x00, 0x01], Kind::Speaker), // Sonance
             ([0x00, 0x1b, 0xa9, 0x00, 0x00, 0x01], Kind::Printer), // Brother Industries
         ] {
-            let guess = identify(&host(&[], Some(mac)), &Identity::default(), false);
+            let guess = identify(
+                &host(&[], Some(mac)),
+                &Identity::default(),
+                Vantage::default(),
+            );
             assert_eq!(guess.map(|g| g.kind), Some(expected), "{mac:02x?}");
         }
     }
@@ -879,8 +1623,12 @@ mod tests {
     #[test]
     fn mikrotik_is_found_under_the_name_it_actually_registered() {
         let routerboard = [0x00, 0x0c, 0x42, 0x00, 0x00, 0x01];
-        let guess =
-            identify(&host(&[], Some(routerboard)), &Identity::default(), false).expect("a guess");
+        let guess = identify(
+            &host(&[], Some(routerboard)),
+            &Identity::default(),
+            Vantage::default(),
+        )
+        .expect("a guess");
         assert_eq!(guess.kind, Kind::NetworkGear);
         assert_eq!(guess.clue, Clue::Vendor);
     }
@@ -890,7 +1638,12 @@ mod tests {
     #[test]
     fn a_handset_maker_makes_it_a_phone() {
         let oppo = [0x00, 0xca, 0xe0, 0x00, 0x00, 0x01];
-        let guess = identify(&host(&[], Some(oppo)), &Identity::default(), false).expect("a guess");
+        let guess = identify(
+            &host(&[], Some(oppo)),
+            &Identity::default(),
+            Vantage::default(),
+        )
+        .expect("a guess");
         assert_eq!(guess.kind, Kind::Phone);
         assert_eq!(guess.clue, Clue::Vendor);
     }
@@ -906,15 +1659,23 @@ mod tests {
             [0x00, 0x00, 0x09, 0x11, 0x22, 0x33],
         ] {
             assert_eq!(
-                identify(&host(&[], Some(mac)), &Identity::default(), false),
+                identify(
+                    &host(&[], Some(mac)),
+                    &Identity::default(),
+                    Vantage::default()
+                ),
                 None,
                 "{mac:02x?} was read as a vendor"
             );
         }
         // And a Xerox block from this century still is one.
         let xerox = [0x9c, 0x93, 0x4e, 0x00, 0x00, 0x01];
-        let guess =
-            identify(&host(&[], Some(xerox)), &Identity::default(), false).expect("a guess");
+        let guess = identify(
+            &host(&[], Some(xerox)),
+            &Identity::default(),
+            Vantage::default(),
+        )
+        .expect("a guess");
         assert_eq!(guess.kind, Kind::Printer);
     }
 
@@ -926,12 +1687,12 @@ mod tests {
         let forwards = advertising(&["_airplay._tcp", "_raop._tcp"]);
         let backwards = advertising(&["_raop._tcp", "_airplay._tcp"]);
         assert_eq!(
-            identify(&host(&[], None), &forwards, false),
-            identify(&host(&[], None), &backwards, false),
+            identify(&host(&[], None), &forwards, Vantage::default()),
+            identify(&host(&[], None), &backwards, Vantage::default()),
             "the answer changed with the order of the advertised list"
         );
         assert_eq!(
-            kind_of(&host(&[], None), &forwards, false),
+            kind_of(&host(&[], None), &forwards, Vantage::default()),
             Kind::Television
         );
     }
@@ -947,7 +1708,7 @@ mod tests {
             "_companion-link._tcp",
         ]);
         assert_eq!(
-            kind_of(&host(&[], None), &apple_tv, false),
+            kind_of(&host(&[], None), &apple_tv, Vantage::default()),
             Kind::Television
         );
     }
@@ -960,7 +1721,7 @@ mod tests {
             identify(
                 &host(&[], None),
                 &advertising(&["_companion-link._tcp.local"]),
-                false
+                Vantage::default()
             ),
             None
         );
@@ -977,8 +1738,12 @@ mod tests {
             ("_matterd._udp", Kind::SmartHome),
             ("_androidtvremote2._tcp", Kind::Television),
         ] {
-            let guess =
-                identify(&host(&[], None), &advertising(&[service]), false).expect("a guess");
+            let guess = identify(
+                &host(&[], None),
+                &advertising(&[service]),
+                Vantage::default(),
+            )
+            .expect("a guess");
             assert_eq!(guess.kind, expected, "{service}");
             assert_eq!(guess.clue, Clue::Service);
         }
@@ -1021,8 +1786,12 @@ mod tests {
             (62078, Kind::Phone),
             (8006, Kind::Server),
         ] {
-            let guess =
-                identify(&host(&[port], None), &Identity::default(), false).expect("a guess");
+            let guess = identify(
+                &host(&[port], None),
+                &Identity::default(),
+                Vantage::default(),
+            )
+            .expect("a guess");
             assert_eq!(guess.kind, expected, "port {port}");
             assert_eq!(guess.clue, Clue::Port);
         }

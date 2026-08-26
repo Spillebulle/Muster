@@ -74,4 +74,73 @@ for f in packaging/linux/build-packages.sh packaging/linux/PKGBUILD \
 done
 ok "every packaging script names $APP_ID"
 
+# --- the icon on the running window ------------------------------------------
+#
+# A Wayland client cannot hand the compositor an icon; it hands it an app id,
+# and the compositor reads the icon out of `<app id>.desktop`. So the string the
+# window sets and the name of this desktop entry are one fact written in two
+# languages, and when they disagree nothing breaks loudly: the launcher reads
+# the entry by name and shows the mark, and the taskbar shows a blank square.
+decl=$(grep '^pub const APP_ID' crates/muster-app/src/lib.rs | head -1)
+[ -n "$decl" ] || fail "crates/muster-app/src/lib.rs declares no APP_ID"
+window_id=$(printf '%s' "$decl" | cut -d '"' -f 2)
+[ "$window_id" = "$APP_ID" ] || fail "the window's app id is '$window_id', expected '$APP_ID'"
+grep -q 'with_app_id(APP_ID)' crates/muster-app/src/lib.rs || fail "the window never sets an app id, so Wayland has no icon to find"
+ok "the window's app id resolves to the desktop entry"
+
+# X11 takes no app id and matches on WM_CLASS instead, which winit leaves as the
+# basename of argv[0] — the binary Exec runs.
+wmclass=$(grep '^StartupWMClass=' "$desktop" | head -1 | cut -d = -f 2)
+[ "$wmclass" = "$exec_line" ] || fail "StartupWMClass is '$wmclass' but the binary is called '$exec_line'"
+ok "StartupWMClass is the binary's own name, which is X11's WM_CLASS"
+
+# --- the one capability ------------------------------------------------------
+#
+# The DHCP check binds port 68, which is below 1024, so it needs
+# `CAP_NET_BIND_SERVICE`. Three scriptlets grant it and one string on screen
+# names it, and if those ever disagree the feature simply reports "Permission
+# denied" for ever with a message telling the user to grant something the
+# packages already granted. Same shape of defect as the archive path below.
+CAP=cap_net_bind_service
+for f in packaging/linux/build-packages.sh packaging/linux/muster.install; do
+    [ -f "$f" ] || fail "$f is missing"
+    grep -q "$CAP" "$f" || fail "$f never grants $CAP, so the DHCP check cannot bind port 68"
+done
+grep -q "$CAP" crates/muster-net/src/platform/mod.rs ||     fail "the message that explains a failed DHCP check never names $CAP"
+ok "the packages grant $CAP and the message names it"
+
+# The Arch scriptlet only runs if the PKGBUILD names it, and makepkg only finds
+# it if the workflow copies it next to the PKGBUILD.
+grep -q '^install=muster.install$' packaging/linux/PKGBUILD ||     fail "the PKGBUILD does not name muster.install, so the scriptlet never runs"
+grep -q 'packaging/linux/muster.install' .github/workflows/release.yml ||     fail "release.yml does not copy muster.install beside the PKGBUILD, so makepkg will fail"
+ok "the Arch scriptlet is named by the PKGBUILD and shipped by the workflow"
+
+# --- the house archive -------------------------------------------------------
+#
+# The path the `.deb` writes and the path the updater looks for have to be the
+# same string, and they are written in two files in two languages that never
+# see each other. Get it wrong and nothing breaks: the packages still install,
+# the updater still runs, and it simply tells every user of the archive to go
+# and download a file by hand for ever. That is the shape of defect this whole
+# script exists for.
+for path in /etc/apt/sources.list.d/spillebulle.sources \
+            /etc/yum.repos.d/spillebulle.repo; do
+    grep -q "$path" packaging/linux/build-packages.sh || \
+        fail "packaging/linux/build-packages.sh never writes $path"
+    grep -q "$path" crates/muster-app/src/update/install.rs || \
+        fail "the updater never looks for $path"
+done
+ok "the packages and the updater agree on where the archive is configured"
+
+# Not a failure: the public key is checked in when the archive has one, and
+# until then the packages build exactly as they did before it existed. Said out
+# loud on every run, because a package that quietly stopped enrolling machines
+# would look identical to one that never did.
+if [ -f packaging/linux/spillebulle-archive.asc ]; then
+    ok "the archive key is checked in, so packages will enrol the machine"
+else
+    printf '  --  no packaging/linux/spillebulle-archive.asc: packages will not\n'
+    printf '      enrol the machine in the archive (see ../Packages/README.md)\n'
+fi
+
 printf 'packaging metadata is consistent\n'

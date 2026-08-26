@@ -105,7 +105,14 @@ fn main() {
             let mut out = std::io::stdout().lock();
             print_survey(&mut out, &muster_net::survey());
         }
-        "scan" => scan(args.get(1).map(String::as_str)),
+        "scan" => {
+            // `--dhcp` may come before or after the prefix, because both read
+            // naturally and a tool that accepts only one order is a tool that
+            // has to be argued with.
+            let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+            let dhcp = rest.contains(&"--dhcp");
+            scan(rest.into_iter().find(|a| !a.starts_with("--")), dhcp);
+        }
         "ports" => portcmd::run(
             args.get(1).map(String::as_str),
             args.get(2).map(String::as_str),
@@ -125,10 +132,16 @@ fn usage() {
          Usage:\n  \
            muster survey                 what this machine knows, no packets sent\n  \
            muster scan [prefix]          sweep the local network for devices\n  \
+           muster scan --dhcp            and ask who hands out addresses\n  \
            muster ports <host> [ports]   which ports are open on one host\n  \
            muster --help                 this\n\n\
          None of these needs administrator rights. With no prefix, the scan\n\
          sweeps the network this machine is on and nothing beyond it.\n\n\
+         A scan asks each device what it is over mDNS, SSDP and NetBIOS, and\n\
+         asks the link as a whole, which is what most devices answer. It also\n\
+         asks each one whether it is a name server. `--dhcp` adds a DISCOVER\n\
+         broadcast, which finds every server willing to hand out an address:\n\
+         two is a fault worth knowing about. Nothing ever accepts an offer.\n\n\
          Devices are identified by hardware vendor, and by name where they\n\
          answer reverse DNS, mDNS or NetBIOS. The port scan uses connect(),\n\
          which is slower than the SYN scan it will use once raw packet access\n\
@@ -145,7 +158,7 @@ fn usage() {
 /// range somebody typed. A prefix given on the command line is the deliberate
 /// act, and it is checked against the local networks so that reaching beyond
 /// the link is something the user is told they are doing.
-fn scan(target: Option<&str>) {
+fn scan(target: Option<&str>, dhcp: bool) {
     let survey = muster_net::survey();
 
     let prefixes: Vec<Prefix> = match target {
@@ -218,6 +231,12 @@ fn scan(target: Option<&str>) {
         );
 
         let started = Instant::now();
+
+        // Started before the sweep and collected after identification, so its
+        // three-second window costs the scan nothing. See `muster_app::scan`,
+        // which does the same thing for the same reason.
+        let offers = (dhcp && on_link).then(|| dhcp_probe(&survey)).flatten();
+
         let last = Mutex::new(Instant::now() - Duration::from_secs(1));
         let result = discover::sweep(prefix, &transport, &rate, opts, &cancel, &|p, _| {
             // A progress line is drawn by returning to the start of it, which
@@ -274,8 +293,66 @@ fn scan(target: Option<&str>) {
             eprint!("\r{:<48}\r", "");
         }
 
-        print_sweep(&result, &names, started.elapsed());
+        let mut names = names;
+        let offers = offers.and_then(|handle| handle.join().ok());
+        if let Some(probe) = &offers {
+            for server in probe.servers() {
+                let server = IpAddr::V4(server);
+                if let Some(i) = addresses.iter().position(|a| *a == server) {
+                    names[i].offers_addresses();
+                }
+            }
+        }
+
+        print_sweep(&result, &names, &survey, started.elapsed());
+
+        // After the table, because it is a statement about the link rather
+        // than about a device, and because two servers is the one thing here
+        // worth ending on.
+        if let Some(probe) = &offers {
+            println!("\n  {}", probe.verdict());
+            for offer in probe.distinct_offers() {
+                println!(
+                    "  {:<W_ADDRESS$}  offered {}{}",
+                    offer.server.to_string(),
+                    offer.offered,
+                    offer
+                        .router
+                        .map(|r| format!(", gateway {r}"))
+                        .unwrap_or_default()
+                );
+            }
+        }
     }
+}
+
+/// Broadcasts a DISCOVER on a thread, to be collected when the scan is done.
+///
+/// [`None`] where this machine has no interface with a hardware address to ask
+/// from, because an offer comes back addressed to whoever sent it and an
+/// address nothing on the link owns collects nothing.
+fn dhcp_probe(
+    survey: &muster_net::Survey,
+) -> Option<std::thread::JoinHandle<muster_net::dhcp::Probe>> {
+    let mac = survey
+        .interfaces
+        .iter()
+        .find(|i| i.is_scannable())
+        .and_then(|i| i.mac)?;
+    Some(std::thread::spawn(move || {
+        // A fresh transaction id per probe, from the clock rather than a
+        // counter: a predictable id on a real network collects somebody else's
+        // negotiation.
+        let xid = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0x4d75_7374, |d| d.subsec_nanos() ^ d.as_secs() as u32);
+        muster_net::dhcp::probe(
+            &muster_net::platform::udp::Dhcp,
+            mac,
+            xid,
+            Duration::from_secs(3),
+        )
+    }))
 }
 
 /// Column widths for the device table.
@@ -298,6 +375,8 @@ const W_VENDOR: usize = 24;
 /// The name a device gives for itself.
 const W_NAME: usize = 22;
 const W_RTT: usize = 6; // 1234 ms, or <1 ms
+/// Wide enough for the longest of [`muster_net::Kind`]'s labels.
+const W_KIND: usize = 10; // "Smart home"
 
 /// What an address says about its maker, in one place because it is shown in
 /// three.
@@ -316,7 +395,11 @@ fn vendor_cell(mac: Option<muster_net::MacAddr>) -> String {
 /// A function rather than an inline `println!` so that the alignment rule has
 /// somewhere to be tested. A test that reimplements the formatting proves only
 /// that it agrees with itself.
-fn device_row(host: &discover::Found, named: Option<&identify::Identity>) -> String {
+fn device_row(
+    host: &discover::Found,
+    named: Option<&identify::Identity>,
+    vantage: muster_net::kind::Vantage,
+) -> String {
     let mac = host.mac.map(|m| m.to_string()).unwrap_or_default();
     // Its own column, not a suffix on the hardware address.
     let vendor = vendor_cell(host.mac);
@@ -347,16 +430,58 @@ fn device_row(host: &discover::Found, named: Option<&identify::Identity>) -> Str
             .unwrap_or_default();
         why.push(format!("also called {}", others.join(", ")));
     }
+    // The model, where the device named one. It is short, it is the device's
+    // own words, and it is the single most useful thing in this column.
+    if let Some(model) = named.and_then(|i| i.model.as_deref()) {
+        why.push(model.to_string());
+    }
     if let Some(group) = named.and_then(|i| i.workgroup.as_deref()) {
         why.push(format!("workgroup {group}"));
     }
     for service in named.map(|i| i.services.as_slice()).unwrap_or(&[]) {
         why.push(service.clone());
     }
+    // What the device announced over UPnP. The `SERVER` header is a sentence
+    // and the type URNs are long, so this column shows the header and counts
+    // the rest: the device window is where the whole list belongs.
+    if let Some(product) = named.and_then(|i| i.product.as_deref()) {
+        why.push(format!("announces {product}"));
+    }
+    match named.map(|i| i.upnp.len()).unwrap_or(0) {
+        0 => {}
+        1 => why.push("1 UPnP type".into()),
+        many => why.push(format!("{many} UPnP types")),
+    }
+    if named.is_some_and(|i| i.llmnr) {
+        why.push("answered LLMNR".into());
+    }
+    // What it serves the network. The window draws these as badges; here they
+    // are words, in the same order, out of the same function.
+    for role in named.map(identify::Identity::roles).unwrap_or_default() {
+        why.push(role.reason().to_string());
+    }
+    if let Some(version) = named.and_then(|i| i.resolver.as_ref()?.version.as_deref()) {
+        why.push(version.to_string());
+    }
+
+    // The kind, and its reason with the rest of the evidence. The window shows
+    // the same guess from the same function; a text mode that could not say
+    // what a device is would be a different product from the one with the
+    // icons in it.
+    let empty = identify::Identity::default();
+    let guess = muster_net::kind::identify(host, named.unwrap_or(&empty), vantage);
+    let kind = match guess {
+        Some(guess) => {
+            why.insert(0, guess.clue.reason().to_string());
+            guess.kind.label()
+        }
+        None => "",
+    };
 
     format!(
-        "  {:<W_ADDRESS$}  {:<W_NAME$}  {:<W_MAC$}  {:<W_VENDOR$}  {:>W_RTT$}  {}",
+        "  {:<W_ADDRESS$}  {:<W_KIND$}  {:<W_NAME$}  {:<W_MAC$}  {:<W_VENDOR$}  {:>W_RTT$}  {}",
         host.address,
+        kind,
         name,
         mac,
         vendor,
@@ -377,17 +502,25 @@ fn truncate(text: &str, width: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
-fn print_sweep(s: &discover::Sweep, names: &[identify::Identity], took: Duration) {
+fn print_sweep(
+    s: &discover::Sweep,
+    names: &[identify::Identity],
+    survey: &muster_net::Survey,
+    took: Duration,
+) {
     if s.found.is_empty() {
         println!("  nothing answered");
     } else {
         println!(
-            "  {:<W_ADDRESS$}  {:<W_NAME$}  {:<W_MAC$}  {:<W_VENDOR$}  {:>W_RTT$}  How it answered",
-            "Address", "Name", "Hardware", "Made by", "Time"
+            "  {:<W_ADDRESS$}  {:<W_KIND$}  {:<W_NAME$}  {:<W_MAC$}  {:<W_VENDOR$}  {:>W_RTT$}               How it answered",
+            "Address", "What", "Name", "Hardware", "Made by", "Time"
         );
     }
     for (i, host) in s.found.iter().enumerate() {
-        println!("{}", device_row(host, names.get(i)));
+        println!(
+            "{}",
+            device_row(host, names.get(i), survey.vantage(host.address))
+        );
     }
 
     println!(
@@ -741,7 +874,11 @@ mod tests {
 
         // No identities: the alignment has to hold for the empty name column
         // as well, which is the common case on a network with no mDNS on it.
-        let rows: Vec<String> = sweep.found.iter().map(|f| device_row(f, None)).collect();
+        let rows: Vec<String> = sweep
+            .found
+            .iter()
+            .map(|f| device_row(f, None, muster_net::kind::Vantage::default()))
+            .collect();
 
         // The reason is the last column, so where it starts is where every
         // preceding field has finished. One position for every row, or it is

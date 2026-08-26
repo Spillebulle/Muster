@@ -11,7 +11,7 @@
 
 use crate::identify::Ask;
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 /// The receive buffer, which is one whole datagram's worth.
@@ -81,6 +81,69 @@ impl Ask for Udp {
             }
             socket.set_read_timeout(Some(left))?;
         }
+    }
+
+    /// Collects every reply inside the window, with the address each came from.
+    ///
+    /// The same socket for the whole window, which is the one place this file's
+    /// "a fresh socket per exchange" rule is about a *window* rather than a
+    /// single exchange: the replies are all answers to the one datagram that
+    /// was sent, and rebinding between them would lose the ones in flight.
+    ///
+    /// **A timeout is not a failure here.** A device that sent four replies and
+    /// then went quiet has answered; the error is only returned when nothing
+    /// arrived at all, so that the caller can tell "said nothing" from "said
+    /// several things".
+    fn ask_all(
+        &self,
+        to: SocketAddr,
+        payload: &[u8],
+        window: Duration,
+        most: usize,
+    ) -> io::Result<Vec<(IpAddr, Vec<u8>)>> {
+        let bind: SocketAddr = if to.is_ipv4() {
+            "0.0.0.0:0".parse().expect("literal")
+        } else {
+            "[::]:0".parse().expect("literal")
+        };
+        let socket = UdpSocket::bind(bind)?;
+        socket.set_read_timeout(Some(window))?;
+        socket.send_to(payload, to)?;
+
+        let deadline = Instant::now() + window;
+        let mut replies = Vec::new();
+        let mut buf = vec![0u8; RECV_BUFFER];
+        while replies.len() < most {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            socket.set_read_timeout(Some(left))?;
+            let (n, from) = match socket.recv_from(&mut buf) {
+                Ok(got) => got,
+                Err(e) if e.raw_os_error() == Some(WSAEMSGSIZE) => (buf.len(), to),
+                // Out of window, or the socket has nothing more. Either way
+                // what has arrived is the answer.
+                Err(_) => break,
+            };
+            // A question asked of one address may only be answered by that
+            // address, or a device could name its neighbour. **A question asked
+            // of a group has the opposite rule**: the whole point of a
+            // multicast search is that the answers come from everywhere, each
+            // from the device it is about, so there the sender is the result
+            // rather than something to check.
+            if to.ip().is_multicast() || from.ip() == to.ip() {
+                replies.push((from.ip(), buf[..n].to_vec()));
+            }
+        }
+
+        if replies.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no reply from the address asked",
+            ));
+        }
+        Ok(replies)
     }
 }
 

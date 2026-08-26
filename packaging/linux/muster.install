@@ -1,0 +1,28 @@
+# The one capability Muster asks a package manager for.
+#
+# `CAP_NET_BIND_SERVICE` is the right to bind a port below 1024, and the DHCP
+# check needs it: a client has to be listening on port 68 to hear an offer at
+# all, so without this that feature reports "Permission denied" and nothing
+# else, on every machine, for ever.
+#
+# It is **not** `CAP_NET_RAW`. That is what the privileged engine will want when
+# the raw transport lands, and granting it to a binary with no code path that
+# uses it would be a capability handed out for nothing. See the long note in
+# `build-packages.sh`, which grants the same one to the .deb and the .rpm.
+#
+# `|| true`: setcap comes from `libcap`, and a package must not fail to install
+# over an optional feature. Without it Muster simply keeps saying what it cannot
+# do, which is what it did before.
+_grant() {
+    if command -v setcap >/dev/null 2>&1; then
+        setcap cap_net_bind_service=+ep /usr/bin/muster || true
+    fi
+}
+
+post_install() {
+    _grant
+}
+
+post_upgrade() {
+    _grant
+}

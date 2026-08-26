@@ -41,6 +41,7 @@ const fn hue(kind: Kind) -> Option<f32> {
         Kind::Camera => 0.0,
         Kind::Television => 45.0,
         Kind::Speaker => 80.0,
+        Kind::PaymentTerminal => 105.0,
         Kind::SmartHome => 130.0,
         Kind::Server => 165.0,
         // The accent itself. The router is the one device every other device on
@@ -192,6 +193,25 @@ pub fn draw(painter: &Painter, rect: Rect, kind: Kind, ink: Color32, ground: Col
             fill(box_of(0.40, 0.60, 0.20, 0.32), 0.04, ground);
         }
 
+        // A card terminal: a body, a screen and a keypad. The keypad is the
+        // whole of what tells it from the phone two rows up — both are a
+        // rounded slab with a screen, and only one of them has buttons under
+        // it — so the dots are large and there are only six.
+        Kind::PaymentTerminal => {
+            fill(box_of(0.24, 0.10, 0.52, 0.80), 0.14, ink);
+            fill(box_of(0.32, 0.18, 0.36, 0.22), 0.05, ground);
+            for row in 0..3 {
+                for column in 0..2 {
+                    dot(
+                        0.40 + column as f32 * 0.20,
+                        0.52 + row as f32 * 0.15,
+                        0.045,
+                        ground,
+                    );
+                }
+            }
+        }
+
         // A ring and nothing in it. Deliberately the emptiest icon on the list:
         // it is what "nothing said anything" looks like, and it must not read as
         // a device of its own.
@@ -205,7 +225,7 @@ pub fn draw(painter: &Painter, rect: Rect, kind: Kind, ink: Color32, ground: Col
 mod tests {
     use super::*;
 
-    const ALL: [Kind; 12] = [
+    const ALL: [Kind; 13] = [
         Kind::Router,
         Kind::NetworkGear,
         Kind::Computer,
@@ -217,6 +237,7 @@ mod tests {
         Kind::Camera,
         Kind::GameConsole,
         Kind::SmartHome,
+        Kind::PaymentTerminal,
         Kind::Unknown,
     ];
 

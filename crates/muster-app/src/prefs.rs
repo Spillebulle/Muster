@@ -103,6 +103,28 @@ pub struct Prefs {
     pub warn_off_link: bool,
     /// The port list. Empty means the built-in common list.
     pub port_list: String,
+
+    /// Ask devices what they are: mDNS, SSDP, NetBIOS, LLMNR, the model.
+    ///
+    /// On, and the only reason to turn it off is a network where the extra
+    /// datagrams are unwelcome. A sweep with this off finds addresses, hardware
+    /// addresses and vendors, and says nothing else about anything.
+    pub identify: bool,
+    /// Ask who hands out addresses, as part of a scan.
+    ///
+    /// **Off by default, and that is a conduct decision rather than a technical
+    /// one.** A DISCOVER is a broadcast that asks every server on the link to
+    /// reserve an address — nothing takes the offer and the reservation is
+    /// given back in seconds, but it is still asking somebody's server to do
+    /// work, and `CLAUDE.md` makes anything beyond looking a deliberate act.
+    /// Turning it on is that act, and it is remembered.
+    pub scan_dhcp: bool,
+    /// Ask every device that answered whether it is a name server.
+    ///
+    /// On: it is one datagram per device, in the protocol, and it answers the
+    /// question somebody scanning a network most often has after "what is
+    /// here" — which of these is the network's own infrastructure.
+    pub scan_dns: bool,
 }
 
 impl Default for Prefs {
@@ -120,6 +142,9 @@ impl Default for Prefs {
             port_rate: 400,
             warn_off_link: true,
             port_list: String::new(),
+            identify: true,
+            scan_dhcp: false,
+            scan_dns: true,
         }
     }
 }
@@ -189,6 +214,9 @@ pub fn parse(text: &str) -> Prefs {
             }
             "warn_off_link" => prefs.warn_off_link = flag,
             "port_list" => prefs.port_list = value.to_string(),
+            "identify" => prefs.identify = flag,
+            "scan_dhcp" => prefs.scan_dhcp = flag,
+            "scan_dns" => prefs.scan_dns = flag,
             // A file written by a newer Muster. Ignored rather than refused:
             // the alternative is a downgrade wiping settings it did not
             // understand.
@@ -213,6 +241,9 @@ pub fn render(prefs: &Prefs) -> String {
     out.push_str(&format!("rate = {}\n", prefs.rate));
     out.push_str(&format!("port_rate = {}\n", prefs.port_rate));
     out.push_str(&format!("warn_off_link = {}\n", prefs.warn_off_link));
+    out.push_str(&format!("identify = {}\n", prefs.identify));
+    out.push_str(&format!("scan_dhcp = {}\n", prefs.scan_dhcp));
+    out.push_str(&format!("scan_dns = {}\n", prefs.scan_dns));
     if !prefs.port_list.is_empty() {
         out.push_str(&format!("port_list = {}\n", prefs.port_list));
     }
@@ -265,6 +296,9 @@ mod tests {
             port_rate: 200,
             warn_off_link: false,
             port_list: "22,80,443".into(),
+            identify: false,
+            scan_dhcp: true,
+            scan_dns: false,
         };
         assert_eq!(parse(&render(&prefs)), prefs);
     }

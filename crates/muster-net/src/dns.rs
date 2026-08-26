@@ -29,6 +29,10 @@ pub const TYPE_TXT: u16 = 16;
 pub const TYPE_AAAA: u16 = 28;
 pub const TYPE_SRV: u16 = 33;
 pub const CLASS_IN: u16 = 1;
+/// The CHAOS class, which exists on a modern network for exactly one purpose:
+/// `version.bind`, the pseudo-record every name server answers with what it is.
+/// See [`crate::identify`], which asks it.
+pub const CLASS_CH: u16 = 3;
 
 /// mDNS: ask the responder to answer to our own port rather than to the
 /// multicast group. Set in the top bit of the question's class.
@@ -88,6 +92,40 @@ pub struct Message {
 }
 
 impl Message {
+    /// Is this a reply rather than a question?
+    ///
+    /// The `QR` bit, and on its own it is the whole of "something here speaks
+    /// DNS": a server that refuses a query still sets it, and a refusal is an
+    /// answer to the only question being asked.
+    pub const fn is_response(&self) -> bool {
+        self.flags & 0x8000 != 0
+    }
+
+    /// Did the answering server say it will recurse for a client?
+    ///
+    /// The `RA` bit, which separates a resolver — the thing a network's devices
+    /// point at — from a server that is only authoritative for its own zone.
+    pub const fn recursion_available(&self) -> bool {
+        self.flags & 0x0080 != 0
+    }
+
+    /// The response code: 0 is no error, 3 is `NXDOMAIN`, 5 is `REFUSED`.
+    pub const fn rcode(&self) -> u8 {
+        (self.flags & 0x000f) as u8
+    }
+
+    /// The strings of the first `TXT` record, joined.
+    ///
+    /// A `TXT` record is a list of strings and a `version.bind` answer is
+    /// conventionally one of them, but a server is free to split it and some
+    /// do.
+    pub fn first_txt(&self) -> Option<String> {
+        self.records().find_map(|r| match &r.data {
+            RData::Txt(strings) if !strings.is_empty() => Some(strings.join(" ")),
+            _ => None,
+        })
+    }
+
     /// Every record in the message, wherever it was filed. Callers looking for
     /// a fact rarely care which section carried it.
     pub fn records(&self) -> impl Iterator<Item = &Record> {
@@ -103,11 +141,22 @@ impl Message {
     }
 }
 
-/// Builds a query for one name and type.
+/// Builds a query for one name and type, in class `IN`.
 ///
 /// `unicast` sets the mDNS QU bit; it must be false for ordinary DNS, where
 /// that bit is part of the class and setting it asks for class 32769.
 pub fn query(id: u16, name: &str, kind: u16, unicast: bool) -> Vec<u8> {
+    let class = if unicast { CLASS_IN | QU_BIT } else { CLASS_IN };
+    query_in_class(id, name, kind, class)
+}
+
+/// Builds a query in a stated class.
+///
+/// Only [`CLASS_CH`] needs this, and only for `version.bind`. It is a separate
+/// function rather than another parameter on [`query`] because forty call sites
+/// asking for `CLASS_IN` by name would be forty chances to write `CLASS_CH` by
+/// accident.
+pub fn query_in_class(id: u16, name: &str, kind: u16, class: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(name.len() + 20);
     out.extend_from_slice(&id.to_be_bytes());
     // Standard query, recursion desired. Recursion is meaningless to an mDNS
@@ -118,7 +167,6 @@ pub fn query(id: u16, name: &str, kind: u16, unicast: bool) -> Vec<u8> {
 
     write_name(&mut out, name);
     out.extend_from_slice(&kind.to_be_bytes());
-    let class = if unicast { CLASS_IN | QU_BIT } else { CLASS_IN };
     out.extend_from_slice(&class.to_be_bytes());
     out
 }
