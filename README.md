@@ -28,21 +28,21 @@ naming what the sweep could not do](docs/images/window.png)
 
 ## Install
 
-**Muster 0.0.12.** Take the file for your system, or browse the
+**Muster 0.0.13.** Take the file for your system, or browse the
 [release itself](https://github.com/Spillebulle/muster/releases/latest) for the
 notes and the checksums.
 
 | Your system | x86-64 | ARM64 |
 |---|---|---|
-| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-setup-0.0.12-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-setup-0.0.12-arm64.exe) |
-| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster_0.0.12_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster_0.0.12_arm64.deb) |
-| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-1.aarch64.rpm) |
-| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-bin-0.0.12-1-x86_64.pkg.tar.zst) | not built |
-| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.12/Muster-0.0.12-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.12/Muster-0.0.12-aarch64.AppImage) |
-| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-x86_64.flatpak) | not built |
-| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-arm64.msi) |
-| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-aarch64-pc-windows-msvc.zip) |
-| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.12/muster-0.0.12-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-setup-0.0.13-x64.exe) | [Installer](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-setup-0.0.13-arm64.exe) |
+| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster_0.0.13_amd64.deb) | [`.deb`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster_0.0.13_arm64.deb) |
+| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-1.aarch64.rpm) |
+| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-bin-0.0.13-1-x86_64.pkg.tar.zst) | not built |
+| Any other Linux | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.13/Muster-0.0.13-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/muster/releases/download/v0.0.13/Muster-0.0.13-aarch64.AppImage) |
+| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-x86_64.flatpak) | not built |
+| Windows, `.msi` to deploy | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-x64.msi) | [`.msi`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-arm64.msi) |
+| Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-aarch64-pc-windows-msvc.zip) |
+| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.13/muster-0.0.13-aarch64-unknown-linux-gnu.tar.gz) |
 
 The `.deb` and `.rpm` add the [Spillebulle archive](https://spillebulle.github.io/packages/)
 as they install, so `apt upgrade` or your usual system update carries Muster along
@@ -250,6 +250,17 @@ thinks it is and why, what it serves the network, its address, hardware and
 vendor, what it advertises, and a button to ask it again. Every field has a copy
 control, because every field is something about to be pasted somewhere.
 
+**Ping it, or keep pinging it.** The second button goes round until you stop
+it, once every half second — Settings, Scanning has the interval. **History**
+widens the window and puts every result in a column of its own: a chart of the
+last minute, and the readings under it newest first. A probe that went out and
+got nothing back is red; one this machine could not send at all is amber, and is
+never drawn as a device that failed to answer.
+
+<img src="docs/images/history.png" alt="The device window with its history
+column open: a chart of the last minute of round trips with one red bar where
+nothing came back, and the readings listed under it" width="820">
+
 Scan its ports from the same window. Open ports are listed with the service
 usually found on them, which is a convention rather than something the device
 said. **Closed and filtered are counted separately and always.** Rolling them
@@ -363,8 +374,13 @@ required, so it works over SSH.
 scale and the update switch, with a rail listing General, Scanning and Themes"
 align="right" width="380">
 
-Theme, interface scale, how hard a scan knocks, which ports it tries. Settings
-save as you change them, so there is nothing to confirm and nothing to lose.
+Theme, interface scale, how hard a scan knocks, how often a continuous ping goes
+round, and which ports it tries. Settings save as you change them, so there is
+nothing to confirm and nothing to lose.
+
+**The port list is a list.** It shows every port a scan tries with the service
+usually found on it, and you add to it or take from it a row at a time rather
+than retyping the lot to change one. Reset puts the built-in list back.
 
 Muster reads the same `.umbertheme` files as the rest of the family, so a theme
 made in a sibling application opens here. Put them in the themes folder the

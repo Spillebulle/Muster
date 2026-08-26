@@ -3,6 +3,47 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.13
+
+Added
+
+- **Ping history, beside the device rather than under it.** The device window
+  has a History button; pressing it widens the window and fills what it grew by
+  with the round trips, newest first, over a chart of the last minute. A probe
+  that came back is a bar, a probe that went out and got nothing is red, and a
+  probe this machine could not send at all is amber and never drawn as a lost
+  packet. Every result is kept as it arrives, so a loop left running builds one.
+- **Keep pinging is on the device window too**, where it was only in the
+  table's Actions menu. It is one button that says Stop while a loop is going,
+  and the loop it stops includes one started for a whole group.
+- **The port list is a list.** It shows all sixty-four ports a scan tries with
+  the service usually found on each, and you add to it or take from it a row at
+  a time. It used to be one text field where empty meant the built-in list, so
+  adding a single port meant typing out the other sixty-three; the built-in list
+  is now written out the first time you touch it, and Reset puts it back.
+- **A link to the source, on the About page**, with the repository's address
+  written under it rather than hidden behind the words. Nothing is fetched:
+  Muster hands the address to the desktop when you click it.
+- **Listening and asking your own router for names now appear in Settings**,
+  beside the other things a scan asks. They were only in the scan menu, and the
+  two are meant to be two views of one set of switches.
+
+Fixed
+
+- **Keep pinging sent over a hundred probes a second.** There was no interval
+  between passes at all — only the rate limiter — so a device that answered
+  quickly was asked again immediately. It is now once every half second, and
+  Settings, Scanning has the interval. A pass that takes longer than the
+  interval simply goes again when it is done.
+- **A group ping showed "asking…" on every device until the whole group had
+  answered**, and then went on showing it for every pass after the first. Each
+  device now shows its own result the moment that result arrives, and holds it —
+  including "no reply" — until its next one. A row never goes back to blank.
+- **The taskbar icon was three loose circles.** Below 40 px the mark dropped the
+  strokes joining the hub to its satellites, on the reasoning that a two-pixel
+  stroke is a smudge. What was left did not read as a network at all. The small
+  sizes now keep their arms and draw them heavier rather than lighter.
+
 ## 0.0.12
 
 Added
