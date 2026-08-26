@@ -398,6 +398,26 @@ mod tests {
         text.parse().unwrap()
     }
 
+    /// A state with a run in flight, without starting a thread.
+    ///
+    /// The tests below are about what the *window* is told while a run is on,
+    /// which is a question about this file's bookkeeping and not about probing.
+    /// Building the run directly is what keeps them from needing a network.
+    fn running(targets: &[IpAddr], looping: bool) -> State {
+        State {
+            run: Some(Run {
+                targets: targets.to_vec(),
+                looping,
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: channel().1,
+                answered: 0,
+                passes: 1,
+                heard: Default::default(),
+            }),
+            ..Default::default()
+        }
+    }
+
     /// Nothing is asked about nobody. The menu can offer "Ping" with no device
     /// marked, and this is what keeps that from spawning a thread with no work
     /// and a state that never ends.
@@ -426,18 +446,9 @@ mod tests {
     /// is waiting only until it has said something.
     #[test]
     fn a_device_stops_waiting_once_it_has_answered() {
-        let mut state = State::default();
         let one = ip("192.168.0.2");
         let two = ip("192.168.0.3");
-        state.run = Some(Run {
-            targets: vec![one, two],
-            looping: true,
-            cancel: Arc::new(AtomicBool::new(false)),
-            rx: channel().1,
-            answered: 0,
-            passes: 1,
-            heard: Default::default(),
-        });
+        let mut state = running(&[one, two], true);
 
         assert!(state.waiting_for(one));
         assert!(state.waiting_for(two));
@@ -455,16 +466,7 @@ mod tests {
     /// A device nothing is asking about is not waiting for anything.
     #[test]
     fn a_device_no_run_is_about_is_never_waiting() {
-        let mut state = State::default();
-        state.run = Some(Run {
-            targets: vec![ip("192.168.0.2")],
-            looping: false,
-            cancel: Arc::new(AtomicBool::new(false)),
-            rx: channel().1,
-            answered: 0,
-            passes: 1,
-            heard: Default::default(),
-        });
+        let state = running(&[ip("192.168.0.2")], false);
         assert!(!state.waiting_for(ip("192.168.0.9")));
         assert!(
             !state.loops_for(ip("192.168.0.2")),
