@@ -396,6 +396,7 @@ impl App {
             smb: self.prefs.scan_smb,
             nfs: self.prefs.scan_nfs,
             ssh: self.prefs.scan_ssh,
+            snmp: self.prefs.scan_snmp,
             reverse: self.prefs.scan_reverse,
             listen: self.prefs.scan_listen,
         }
@@ -926,6 +927,11 @@ fn scan_options(ui: &mut egui::Ui, p: Palette, app: &mut App, split: &Split) {
                     "Read SSH greetings",
                     "Listens to what a server says on port 22. Nothing is sent to it.",
                     &mut app.prefs.scan_ssh,
+                ),
+                (
+                    "Read SNMP descriptions",
+                    "One query on port 161, carrying public, the community the standard names as the default. Sent once, and never a second one.",
+                    &mut app.prefs.scan_snmp,
                 ),
             ] {
                 changed |= menu_toggle(ui, p, label, explain, value);
@@ -3450,6 +3456,22 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
                     // them would be padding a panel with what a badge already said.
                     if let Some(greeting) = &named.serves.ssh {
                         fact_row(ui, p, "SSH", greeting);
+                    }
+                    // What an SNMP agent said, which on a switch or an access
+                    // point is the only thing on this panel. Three rows rather
+                    // than one, because they are three different claims: what
+                    // the device says it is, what somebody named it, and who
+                    // the identifier it answered with is registered to. The
+                    // last is worded as a registration and not as a maker; see
+                    // `muster_net::snmp::Agent::registrant`.
+                    if let Some(agent) = &named.snmp {
+                        fact_row(ui, p, "SNMP", &agent.summary());
+                        if let Some(name) = &agent.name {
+                            fact_row(ui, p, "SNMP name", name);
+                        }
+                        if let Some(registered) = agent.registered_to() {
+                            fact_row(ui, p, "OID registered to", &registered);
+                        }
                     }
                     fact_row(
                         ui,

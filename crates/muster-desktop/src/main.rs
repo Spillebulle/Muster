@@ -121,10 +121,19 @@ fn main() {
                 ssh: rest.contains(&"--ssh"),
                 ..Default::default()
             };
+            // A datagram rather than a connection, and named separately all the
+            // same: it carries the community string the standard names as the
+            // default, which makes asking a deliberate act. See
+            // `muster_net::snmp`.
+            let agents = muster_net::snmp::Options {
+                ask: rest.contains(&"--snmp"),
+                ..Default::default()
+            };
             scan(
                 rest.into_iter().find(|a| !a.starts_with("--")),
                 dhcp,
                 serves,
+                agents,
             );
         }
         "ports" => portcmd::run(
@@ -148,6 +157,7 @@ fn usage() {
            muster scan [prefix]          sweep the local network for devices\n  \
            muster scan --dhcp            and ask who hands out addresses\n  \
            muster scan --smb --nfs --ssh  and ask what each device serves\n  \
+           muster scan --snmp            and read what an SNMP agent says\n  \
            muster ports <host> [ports]   which ports are open on one host\n  \
            muster --help                 this\n\n\
          None of these needs administrator rights. With no prefix, the scan\n\
@@ -162,6 +172,13 @@ fn usage() {
          SMB client sends first, the null call NFS defines, and for SSH nothing\n\
          at all, because a server greets whoever connects. Nothing is opened,\n\
          listed or authenticated.\n\n\
+         `--snmp` asks port 161 for the three things an agent publishes about\n\
+         itself: its description, its name and its object identifier, which\n\
+         names the organisation the identifier is registered to. It carries\n\
+         public, the community the standard names as the default, sent once\n\
+         and never followed by a second one. Nothing is walked and nothing is\n\
+         written. It is what reaches a switch, an access point or a printer\n\
+         that answers none of the questions above.\n\n\
          Devices are identified by hardware vendor, and by name where they\n\
          answer reverse DNS, mDNS or NetBIOS. The port scan uses connect(),\n\
          which is slower than the SYN scan it will use once raw packet access\n\
@@ -182,7 +199,12 @@ const LISTEN_WINDOW: Duration = Duration::from_secs(15);
 /// range somebody typed. A prefix given on the command line is the deliberate
 /// act, and it is checked against the local networks so that reaching beyond
 /// the link is something the user is told they are doing.
-fn scan(target: Option<&str>, dhcp: bool, serves: muster_net::service::Options) {
+fn scan(
+    target: Option<&str>,
+    dhcp: bool,
+    serves: muster_net::service::Options,
+    agents: muster_net::snmp::Options,
+) {
     let survey = muster_net::survey();
 
     let prefixes: Vec<Prefix> = match target {
@@ -467,6 +489,33 @@ fn scan(target: Option<&str>, dhcp: bool, serves: muster_net::service::Options) 
             }
         }
 
+        // And what their SNMP agents say. Same placement and same reasoning as
+        // the block above: after identification, only for what answered, and
+        // skipped entirely unless the flag asked for it.
+        if agents.any() {
+            let heard = muster_net::snmp::many(
+                &addresses,
+                &muster_net::platform::udp::Udp,
+                &rate,
+                agents,
+                &cancel,
+                &|done, total| {
+                    if live {
+                        eprint!("\r  asking {done} of {total} over SNMP   ");
+                        let _ = std::io::stderr().flush();
+                    }
+                },
+            );
+            if live {
+                eprint!("\r{:<48}\r", "");
+            }
+            for (identity, agent) in names.iter_mut().zip(heard) {
+                if identity.snmp.is_none() {
+                    identity.snmp = agent;
+                }
+            }
+        }
+
         let offers = offers.and_then(|handle| handle.join().ok());
         if let Some(probe) = &offers {
             for server in probe.servers() {
@@ -627,6 +676,16 @@ fn device_row(
     }
     if named.is_some_and(|i| i.llmnr) {
         why.push("answered LLMNR".into());
+    }
+    // What an SNMP agent said, which on a switch or an access point is the only
+    // thing in this column. The description is the device's own product string;
+    // the enterprise is who the identifier is registered to, which is worded as
+    // a registration rather than as a maker. See `muster_net::snmp`.
+    if let Some(agent) = named.and_then(|i| i.snmp.as_ref()) {
+        why.push(agent.summary());
+        if let Some(registered) = agent.registered_to() {
+            why.push(format!("OID registered to {registered}"));
+        }
     }
     // What it serves the network. The window draws these as badges; here they
     // are words, in the same order, out of the same function.

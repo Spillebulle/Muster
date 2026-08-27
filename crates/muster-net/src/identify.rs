@@ -239,6 +239,13 @@ pub struct Identity {
     /// for the same reason [`Self::dhcp`] is: those questions are asked over
     /// TCP and this phase is a UDP phase. See [`Self::serves`].
     pub serves: crate::service::Serves,
+    /// What an SNMP agent said about itself, where one answered.
+    ///
+    /// Filled in by the caller from [`crate::snmp`] rather than by [`one`],
+    /// for the same reason [`Self::serves`] is: it is a phase of its own,
+    /// switched on deliberately, and a scan that did not ask must not be
+    /// indistinguishable from one that asked and heard nothing.
+    pub snmp: Option<crate::snmp::Agent>,
 }
 
 impl Identity {
@@ -254,6 +261,7 @@ impl Identity {
             && !self.dhcp
             && !self.llmnr
             && self.serves.is_empty()
+            && self.snmp.is_none()
     }
 
     /// The name to show. The highest-priority source wins; ties keep the first.
@@ -385,6 +393,9 @@ impl Identity {
         }
         self.dhcp |= other.dhcp;
         self.llmnr |= other.llmnr;
+        if self.snmp.is_none() {
+            self.snmp.clone_from(&other.snmp);
+        }
         self.serves(&other.serves);
     }
 

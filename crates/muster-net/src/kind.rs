@@ -932,10 +932,24 @@ pub fn identify(found: &Found, identity: &Identity, vantage: Vantage) -> Option<
     // SSDP `SERVER` header and an mDNS model string are searched against one
     // table, so a device that names itself in either place is read the same
     // way; the table is the outer loop for the same reason it is below.
+    // SNMP's `sysDescr` joins the other two here rather than above them, and
+    // that is the honest place for it. It is the fullest product string a
+    // switch or a printer will ever volunteer, and it is still free text the
+    // device wrote about itself with nothing checking it — the same class of
+    // evidence as an SSDP `SERVER` header, so the same clue. What is *not*
+    // read for a kind is the enterprise number beside it: that names whoever
+    // registered the OID, which is an OEM or an acquired company as often as
+    // it is the maker of the box. See [`crate::snmp::Agent::registrant`].
     let named: Vec<String> = identity
         .product
         .iter()
         .chain(identity.model.iter())
+        .chain(
+            identity
+                .snmp
+                .iter()
+                .filter_map(|agent| agent.description.as_ref()),
+        )
         .map(|product| product.to_ascii_lowercase())
         .collect();
     for (mode, needle, kind) in PRODUCTS {
