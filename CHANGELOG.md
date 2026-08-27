@@ -3,6 +3,22 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.15
+
+Changed
+
+- **Nothing you can see, and that is the whole of it.** 0.0.14 fixed the mark on
+  the About page and the path reader behind it. This release adds the test that
+  would have caught the need for that fix, and nothing else: every binary here
+  behaves exactly as 0.0.14's did.
+- **The icon reader now has to prove it can read a number.** A number it scans
+  past the end of parses as nothing and becomes a zero, and a zero is a legal
+  coordinate in a legal box — so an icon drawn from it comes out quietly
+  deformed and every check the icons had still passed. Every number in every
+  icon is now required to parse before anything is drawn from it. The rule went
+  into the house style guide as well, so the next application to copy this
+  reader copies the guard with it.
+
 ## 0.0.14
 
 Fixed
