@@ -494,6 +494,9 @@ fn scan(target: Option<&str>, dhcp: bool, serves: muster_net::service::Options) 
                         .map(|r| format!(", gateway {r}"))
                         .unwrap_or_default()
                 );
+                if let Some(portal) = offer.captive_portal() {
+                    println!("  {:<W_ADDRESS$}  captive portal at {portal}", "");
+                }
             }
         }
     }

@@ -4030,6 +4030,13 @@ fn dhcp_check(ui: &mut egui::Ui, p: Palette, app: &mut App) {
             detail.push_str(&format!(", {} h lease", lease.as_secs() / 3600));
         }
         card_note(ui, p, &offer.server.to_string(), &detail);
+        // RFC 8910's option 114, and it gets a line of its own rather than a
+        // clause on the end of the one above: it is a statement about the
+        // network rather than about the address being offered, and a URL is
+        // long enough to push the lease off the end of a card.
+        if let Some(portal) = offer.captive_portal() {
+            card_note(ui, p, "Captive portal", portal);
+        }
     }
 }
 
