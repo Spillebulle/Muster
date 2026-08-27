@@ -30,13 +30,36 @@
 //!
 //! The reply is a SOAP envelope, and this parses it with a tag scanner rather
 //! than an XML parser. That is a deliberate limit, not a shortcut: what is
-//! wanted is three fields — the device's types, its transport addresses and its
-//! identifier — each of which is a text node inside a uniquely named element,
+//! wanted is four fields — the device's types, its scopes, its transport
+//! addresses and its identifier — each of which is a text node inside a
+//! uniquely named element,
 //! and no responder has ever put one of them in an attribute. A real parser
 //! would be a dependency and a much larger surface for a hostile responder to
 //! aim at. The scanner ignores namespace prefixes, because every implementation
 //! chooses its own: `wsd:Types`, `d:Types` and `Types` are all the same element
 //! and all three have been seen.
+//!
+//! ## The scopes were already in hand and were thrown away
+//!
+//! `Scopes` is a whitespace-separated list of URIs a device publishes about
+//! itself, and on the two kinds of device that answer this protocol most it is
+//! the only place the hardware is named. ONVIF Core §7.3.2 gives cameras five
+//! scope categories under `onvif://www.onvif.org/`, of which `hardware` is the
+//! model number stamped at the factory; Microsoft's WSD-Print device identifier
+//! writes the same thing as `MFG:` and `MDL:` fields. Both arrived in every
+//! `ProbeMatch` this has ever read, and both were parsed straight past.
+//!
+//! **The `name` scope is read and deliberately not used as a model.** It is the
+//! device's *friendly name*, which is to say the thing whoever installed the
+//! camera typed into a web form, and `CLAUDE.md` has already settled what this
+//! project does with evidence of that class: a name is evidence about a person,
+//! not about the hardware. On a factory-fresh Hikvision it is
+//! `HIKVISION DS-2CD2042WD-I` and looks like the best answer on the network; on
+//! the one beside it that somebody labelled, it is `Front door`, and a
+//! "Model: Front door" row is exactly the confident nonsense the hostname rule
+//! exists to refuse. So [`Match::model`] reads `hardware` and `MDL`, which no
+//! installer can change, and leaves `name` to [`Match::scope`] for anything
+//! that wants it for something other than an inference.
 //!
 //! As everywhere else in this crate, nothing here opens a socket.
 
@@ -138,13 +161,123 @@ pub struct Match {
     /// device: `urn:uuid:...`. The same device answering twice gives the same
     /// one, which is how two replies are known to be one device.
     pub endpoint: Option<String>,
+    /// `Scopes`: the URIs the device publishes about itself, as it wrote them.
+    ///
+    /// Kept verbatim rather than decoded into fields, because the vocabulary is
+    /// open: ONVIF defines five categories, Microsoft's print stack writes
+    /// `MFG:`/`MDL:` pairs, and a vendor is free to publish an `ldap:///` path
+    /// or anything else it likes. What is understood is read by
+    /// [`Match::scope`] and [`Match::model`]; the rest is still evidence that
+    /// something answered, and is not dropped to make a struct tidier.
+    pub scopes: Vec<String>,
 }
 
 impl Match {
     /// Nothing was in it worth keeping.
     pub fn is_empty(&self) -> bool {
-        self.types.is_empty() && self.addresses.is_empty() && self.endpoint.is_none()
+        self.types.is_empty()
+            && self.addresses.is_empty()
+            && self.endpoint.is_none()
+            && self.scopes.is_empty()
     }
+
+    /// The value of one ONVIF scope category, percent-decoded.
+    ///
+    /// ONVIF Core §7.3.2 writes a scope as
+    /// `onvif://www.onvif.org/<category>/<value>` and defines `name`,
+    /// `location`, `hardware`, `Profile` and `type`. The category is compared
+    /// without regard to case, because the specification capitalises `Profile`
+    /// and nothing else, and implementations are not consistent about it.
+    ///
+    /// The value is percent-decoded, because a space in a model or a location
+    /// arrives as `%20` and `HIKVISION%20DS-2CD2042WD-I` is not a string to put
+    /// in front of somebody.
+    pub fn scope(&self, category: &str) -> Option<String> {
+        let prefix = format!("{ONVIF}{}/", category.to_ascii_lowercase());
+        self.scopes.iter().find_map(|scope| {
+            let head = scope.get(..prefix.len())?;
+            (head.to_ascii_lowercase() == prefix)
+                .then(|| unescape(scope[prefix.len()..].trim_end_matches('/')))
+                .filter(|value| !value.is_empty())
+        })
+    }
+
+    /// The model the device named for itself in its scopes, where it named one.
+    ///
+    /// Two vocabularies, in the order of how hard each is to falsify:
+    ///
+    /// * **`MFG:` and `MDL:`**, the fields of Microsoft's WSD-Print device
+    ///   identifier, which a print device publishes and which name the maker
+    ///   and the model outright. The two are joined, unless the model already
+    ///   begins with the maker's name, which is how most printers write it.
+    /// * **The ONVIF `hardware` scope**, which is the model number in the
+    ///   camera's own firmware.
+    ///
+    /// **`name` is not among them**, and the module note says why: it is a
+    /// friendly name somebody typed, and this project does not infer hardware
+    /// from what a person wrote down.
+    pub fn model(&self) -> Option<String> {
+        let (mut maker, mut model) = (None, None);
+        for field in self.scopes.iter().flat_map(|scope| scope.split(';')) {
+            let Some((key, value)) = field.split_once(':') else {
+                continue;
+            };
+            let value = unescape(value.trim());
+            if value.is_empty() {
+                continue;
+            }
+            match key.trim().to_ascii_uppercase().as_str() {
+                "MFG" => maker = Some(value),
+                "MDL" => model = Some(value),
+                _ => {}
+            }
+        }
+        match (maker, model) {
+            (Some(maker), Some(model)) => {
+                let same = model
+                    .to_ascii_lowercase()
+                    .starts_with(&maker.to_ascii_lowercase());
+                Some(if same {
+                    model
+                } else {
+                    format!("{maker} {model}")
+                })
+            }
+            (None, Some(model)) => Some(model),
+            // A maker with no model names nobody's hardware, so it is not a
+            // model and is not offered as one.
+            _ => self.scope("hardware"),
+        }
+    }
+}
+
+/// The stem every ONVIF scope is written under. ONVIF Core §7.3.2.
+const ONVIF: &str = "onvif://www.onvif.org/";
+
+/// Percent-decoding, and nothing else.
+///
+/// A scope is a URI, so a space in a model name arrives as `%20`. This is not a
+/// general URI decoder and does not want to be: `+` is left alone, because a
+/// scope is a path rather than a query string and a `+` in a model number is a
+/// `+`. A malformed escape is kept as it was written rather than dropped, on
+/// the same principle as everything else here that reads a stranger's bytes.
+fn unescape(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%'
+            && let Some(pair) = text.get(at + 1..at + 3)
+            && let Ok(byte) = u8::from_str_radix(pair, 16)
+        {
+            out.push(byte);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Reads one WS-Discovery datagram.
@@ -177,6 +310,7 @@ pub fn parse(buf: &[u8]) -> Option<Match> {
 
     let mut found = Match {
         types: Vec::new(),
+        scopes: split(element(&text, "Scopes").as_deref()),
         addresses: split(element(&text, "XAddrs").as_deref()),
         // The endpoint is inside `EndpointReference`, and the element that
         // holds it is `Address` — a name common enough that scanning for it
@@ -296,6 +430,12 @@ mod tests {
 
     /// An ONVIF camera, which answers the same probe in the same namespace and
     /// names itself a video transmitter.
+    ///
+    /// The `Scopes` line is the one a Hikvision DS-2CD2042WD-I publishes, which
+    /// is the shape ONVIF Core §7.3.2 mandates and the one reported from these
+    /// cameras in the field: a type, a hardware model and a friendly name that
+    /// happens, on a camera nobody has renamed, to be the maker and the model
+    /// again.
     const CAMERA: &str = r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
  xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"
@@ -307,6 +447,7 @@ mod tests {
  <s:Body><d:ProbeMatches><d:ProbeMatch>
   <a:EndpointReference><a:Address>urn:uuid:11112222-3333-4444-5555-666677778888</a:Address></a:EndpointReference>
   <d:Types>dn:NetworkVideoTransmitter</d:Types>
+  <d:Scopes>onvif://www.onvif.org/type/video_encoder onvif://www.onvif.org/Profile/Streaming onvif://www.onvif.org/hardware/DS-2CD2042WD-I onvif://www.onvif.org/name/HIKVISION%20DS-2CD2042WD-I</d:Scopes>
   <d:XAddrs>http://192.168.1.90/onvif/device_service</d:XAddrs>
  </d:ProbeMatch></d:ProbeMatches></s:Body>
 </s:Envelope>"#;
@@ -352,6 +493,89 @@ mod tests {
             m.addresses,
             vec!["http://192.168.1.90/onvif/device_service"]
         );
+    }
+
+    /// The scopes were in every reply all along, and the model is in them.
+    #[test]
+    fn a_cameras_scopes_name_its_hardware() {
+        let m = parse(CAMERA.as_bytes()).expect("a probe match");
+        assert_eq!(m.scope("hardware").as_deref(), Some("DS-2CD2042WD-I"));
+        assert_eq!(m.model().as_deref(), Some("DS-2CD2042WD-I"));
+        // The category is matched without regard to case, which is what the
+        // capitalised `Profile` in the specification requires of a reader.
+        assert_eq!(m.scope("profile").as_deref(), Some("Streaming"));
+        // And the escape is undone, or the model arrives with a `%20` in it.
+        assert_eq!(
+            m.scope("name").as_deref(),
+            Some("HIKVISION DS-2CD2042WD-I"),
+            "the friendly name is read"
+        );
+    }
+
+    /// **The rule this file's note argues for.** The friendly name on a
+    /// factory-fresh camera is the maker and the model; on the camera next to
+    /// it, it is whatever the installer typed, and a "Model: Front door" row
+    /// is what `CLAUDE.md` refuses. So the model comes from `hardware`, which
+    /// nobody can edit, and the renamed camera reports the same model as the
+    /// one that was left alone.
+    #[test]
+    fn a_camera_somebody_renamed_still_reports_its_own_model() {
+        let renamed = CAMERA.replace("HIKVISION%20DS-2CD2042WD-I", "Front%20door");
+        let m = parse(renamed.as_bytes()).expect("a probe match");
+        assert_eq!(m.scope("name").as_deref(), Some("Front door"));
+        assert_eq!(
+            m.model().as_deref(),
+            Some("DS-2CD2042WD-I"),
+            "the model is the hardware and never the label"
+        );
+    }
+
+    /// A WSD print device writes its maker and model as the fields of a device
+    /// identifier rather than as ONVIF scopes.
+    ///
+    /// **Constructed from Microsoft's WS-Print documentation rather than
+    /// captured**: no printer on the network this was written against speaks
+    /// WSD. The field spelling is the one that documentation gives, and it is
+    /// the same one a Dell 2330dn publishes.
+    #[test]
+    fn a_printers_scopes_name_its_maker_and_its_model() {
+        let printer = CAMERA
+            .replace("dn:NetworkVideoTransmitter", "wsdp:Device wprt:PrintDeviceType")
+            .replace(
+                "onvif://www.onvif.org/type/video_encoder onvif://www.onvif.org/Profile/Streaming onvif://www.onvif.org/hardware/DS-2CD2042WD-I onvif://www.onvif.org/name/HIKVISION%20DS-2CD2042WD-I",
+                "ldap:///ou=floor2,o=example MFG:Brother;MDL:HL-L2350DW;CLS:Printer",
+            );
+        let m = parse(printer.as_bytes()).expect("a probe match");
+        assert_eq!(m.model().as_deref(), Some("Brother HL-L2350DW"));
+    }
+
+    /// Most printers write the maker into the model as well, and a row reading
+    /// "Brother Brother HL-L2350DW" is the sort of thing nobody notices until
+    /// it is on a screen.
+    #[test]
+    fn a_maker_is_not_said_twice() {
+        let m = Match {
+            scopes: vec!["MFG:Brother;MDL:Brother HL-L2350DW".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(m.model().as_deref(), Some("Brother HL-L2350DW"));
+
+        // A maker with no model names nobody's hardware.
+        let m = Match {
+            scopes: vec!["MFG:Brother".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(m.model(), None);
+    }
+
+    /// A device with no scopes at all is the ordinary case, and it has to come
+    /// out as "nothing" rather than as an empty string in a Model row.
+    #[test]
+    fn a_reply_with_no_scopes_names_nothing() {
+        let m = parse(WINDOWS.as_bytes()).expect("a probe match");
+        assert!(m.scopes.is_empty());
+        assert_eq!(m.model(), None);
+        assert_eq!(m.scope("hardware"), None);
     }
 
     /// The prefix a responder chooses is its own business, and three different

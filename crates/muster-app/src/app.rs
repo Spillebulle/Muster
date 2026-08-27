@@ -3442,12 +3442,22 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
                         };
                         fact_row(ui, p, "Name server", &what);
                     }
+                    // What the file server said about itself while it was answering.
+                    // This row used to say that SMB volunteered nothing worth printing,
+                    // which was true of the `bool` the answer was being reduced to and
+                    // never of the answer: a `NEGOTIATE` response carries the dialect,
+                    // the server's own clock and whether it keeps a start time at all.
+                    // NFS still gets no row, because an RPC `NULL` reply genuinely
+                    // carries nothing.
+                    if let Some(smb) = &named.serves.smb {
+                        let said = smb.stated(std::time::SystemTime::now());
+                        if !said.is_empty() {
+                            fact_row(ui, p, "SMB", &said);
+                        }
+                    }
                     // The greeting, which is the software in the device's own words and
                     // is worth a row of its own for the same reason the resolver's
-                    // version is. SMB and NFS get no row here: both answered a question
-                    // and neither volunteered anything to print, so the badge and its
-                    // reason are the whole of what is known, and inventing a line for
-                    // them would be padding a panel with what a badge already said.
+                    // version is.
                     if let Some(greeting) = &named.serves.ssh {
                         fact_row(ui, p, "SSH", greeting);
                     }
@@ -4030,6 +4040,13 @@ fn dhcp_check(ui: &mut egui::Ui, p: Palette, app: &mut App) {
             detail.push_str(&format!(", {} h lease", lease.as_secs() / 3600));
         }
         card_note(ui, p, &offer.server.to_string(), &detail);
+        // RFC 8910's option 114, and it gets a line of its own rather than a
+        // clause on the end of the one above: it is a statement about the
+        // network rather than about the address being offered, and a URL is
+        // long enough to push the lease off the end of a card.
+        if let Some(portal) = offer.captive_portal() {
+            card_note(ui, p, "Captive portal", portal);
+        }
     }
 }
 

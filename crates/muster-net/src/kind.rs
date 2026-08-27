@@ -801,6 +801,72 @@ const WSD: &[(&str, Kind)] = &[
     ("networkvideoanalytics", Kind::Camera),
 ];
 
+/// HomeKit accessory categories, by the number an accessory publishes.
+///
+/// HAP §6.4 has an accessory state its category in the `ci` key of its `_hap`
+/// `TXT` record, out of a fixed list Apple defines. It is the same class of
+/// claim as a service type - a number inside a protocol the device had to
+/// implement to answer at all, not free text - so it produces
+/// [`Clue::Service`], and [`identify`] consults it **before** the service table
+/// so that it beats the `_hap.` row there when both fire. That row can only
+/// ever say `SmartHome`, which for a doorbell camera or a television is the
+/// wrong half of the answer.
+///
+/// The numbers are Apple's, checked against the published list rather than
+/// guessed at, and the gaps in this table are the point:
+///
+/// * **1 (Other) and 2 (Bridge) are absent.** `Other` is the category an
+///   accessory picks when none of the rest fit, and a bridge is a thing that
+///   speaks for other things - a Hue hub is one and so is a Raspberry Pi
+///   running Homebridge, which is a computer. Neither names a kind.
+/// * **32 (Target controller) is absent** for the same reason: it is a remote
+///   control, and [`Kind`] has nothing it belongs to.
+/// * The rest of the smart-home rows collapse a dozen categories into one
+///   kind, which is what [`Kind::SmartHome`] is for. A `Kind` per HomeKit
+///   category would be a longer list of things to be wrong about, and the
+///   exact category is still on the row as a fact.
+const HAP_CATEGORIES: &[(u16, Kind)] = &[
+    (3, Kind::SmartHome),  // Fan
+    (4, Kind::SmartHome),  // Garage door opener
+    (5, Kind::SmartHome),  // Lightbulb
+    (6, Kind::SmartHome),  // Door lock
+    (7, Kind::SmartHome),  // Outlet
+    (8, Kind::SmartHome),  // Switch
+    (9, Kind::SmartHome),  // Thermostat
+    (10, Kind::SmartHome), // Sensor
+    (11, Kind::SmartHome), // Security system
+    (12, Kind::SmartHome), // Door
+    (13, Kind::SmartHome), // Window
+    (14, Kind::SmartHome), // Window covering
+    (15, Kind::SmartHome), // Programmable switch
+    // A range extender, an AirPort and a router are all somebody's networking
+    // equipment. Where one of them is also the way off the network,
+    // [`Clue::Gateway`] has already answered.
+    (16, Kind::NetworkGear), // Range extender
+    // The two this table was worth writing for. A HomeKit camera and a video
+    // doorbell both advertise `_hap._tcp` and nothing else that names them, so
+    // both were smart-home icons in a column of smart-home icons.
+    (17, Kind::Camera),      // IP camera
+    (18, Kind::Camera),      // Video doorbell
+    (19, Kind::SmartHome),   // Air purifier
+    (20, Kind::SmartHome),   // Heater
+    (21, Kind::SmartHome),   // Air conditioner
+    (22, Kind::SmartHome),   // Humidifier
+    (23, Kind::SmartHome),   // Dehumidifier
+    (24, Kind::Television),  // Apple TV
+    (25, Kind::Speaker),     // HomePod
+    (26, Kind::Speaker),     // Speaker
+    (27, Kind::NetworkGear), // AirPort
+    (28, Kind::SmartHome),   // Sprinkler
+    (29, Kind::SmartHome),   // Faucet
+    (30, Kind::SmartHome),   // Shower head
+    (31, Kind::Television),  // Television
+    (33, Kind::NetworkGear), // Router
+    (34, Kind::Speaker),     // Audio receiver
+    (35, Kind::Television),  // Television set-top box
+    (36, Kind::Television),  // Television streaming stick
+];
+
 /// Product names, as a device writes them about itself.
 ///
 /// Two sources, one table, because they are the same kind of statement: the
@@ -981,6 +1047,18 @@ pub fn identify(found: &Found, identity: &Identity, vantage: Vantage) -> Option<
         }
     }
 
+    // **Before the service table, and that is the whole of what this clue
+    // buys.** Both produce `Clue::Service` and `consider` keeps the first of an
+    // equal pair, so the order here is the tie-break: `SERVICES` can only say
+    // that `_hap._tcp` is something in a house, and the category says which
+    // thing. Asked in the other order, every HomeKit camera and doorbell on the
+    // network would stay a smart-home icon.
+    if let Some(category) = identity.hap
+        && let Some((_, kind)) = HAP_CATEGORIES.iter().find(|(id, _)| *id == category)
+    {
+        consider(*kind, Clue::Service);
+    }
+
     // The table is the outer loop and the device's own list is the inner one,
     // so that two services of equal rank are settled by `SERVICES`'s order
     // rather than by the order the records were laid out in one packet.
@@ -1110,6 +1188,98 @@ mod tests {
         identity.workgroup = Some("WORKGROUP".into());
         let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
         assert_eq!(guess.kind, Kind::Television);
+        assert_eq!(guess.clue, Clue::Service);
+    }
+
+    /// The whole of what the HomeKit category buys: `_hap._tcp` says "something
+    /// in a house" and the category says which thing.
+    #[test]
+    fn a_homekit_doorbell_is_a_camera_and_not_a_smart_plug() {
+        let mut identity = advertising(&["_hap._tcp"]);
+        // Without the category, the service table can only say `SmartHome`,
+        // which is the answer every HomeKit accessory used to get.
+        let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
+        assert_eq!(guess.kind, Kind::SmartHome);
+
+        identity.hap = Some(18);
+        let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
+        assert_eq!(guess.kind, Kind::Camera, "18 is a video doorbell");
+        assert_eq!(
+            guess.clue,
+            Clue::Service,
+            "a number in a protocol, not free text"
+        );
+    }
+
+    /// A category nobody has heard of is not a kind. HomeKit's list grows, and
+    /// an accessory in a category added after this table was written must come
+    /// out as whatever the rest of the evidence says rather than as a guess.
+    #[test]
+    fn a_category_this_table_does_not_know_names_nothing() {
+        let mut identity = advertising(&["_hap._tcp"]);
+        identity.hap = Some(99);
+        let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
+        assert_eq!(
+            guess.kind,
+            Kind::SmartHome,
+            "the service is still a service"
+        );
+    }
+
+    /// The table is Apple's list, and the rows that are missing from it are as
+    /// deliberate as the ones in it.
+    #[test]
+    fn the_homekit_table_is_apples_list_and_says_nothing_it_should_not() {
+        let mut seen: Vec<u16> = HAP_CATEGORIES.iter().map(|(id, _)| *id).collect();
+        let count = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), count, "a category cannot name two kinds");
+        for (id, kind) in HAP_CATEGORIES {
+            assert!(
+                (3..=36).contains(id),
+                "{id} is not a category Apple defines"
+            );
+            assert_ne!(
+                *kind,
+                Kind::Unknown,
+                "a row that names nothing is not a row"
+            );
+        }
+        // `Other`, `Bridge` and `Target controller` name no kind, and a bridge
+        // is a Hue hub as readily as it is a computer running Homebridge.
+        for absent in [1u16, 2, 32] {
+            assert!(
+                !seen.contains(&absent),
+                "{absent} names no kind and must not be in the table"
+            );
+        }
+    }
+
+    /// The `Scopes` of a WS-Discovery reply name the hardware, and they were
+    /// parsed and dropped. A model ranks below a service, which is the second
+    /// half of this test.
+    ///
+    /// The device identifier is **constructed from Microsoft's WS-Print
+    /// documentation rather than captured**; the spelling is the one that
+    /// documentation gives.
+    #[test]
+    fn a_printer_named_only_by_its_scopes_is_still_a_printer() {
+        let mut identity = Identity::default();
+        identity.probed(&crate::wsd::Match {
+            scopes: vec!["MFG:HP;MDL:HP LaserJet MFP M428fdw".into()],
+            ..Default::default()
+        });
+        let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
+        assert_eq!(guess.kind, Kind::Printer);
+        assert_eq!(guess.clue, Clue::Product, "a model is what a scope carries");
+
+        // And where the same reply also claims a type, the type wins: a model
+        // is free text and a `Types` value is a protocol the device has to
+        // implement. `CLAUDE.md`, and the reason `Clue::Product` sits below
+        // `Clue::Service`.
+        identity.wsd.push("wprt:printdevicetype".into());
+        let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
         assert_eq!(guess.clue, Clue::Service);
     }
 

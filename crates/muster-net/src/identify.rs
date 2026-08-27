@@ -217,6 +217,20 @@ pub struct Identity {
     /// its own rather than a line in [`Self::services`]: a service type says
     /// what a device does and this says what it is.
     pub model: Option<String>,
+    /// The HomeKit accessory category the device published in its `_hap`
+    /// `TXT` record: the `ci` key, HAP §6.4.
+    ///
+    /// **A number, kept as a number**, because it is one: HAP defines a fixed
+    /// list of categories and an accessory states which of them it is. That is
+    /// the same class of statement as a service type - a self-report inside a
+    /// protocol the device had to implement to say it at all - and
+    /// [`crate::kind`] reads it as one.
+    ///
+    /// It is worth having because `_hap._tcp` on its own says only "a HomeKit
+    /// accessory", which covers a light bulb, a doorbell camera, a thermostat
+    /// and a television. The category is the difference between a column of
+    /// identical smart-home icons and a network somebody can read.
+    pub hap: Option<u16>,
     /// It answered on port 53, and what it said.
     pub resolver: Option<Resolver>,
     /// It answered a DHCP DISCOVER with an offer.
@@ -250,6 +264,7 @@ impl Identity {
             && self.wsd.is_empty()
             && self.product.is_none()
             && self.model.is_none()
+            && self.hap.is_none()
             && self.resolver.is_none()
             && !self.dhcp
             && !self.llmnr
@@ -302,7 +317,7 @@ impl Identity {
         if self.resolver.is_some() {
             out.push(Role::Dns);
         }
-        if self.serves.smb {
+        if self.serves.smb.is_some() {
             out.push(Role::Smb);
         }
         if self.serves.nfs {
@@ -324,7 +339,13 @@ impl Identity {
     /// A merge rather than an assignment: a scan that asked only about SMB must
     /// not wipe what an earlier answer said about the rest.
     pub fn serves(&mut self, serves: &crate::service::Serves) {
-        self.serves.smb |= serves.smb;
+        // What one answer said is kept whole rather than folded into what
+        // another said: the fields of an SMB negotiate describe one exchange
+        // with one server, and a dialect from one reply beside a clock from
+        // another would be a machine that never existed.
+        if self.serves.smb.is_none() {
+            self.serves.smb.clone_from(&serves.smb);
+        }
         self.serves.nfs |= serves.nfs;
         if self.serves.ssh.is_none() {
             self.serves.ssh.clone_from(&serves.ssh);
@@ -380,6 +401,9 @@ impl Identity {
         if self.model.is_none() {
             self.model.clone_from(&other.model);
         }
+        if self.hap.is_none() {
+            self.hap = other.hap;
+        }
         if self.resolver.is_none() {
             self.resolver.clone_from(&other.resolver);
         }
@@ -401,6 +425,28 @@ impl Identity {
         }
         if self.product.is_none() {
             self.product.clone_from(&announcement.server);
+        }
+    }
+
+    /// Folds one WS-Discovery `ProbeMatch` in.
+    ///
+    /// The counterpart of [`Self::announced`], and it exists for the same
+    /// reason: the two callers that read this protocol - the link phase and the
+    /// listen - were each unrolling the same loop over `Types`, so the day the
+    /// reply started carrying something else worth having there were two places
+    /// to remember, and one of them would have been forgotten.
+    ///
+    /// **The scopes are where the hardware is named**, and they were being
+    /// parsed and dropped. See [`crate::wsd::Match::model`] for which of them
+    /// is read and, more to the point, which is not.
+    pub fn probed(&mut self, matched: &crate::wsd::Match) {
+        for kind in &matched.types {
+            if !self.wsd.contains(kind) {
+                self.wsd.push(kind.clone());
+            }
+        }
+        if self.model.is_none() {
+            self.model = matched.model();
         }
     }
 
@@ -856,7 +902,21 @@ pub fn harvest(msg: &dns::Message, found: &mut Identity, models: &mut Vec<(usize
             // it. `_services._dns-sd._udp.local PTR _googlecast._tcp.local`.
             dns::RData::Name(target) => offered(service_type(target), found),
             dns::RData::Txt(strings) => {
+                // The accessory category is read only out of a `_hap` record,
+                // and the record's own name is what says so. `ci` is two
+                // letters, and two letters is not a key to go looking for in
+                // every `TXT` on the network: a printer's `_ipp` record
+                // carries a dozen entries and somebody's is going to be `ci`
+                // one day meaning something else entirely.
+                let homekit =
+                    service_type(&record.name).is_some_and(|service| service.starts_with("_hap."));
                 for entry in strings {
+                    if homekit
+                        && found.hap.is_none()
+                        && let Some(category) = category_of(entry)
+                    {
+                        found.hap = Some(category);
+                    }
                     if let Some((rank, value)) = model_of(entry)
                         && !models.iter().any(|(_, seen)| seen == &value)
                     {
@@ -888,6 +948,23 @@ fn model_of(entry: &str) -> Option<(usize, String)> {
     let key = key.trim().to_ascii_lowercase();
     let rank = MODEL_KEYS.iter().position(|known| *known == key)?;
     Some((rank, value.to_string()))
+}
+
+/// The HomeKit accessory category out of one `TXT` entry.
+///
+/// HAP §6.4 names the key `ci` and defines its value as the accessory category
+/// identifier: a decimal integer from the fixed list [`crate::kind`] reads. An
+/// accessory is required to publish it, and every one that answers `_hap` does.
+///
+/// Anything that is not a plain number is not a category. A responder that
+/// writes `ci=` with nothing after it, or `ci=lightbulb`, has said nothing this
+/// can act on, and inventing a category from it would be worse than the blank
+/// row it replaces.
+fn category_of(entry: &str) -> Option<u16> {
+    let (key, value) = entry.split_once('=')?;
+    (key.trim().eq_ignore_ascii_case("ci"))
+        .then(|| value.trim().parse().ok())
+        .flatten()
 }
 
 /// The `_ipp._tcp` out of an mDNS name, where there is one.
@@ -1112,6 +1189,87 @@ mod tests {
             resolver: Some(ip(resolver)),
             ..Default::default()
         }
+    }
+
+    /// A HomeKit accessory says which kind of accessory it is, and it was
+    /// being read past.
+    ///
+    /// **Constructed from the HAP specification rather than captured.** The
+    /// keys are the ones HAP §6.4 requires of every accessory - a
+    /// configuration number, an identifier, a state flag, a model and the
+    /// category - and the values are a plausible doorbell's.
+    #[test]
+    fn a_homekit_accessory_says_which_kind_of_accessory_it_is() {
+        let reply = txt_reply(
+            "Doorbell 4C2E._hap._tcp.local",
+            &[
+                "c#=2",
+                "id=A1:B2:C3:D4:E5:F6",
+                "md=Video Doorbell",
+                "s#=1",
+                "sf=0",
+                "ci=18",
+            ],
+        );
+        let message = dns::parse(&reply).expect("a reply");
+        let mut found = Identity::default();
+        let mut models = Vec::new();
+        harvest(&message, &mut found, &mut models);
+        assert_eq!(found.hap, Some(18), "18 is a video doorbell");
+        // And the record's other keys still read the way they always did.
+        assert_eq!(
+            models.first().map(|(_, m)| m.as_str()),
+            Some("Video Doorbell")
+        );
+        assert!(found.services.iter().any(|s| s == "_hap._tcp"));
+    }
+
+    /// `ci` is two letters, and two letters is not a key to go looking for
+    /// everywhere. Only a `_hap` record is asked for a HomeKit category.
+    #[test]
+    fn a_two_letter_key_on_somebody_elses_record_is_not_a_category() {
+        let reply = txt_reply("Office._ipp._tcp.local", &["ty=HP OfficeJet 6950", "ci=17"]);
+        let message = dns::parse(&reply).expect("a reply");
+        let mut found = Identity::default();
+        harvest(&message, &mut found, &mut Vec::new());
+        assert_eq!(found.hap, None, "a printer is not a HomeKit camera");
+    }
+
+    /// Anything that is not a plain number is not a category, and inventing
+    /// one from it would be worse than the blank it replaces.
+    #[test]
+    fn a_category_that_is_not_a_number_is_not_a_category() {
+        assert_eq!(category_of("ci=17"), Some(17));
+        assert_eq!(category_of("CI=17"), Some(17));
+        assert_eq!(category_of("ci="), None);
+        assert_eq!(category_of("ci=lightbulb"), None);
+        assert_eq!(category_of("c#=2"), None);
+    }
+
+    /// The WS-Discovery scopes are folded in through one method rather than
+    /// through the same loop written out in the link phase and in the listen.
+    #[test]
+    fn a_probe_match_gives_up_its_types_and_its_model() {
+        let mut found = Identity::default();
+        found.probed(&crate::wsd::Match {
+            types: vec!["wsdp:device".into(), "wprt:printdevicetype".into()],
+            scopes: vec!["MFG:HP;MDL:HP LaserJet MFP M428fdw".into()],
+            ..Default::default()
+        });
+        assert_eq!(found.wsd, vec!["wsdp:device", "wprt:printdevicetype"]);
+        assert_eq!(found.model.as_deref(), Some("HP LaserJet MFP M428fdw"));
+
+        // A model already known is the more specific one and is kept, which is
+        // the rule every other source here follows.
+        let mut found = Identity {
+            model: Some("HP OfficeJet 6950".into()),
+            ..Default::default()
+        };
+        found.probed(&crate::wsd::Match {
+            scopes: vec!["MFG:HP;MDL:HP LaserJet MFP M428fdw".into()],
+            ..Default::default()
+        });
+        assert_eq!(found.model.as_deref(), Some("HP OfficeJet 6950"));
     }
 
     #[test]
@@ -1469,7 +1627,7 @@ mod tests {
         // A second pass that learned only about SMB adds to what is known
         // rather than replacing it.
         identity.serves(&crate::service::Serves {
-            smb: true,
+            smb: Some(crate::service::Smb::default()),
             ..Default::default()
         });
         assert_eq!(identity.roles(), vec![Role::Smb, Role::Nfs, Role::Ssh]);

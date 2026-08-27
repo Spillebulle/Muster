@@ -8,6 +8,17 @@
 //! that happened before Muster started. Only a fresh DISCOVER tells you who
 //! else was willing to answer.
 //!
+//! ## The other thing an offer already carries
+//!
+//! An offer is a description of the network, not only of the server that sent
+//! it, and one field in it is worth as much as the rogue-server check: RFC
+//! 8910's option 114, the address of a captive portal's API endpoint. Every
+//! other way of detecting a captive portal is a request made in the hope that
+//! something intercepts it, which decides the question from the *absence* of an
+//! expected answer and cannot tell a captive network from a broken one. This is
+//! the network saying so itself, in a datagram Muster was already reading and
+//! already throwing away.
+//!
 //! A second DHCP server is one of the few things on a home or office network
 //! that is nearly always a fault: a router plugged into the LAN by its WAN
 //! port, a forgotten test server, a virtual machine bridging its own. It breaks
@@ -55,6 +66,14 @@ const OPT_LEASE: u8 = 51;
 const OPT_TYPE: u8 = 53;
 const OPT_SERVER_ID: u8 = 54;
 const OPT_PARAMS: u8 = 55;
+/// RFC 8910's captive-portal option, and **the number is the whole history of
+/// it.** RFC 7710 first defined this as option 160; that code point was already
+/// in use by a Polycom provisioning option, phones were being handed a URL they
+/// tried to boot from, and RFC 8910 moved it to 114 and deprecated 160. Muster
+/// reads 114 and nothing else: a value at 160 on a real network is more likely
+/// to be the Polycom option than a portal, and guessing between them would be
+/// the kind of confident nonsense this codebase refuses.
+const OPT_CAPTIVE_PORTAL: u8 = 114;
 const OPT_END: u8 = 255;
 
 const DHCP_DISCOVER: u8 = 1;
@@ -75,7 +94,40 @@ pub struct Offer {
     pub dns: Vec<Ipv4Addr>,
     pub domain: Option<String>,
     pub lease: Option<Duration>,
+    /// RFC 8910's option 114, verbatim: the URI of a captive portal's API
+    /// endpoint.
+    ///
+    /// **This is the only honest captive-portal detection there is.** Every
+    /// other method is a request sent somewhere in the hope that something
+    /// intercepts it, which means deciding a network is captive from the
+    /// *absence* of the answer that was expected - and a network that is
+    /// merely broken looks exactly the same. Option 114 is the network saying
+    /// so itself, in the offer it was already sending.
+    ///
+    /// Kept as the server wrote it rather than parsed into a URL. See
+    /// [`Offer::captive_portal`] for the one value that has to be read rather
+    /// than shown.
+    pub portal: Option<String>,
 }
+
+impl Offer {
+    /// The captive portal this offer names, where it names one.
+    ///
+    /// **A network with no portal is entitled to say so, and RFC 8910 §2 gives
+    /// it the words**: the URN `urn:ietf:params:capport:unrestricted` means
+    /// "there is no captive portal here". Showing that to somebody as a portal
+    /// address would turn an all-clear into an alarm, so it is read and
+    /// answered with [`None`] - which is the same answer an offer that carried
+    /// no option 114 at all gets, and means the same thing.
+    pub fn captive_portal(&self) -> Option<&str> {
+        let portal = self.portal.as_deref()?.trim();
+        (!portal.is_empty() && portal != UNRESTRICTED).then_some(portal)
+    }
+}
+
+/// What a network says when it wants to state that it is *not* captive.
+/// RFC 8910 §2.
+const UNRESTRICTED: &str = "urn:ietf:params:capport:unrestricted";
 
 /// What a DISCOVER turned up.
 #[derive(Clone, Debug, Default)]
@@ -172,13 +224,19 @@ pub fn discover_message(mac: MacAddr, xid: u32) -> Vec<u8> {
     // What to send back. Asking for these is what makes an offer worth
     // comparing between servers: two servers handing out different gateways is
     // the shape the fault usually takes.
+    //
+    // Option 114 is asked for because RFC 8910 §2 says a client that wants it
+    // has to: a server sends it in reply to a request for it and to nothing
+    // else, so a scanner that did not ask would report every captive network
+    // on earth as an ordinary one.
     m.extend_from_slice(&[
         OPT_PARAMS,
-        4,
+        5,
         OPT_SUBNET_MASK,
         OPT_ROUTER,
         OPT_DNS,
         OPT_DOMAIN,
+        OPT_CAPTIVE_PORTAL,
     ]);
     m.push(OPT_END);
     m
@@ -213,6 +271,7 @@ pub fn parse_offer(bytes: &[u8], xid: u32) -> Option<Offer> {
     let mut dns = Vec::new();
     let mut domain = None;
     let mut lease = None;
+    let mut portal = None;
 
     for (code, value) in options(&bytes[HEADER + 4..]) {
         match code {
@@ -232,6 +291,15 @@ pub fn parse_offer(bytes: &[u8], xid: u32) -> Option<Offer> {
                     .collect();
             }
             OPT_DOMAIN => domain = String::from_utf8(value.to_vec()).ok(),
+            // Not NUL terminated, says RFC 8910 §2, and a server that
+            // terminates it anyway is common enough that the trailing zero is
+            // trimmed rather than shown as a stray character in a URL.
+            OPT_CAPTIVE_PORTAL => {
+                portal = String::from_utf8(value.to_vec())
+                    .ok()
+                    .map(|uri| uri.trim_end_matches(' ').to_string())
+                    .filter(|uri| !uri.is_empty());
+            }
             OPT_LEASE => {
                 lease = value
                     .try_into()
@@ -255,6 +323,7 @@ pub fn parse_offer(bytes: &[u8], xid: u32) -> Option<Offer> {
         dns,
         domain,
         lease,
+        portal,
     })
 }
 
@@ -335,6 +404,17 @@ mod tests {
 
     /// Build an OFFER the way a server would.
     fn offer_bytes(server: [u8; 4], offered: [u8; 4], xid: u32) -> Vec<u8> {
+        offer_with(server, offered, xid, None)
+    }
+
+    /// The same, with RFC 8910's option 114 on the end.
+    ///
+    /// **Constructed from the specification rather than captured.** No network
+    /// this was written against runs a captive portal, so there is no recorded
+    /// offer to take these bytes from; what is here is RFC 8910 §2's layout - a
+    /// code, a length, and the URI with no NUL after it - wrapped around the
+    /// example URI the RFC itself uses in §2.4.
+    fn offer_with(server: [u8; 4], offered: [u8; 4], xid: u32, portal: Option<&str>) -> Vec<u8> {
         let mut m = vec![0u8; HEADER];
         m[0] = OP_REPLY;
         m[1] = HTYPE_ETHERNET;
@@ -350,6 +430,10 @@ mod tests {
         m.extend_from_slice(&[OPT_ROUTER, 4]);
         m.extend_from_slice(&server);
         m.extend_from_slice(&[OPT_LEASE, 4, 0, 0, 0x0e, 0x10]); // 3600 s
+        if let Some(portal) = portal {
+            m.extend_from_slice(&[OPT_CAPTIVE_PORTAL, portal.len() as u8]);
+            m.extend_from_slice(portal.as_bytes());
+        }
         m.push(OPT_END);
         m
     }
@@ -385,6 +469,88 @@ mod tests {
             "it must say it is a DISCOVER"
         );
         assert_eq!(*m.last().expect("a message"), OPT_END);
+    }
+
+    /// A server sends option 114 to a client that asked for it and to nobody
+    /// else, so the request list is where captive-portal detection is either
+    /// possible or impossible. RFC 8910 §2.
+    #[test]
+    fn the_discover_asks_for_the_captive_portal_option() {
+        let m = discover_message(MAC, XID);
+        let at = m
+            .windows(2)
+            .position(|w| w[0] == OPT_PARAMS)
+            .expect("a parameter request list");
+        let len = m[at + 1] as usize;
+        let asked = &m[at + 2..at + 2 + len];
+        assert!(
+            asked.contains(&OPT_CAPTIVE_PORTAL),
+            "without asking, every captive network reads as an ordinary one"
+        );
+        assert!(
+            asked.contains(&OPT_ROUTER),
+            "and the rest is still asked for"
+        );
+    }
+
+    /// The whole of piece five: the network says it is captive, in the offer.
+    #[test]
+    fn a_captive_network_names_its_portal_in_the_offer() {
+        let bytes = offer_with(
+            [192, 0, 2, 1],
+            [192, 0, 2, 50],
+            XID,
+            Some("https://example.org/captive-portal/api"),
+        );
+        let offer = parse_offer(&bytes, XID).expect("an offer");
+        assert_eq!(
+            offer.captive_portal(),
+            Some("https://example.org/captive-portal/api")
+        );
+        // And the rest of the offer still reads, which is what a new option in
+        // the middle of the list is most likely to break.
+        assert_eq!(offer.lease, Some(Duration::from_secs(3600)));
+        assert_eq!(offer.server, Ipv4Addr::new(192, 0, 2, 1));
+    }
+
+    /// RFC 8910 §2 gives a network the words to say it is *not* captive, and
+    /// showing that URN as a portal address would turn an all-clear into an
+    /// alarm.
+    #[test]
+    fn a_network_saying_it_is_not_captive_is_not_captive() {
+        let bytes = offer_with([192, 0, 2, 1], [192, 0, 2, 50], XID, Some(UNRESTRICTED));
+        let offer = parse_offer(&bytes, XID).expect("an offer");
+        assert_eq!(
+            offer.portal.as_deref(),
+            Some(UNRESTRICTED),
+            "what the server said is kept"
+        );
+        assert_eq!(
+            offer.captive_portal(),
+            None,
+            "and it is read for what it means"
+        );
+
+        // An offer with no option 114 at all means the same thing and answers
+        // the same way.
+        let plain =
+            parse_offer(&offer_bytes([192, 0, 2, 1], [192, 0, 2, 50], XID), XID).expect("an offer");
+        assert_eq!(plain.captive_portal(), None);
+    }
+
+    /// Some servers terminate the URI even though RFC 8910 §2 says not to, and
+    /// a stray NUL on the end of a URL is the kind of thing that reaches the
+    /// screen.
+    #[test]
+    fn a_terminated_uri_is_still_a_uri() {
+        let bytes = offer_with(
+            [192, 0, 2, 1],
+            [192, 0, 2, 50],
+            XID,
+            Some("https://example.org/api "),
+        );
+        let offer = parse_offer(&bytes, XID).expect("an offer");
+        assert_eq!(offer.captive_portal(), Some("https://example.org/api"));
     }
 
     #[test]
@@ -526,6 +692,7 @@ mod tests {
             dns: Vec::new(),
             domain: None,
             lease: None,
+            portal: None,
         };
         let probe = Probe {
             offers: vec![offer.clone(), offer.clone()],

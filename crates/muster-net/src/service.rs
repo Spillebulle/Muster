@@ -22,6 +22,22 @@
 //!   every client sends as its first packet; anything answering with the SMB
 //!   header is a file server, including every Samba box, every NAS and every
 //!   Windows machine with sharing switched on.
+//!
+//!   **The reply is read rather than counted.** A `NEGOTIATE` response is a
+//!   server describing itself before anybody has said who they are: the
+//!   dialect it settled on, a GUID that is the same one on every address the
+//!   machine answers, what its clock says, and when it started. None of that
+//!   costs another packet - it arrived in the answer to the question that was
+//!   already being asked, and for a long time it was counted as a `bool` and
+//!   dropped. See [`Smb`].
+//!
+//! * **SMB1**, on the same port and behind the same switch, as a second
+//!   opening. A server that answers an SMB1 `NEGOTIATE` with a dialect has
+//!   proved it speaks SMB1, which is a thing an administrator would want to
+//!   know about a machine on their network and which nothing else here can
+//!   establish. It is reported as what it is, "it answered an SMB1 negotiate",
+//!   and never as a grade, a score or a warning. Muster says what answered;
+//!   what to do about it is not its opinion to have.
 //! * **NFS**, port 2049. The same question asked of the other half of the
 //!   world. The opening is an ONC RPC `NULL` call to the NFS programme, which
 //!   is the no-op the protocol defines for exactly this: it asks the server to
@@ -49,7 +65,7 @@ use crate::rate::Bucket;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Where a file server listens, and where a shell does.
 pub const SMB_PORT: u16 = 445;
@@ -88,8 +104,13 @@ pub trait Speak: Sync {
 /// caller decided, rather than being smuggled into a `bool` here.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Serves {
-    /// It answered an SMB2 `NEGOTIATE` on port 445.
-    pub smb: bool,
+    /// It answered in SMB on port 445, and what it said about itself.
+    ///
+    /// [`Some`] is "a file server answered", which is what the badge claims and
+    /// is true of a server that refused every dialect offered. What is inside
+    /// is whatever the answer carried, and an empty [`Smb`] is a legitimate
+    /// value: a refusal is an answer in the protocol and carries no fields.
+    pub smb: Option<Smb>,
     /// It answered an ONC RPC `NULL` call to the NFS programme on port 2049.
     pub nfs: bool,
     /// The identification string an SSH server volunteered, trimmed.
@@ -103,7 +124,144 @@ pub struct Serves {
 
 impl Serves {
     pub fn is_empty(&self) -> bool {
-        !self.smb && !self.nfs && self.ssh.is_none()
+        self.smb.is_none() && !self.nfs && self.ssh.is_none()
+    }
+}
+
+/// What an SMB server said about itself in its `NEGOTIATE` response.
+///
+/// **All of it arrived in the answer to a question that was already being
+/// asked**, and all of it used to be thrown away for one `bool`. MS-SMB2
+/// §2.2.4 is the layout; what is kept is the four fields that say something
+/// about the machine rather than about the connection about to be set up.
+///
+/// Every field is optional and [`None`] means the server did not say, which is
+/// a different thing from a zero and is kept as a different thing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Smb {
+    /// `DialectRevision`: the dialect the server settled on.
+    ///
+    /// **The ceiling is what was offered, not what the server can do.**
+    /// [`DIALECTS`] stops at 3.0.2 for the reason written there, so 0x0311 can
+    /// never come back from this probe and a server that answers 0x0302 may
+    /// well speak 3.1.1. What the low end says is solid and is the useful half:
+    /// 0x0202 is the dialect Vista and Server 2008 shipped with, and a box on a
+    /// modern network that will go no higher than that is a box worth looking
+    /// at.
+    ///
+    /// [`None`] where the server answered in SMB without completing a
+    /// negotiation, which a refusal is.
+    pub dialect: Option<u16>,
+    /// `ServerGuid`: the same sixteen bytes from every address one machine
+    /// answers on, and a different sixteen from every other machine.
+    ///
+    /// Worth keeping because it is the only identifier on this network that a
+    /// dual-homed server cannot wear two of: two addresses with one GUID are
+    /// one machine, whatever the rest of the scan made of them.
+    pub guid: Option<[u8; 16]>,
+    /// `SystemTime`: what the server's clock said when it answered.
+    ///
+    /// A fault worth surfacing rather than a curiosity. Kerberos refuses a
+    /// ticket over five minutes of skew, backup schedules and log timestamps
+    /// go quietly wrong long before that, and a clock that has drifted is
+    /// invisible until somebody compares two of them - which is what a scanner
+    /// is in a position to do and nothing else on the network is.
+    pub clock: Option<SystemTime>,
+    /// `ServerStartTime`: when the server started, where it says.
+    ///
+    /// **[`None`] is itself the finding.** Windows fills this in with its own
+    /// boot time and Samba sends a zero, so the absence of a start time
+    /// separates a Windows machine from the NAS beside it - and it does so on a
+    /// field neither of them chose for the purpose, which is why it is worth
+    /// more than a banner. Muster reports what the field said; it does not name
+    /// an operating system on the strength of it.
+    pub started: Option<SystemTime>,
+    /// The SMB1 dialect the server chose, where it was asked and chose one.
+    ///
+    /// One of [`SMB1_DIALECTS`], because it can only be one of the dialects
+    /// that were offered. [`None`] is "it did not answer an SMB1 negotiate, or
+    /// it answered by refusing every dialect", and a refusal here is a server
+    /// saying it does not speak SMB1 - which is the opposite claim from the one
+    /// a refusal makes in SMB2, and the reason this field is read from the
+    /// chosen dialect rather than from the reply having arrived.
+    pub smb1: Option<&'static str>,
+}
+
+impl Smb {
+    /// How the dialect number is written down, where it is one this knows.
+    pub const fn dialect_label(&self) -> Option<&'static str> {
+        match self.dialect {
+            Some(0x0202) => Some("SMB 2.0.2"),
+            Some(0x0210) => Some("SMB 2.1"),
+            Some(0x0300) => Some("SMB 3.0"),
+            Some(0x0302) => Some("SMB 3.0.2"),
+            Some(0x0311) => Some("SMB 3.1.1"),
+            _ => None,
+        }
+    }
+
+    /// How far the server's clock is from this machine's, in seconds, positive
+    /// where the server is ahead.
+    ///
+    /// **`now` is the caller's**, which is the whole reason this is not done in
+    /// the parser: a function that reads the clock cannot be tested against a
+    /// recorded reply, and `CLAUDE.md` has the rate limiter driven from a clock
+    /// the test controls for the same reason.
+    pub fn skew(&self, now: SystemTime) -> Option<i64> {
+        let clock = self.clock?;
+        Some(match clock.duration_since(now) {
+            Ok(ahead) => ahead.as_secs() as i64,
+            Err(behind) => -(behind.duration().as_secs() as i64),
+        })
+    }
+
+    /// How long the server says it has been up, where it said when it started.
+    ///
+    /// Measured against the server's own clock rather than against this
+    /// machine's, so a box whose clock is wrong still reports a sensible
+    /// uptime; a start time later than the server's own idea of now is a
+    /// nonsense and answers [`None`].
+    pub fn uptime(&self) -> Option<Duration> {
+        self.clock?.duration_since(self.started?).ok()
+    }
+
+    /// One line of what the server said, for a panel or a report.
+    ///
+    /// Facts, in the order of how much they say, and nothing that is not one:
+    /// there is no grade here and no warning. A skew under a minute is left out
+    /// because every clock on a network is a few seconds from every other and a
+    /// row that always has something in it says nothing.
+    pub fn stated(&self, now: SystemTime) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        match self.dialect_label() {
+            Some(label) => parts.push(label.to_string()),
+            // A dialect this does not know is still a number worth printing,
+            // and a refusal is worth saying out loud rather than leaving as a
+            // blank that reads as "nothing answered".
+            None => parts.push(match self.dialect {
+                Some(number) => format!("an SMB2 dialect of {number:#06x}"),
+                None => "answered without settling on a dialect".to_string(),
+            }),
+        }
+        if let Some(dialect) = self.smb1 {
+            parts.push(format!("answered an SMB1 negotiate as {dialect}"));
+        }
+        if let Some(skew) = self.skew(now)
+            && skew.abs() >= 60
+        {
+            let minutes = skew.abs() / 60;
+            let side = if skew > 0 { "ahead of" } else { "behind" };
+            parts.push(format!("its clock is {minutes} min {side} this machine"));
+        }
+        match self.uptime() {
+            Some(up) => parts.push(format!("up {} days", up.as_secs() / 86_400)),
+            // The Samba tell, said as what it is rather than as a conclusion.
+            None if self.dialect.is_some() => {
+                parts.push("it did not say when it started, as Samba does not".to_string());
+            }
+            None => {}
+        }
+        parts.join(", ")
     }
 }
 
@@ -168,8 +326,32 @@ pub fn one<S: Speak>(address: IpAddr, speak: &S, rate: &Bucket, opts: Options) -
             &smb_negotiate(),
             opts.timeout,
             MOST,
-        ) {
-            serves.smb = smb_answered(&reply);
+        ) && smb_answered(&reply)
+        {
+            serves.smb = Some(smb_details(&reply));
+        }
+
+        // The SMB1 question, on a connection of its own because a `NEGOTIATE`
+        // is a connection's first packet and there is no second one to send.
+        //
+        // **It rides on the same switch rather than getting one of its own.**
+        // The question the switch asks is "may Muster connect to this device
+        // and ask what it serves", and somebody who has answered yes has
+        // answered it for both halves of the same question about the same
+        // service on the same port. A second switch would be a second thing to
+        // find, for a second connection to a port already being connected to.
+        rate.wait();
+        if let Ok(reply) = speak.speak(
+            SocketAddr::new(address, SMB_PORT),
+            &smb1_negotiate(),
+            opts.timeout,
+            MOST,
+        ) && smb_answered(&reply)
+        {
+            // A device that answers only here is a file server too, and an old
+            // enough NAS answers nothing else.
+            let details = serves.smb.get_or_insert_with(Smb::default);
+            details.smb1 = smb1_dialect(&reply);
         }
     }
 
@@ -352,6 +534,189 @@ pub fn smb_answered(reply: &[u8]) -> bool {
     magic(0) || magic(4)
 }
 
+/// Reads what an SMB2 `NEGOTIATE` response said about the server.
+///
+/// MS-SMB2 §2.2.4. Called only for a reply [`smb_answered`] has already
+/// accepted, so this never decides whether there is a file server there; it
+/// decides only what the file server said, and every field it cannot read
+/// comes back [`None`].
+///
+/// Three things are checked before a byte is believed, and each of them is a
+/// reply this has to survive rather than a hypothetical:
+///
+/// * **The framing.** A server may or may not put the NetBIOS session header
+///   on its reply, exactly as [`smb_answered`] documents, so the header is
+///   found rather than assumed to be at four.
+/// * **The status.** A non-zero `Status` is a refusal, and a refusal carries
+///   no response body - the fields after it are whatever the server had in the
+///   buffer. It is still a file server, so this answers with an empty [`Smb`]
+///   rather than with nothing.
+/// * **The `StructureSize`.** 65, always, and it is the server's own statement
+///   that what follows is the structure this is about to read. Anything else
+///   is a different message wearing an SMB2 header.
+pub fn smb_details(reply: &[u8]) -> Smb {
+    let mut found = Smb::default();
+    let Some(header) = [0usize, 4]
+        .into_iter()
+        .find(|at| reply.get(*at..at + 4) == Some(&SMB2_MAGIC))
+    else {
+        return found;
+    };
+    let word = |at: usize| -> Option<u16> {
+        reply
+            .get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    let long = |at: usize| -> Option<u64> {
+        reply
+            .get(at..at + 8)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map(u64::from_le_bytes)
+    };
+    // `Status`, at 8 in the fixed 64-byte header.
+    if reply
+        .get(header + 8..header + 12)
+        .is_none_or(|b| b != [0, 0, 0, 0])
+    {
+        return found;
+    }
+    let body = header + 64;
+    if word(body) != Some(NEGOTIATE_RESPONSE) {
+        return found;
+    }
+    found.dialect = word(body + 4);
+    found.guid = reply
+        .get(body + 8..body + 24)
+        .and_then(|b| <[u8; 16]>::try_from(b).ok());
+    found.clock = long(body + 40).and_then(filetime);
+    found.started = long(body + 48).and_then(filetime);
+    found
+}
+
+/// The `StructureSize` an SMB2 `NEGOTIATE` response carries, which is one more
+/// than its length: MS-SMB2 counts the first byte of the variable part.
+const NEGOTIATE_RESPONSE: u16 = 65;
+
+/// A Windows `FILETIME` as an ordinary point in time.
+///
+/// Hundred-nanosecond intervals since the first of January 1601, which is a
+/// choice somebody made in the 1980s and which every SMB server on a network
+/// still writes its clock in.
+///
+/// Two values answer [`None`], and both mean "the server did not say": a zero,
+/// which is what Samba sends for a start time it does not keep, and anything
+/// before 1970, which is a clock this has no way to represent and no reason to
+/// believe.
+fn filetime(raw: u64) -> Option<SystemTime> {
+    let seconds = raw.checked_div(10_000_000)?.checked_sub(FILETIME_EPOCH)?;
+    let nanos = (raw % 10_000_000) as u32 * 100;
+    (raw != 0).then(|| std::time::UNIX_EPOCH + Duration::new(seconds, nanos))
+}
+
+/// Seconds between the `FILETIME` epoch and the Unix one.
+const FILETIME_EPOCH: u64 = 11_644_473_600;
+
+/// The SMB1 dialects offered, oldest first, which is the order the protocol
+/// requires and the order a server's `DialectIndex` counts in.
+///
+/// **Only SMB1 dialects are here, and that is the whole honesty of this
+/// probe.** A client may put `SMB 2.002` and `SMB 2.???` at the end of this
+/// list, and every modern server answers those with an SMB2 message - so a
+/// probe that offered them would be answered by a machine with SMB1 removed
+/// entirely, and reading that answer as "it speaks SMB1" would be exactly the
+/// lie this module exists to avoid. Offering nothing but SMB1 means the only
+/// thing that can choose a dialect here is a server that speaks one.
+pub const SMB1_DIALECTS: [&str; 6] = [
+    "PC NETWORK PROGRAM 1.0",
+    "LANMAN1.0",
+    "Windows for Workgroups 3.1a",
+    "LM1.2X002",
+    "LANMAN2.1",
+    "NT LM 0.12",
+];
+
+/// An SMB1 `NEGOTIATE` request: the opening move of the older protocol.
+///
+/// The same shape of question as [`smb_negotiate`] and the same conduct: a
+/// fixed 32-byte header, a word count of zero, and a list of dialect strings.
+/// No credential, no name, and nothing about this machine - the process id, the
+/// tree id and the user id are all left at zero or at the wildcard, because a
+/// probe has no session to identify.
+///
+/// `NT_STATUS` is set in the flags so that the reply reports its status as one
+/// thirty-two-bit code rather than as the DOS class-and-code pair, which is the
+/// difference between reading one field and reading two.
+pub fn smb1_negotiate() -> Vec<u8> {
+    let mut msg = Vec::with_capacity(64);
+    msg.extend_from_slice(&SMB1_MAGIC);
+    msg.push(SMB_COM_NEGOTIATE);
+    msg.extend_from_slice(&0u32.to_le_bytes()); // Status
+    msg.push(0x18); // Flags: case insensitive, canonicalised paths
+    msg.extend_from_slice(&0x4001u16.to_le_bytes()); // Flags2: long names, NT status
+    msg.extend_from_slice(&0u16.to_le_bytes()); // PIDHigh
+    msg.extend_from_slice(&[0u8; 8]); // SecurityFeatures
+    msg.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+    msg.extend_from_slice(&0xffffu16.to_le_bytes()); // TID: no tree connected
+    msg.extend_from_slice(&0u16.to_le_bytes()); // PIDLow
+    msg.extend_from_slice(&0u16.to_le_bytes()); // UID
+    msg.extend_from_slice(&0u16.to_le_bytes()); // MID
+
+    msg.push(0); // WordCount: a negotiate carries no words
+    let mut dialects = Vec::new();
+    for dialect in SMB1_DIALECTS {
+        // Each is a buffer-format byte, the name, and a terminator.
+        dialects.push(0x02);
+        dialects.extend_from_slice(dialect.as_bytes());
+        dialects.push(0);
+    }
+    msg.extend_from_slice(&(dialects.len() as u16).to_le_bytes()); // ByteCount
+    msg.extend_from_slice(&dialects);
+
+    nbss(&msg)
+}
+
+/// `SMB_COM_NEGOTIATE`, the only SMB1 command this module can build.
+const SMB_COM_NEGOTIATE: u8 = 0x72;
+/// The `DialectIndex` a server sends when it will speak none of what it was
+/// offered.
+const NO_DIALECT: u16 = 0xffff;
+
+/// Which SMB1 dialect the server chose, if it chose one.
+///
+/// **A reply is not the test here, and that is a departure worth stating.**
+/// Everywhere else in this module a reply in the protocol is the whole of the
+/// claim, because the claim is "there is a file server here" and a server that
+/// refuses a request has still proved that. The claim here is narrower - "it
+/// speaks SMB1" - and a server that answers an SMB1 negotiate with
+/// `DialectIndex` 0xFFFF has said the opposite of it: those are the words for
+/// "none of those, thank you", which is what a Samba built with SMB1 disabled
+/// answers. So the evidence is the dialect it picked, and nothing else.
+///
+/// An error status is read the same way, for the same reason.
+pub fn smb1_dialect(reply: &[u8]) -> Option<&'static str> {
+    let header = [0usize, 4]
+        .into_iter()
+        .find(|at| reply.get(*at..at + 4) == Some(&SMB1_MAGIC))?;
+    if *reply.get(header + 4)? != SMB_COM_NEGOTIATE {
+        return None;
+    }
+    if reply.get(header + 5..header + 9)? != [0, 0, 0, 0] {
+        return None;
+    }
+    // `WordCount`, then the first word, which is the chosen dialect's index
+    // into the list that was sent. A response with no words at all is a server
+    // that answered without answering.
+    if *reply.get(header + 32)? == 0 {
+        return None;
+    }
+    let index = reply
+        .get(header + 33..header + 35)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))?;
+    (index != NO_DIALECT)
+        .then(|| SMB1_DIALECTS.get(index as usize).copied())
+        .flatten()
+}
+
 /// The NFS programme number, its version, and the call's id. All three fixed by
 /// the protocol, except the last, which is fixed by us. See [`one`].
 const NFS_PROGRAM: u32 = 100_003;
@@ -463,6 +828,11 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         replies: BTreeMap<SocketAddr, Vec<u8>>,
+        /// What answers the *SMB1* opening, which goes to the same address and
+        /// the same port as the SMB2 one and is a different question. Keyed by
+        /// address alone, a fake would answer both with one datagram, which is
+        /// the one thing a recorded transport must not do.
+        smb1: BTreeMap<SocketAddr, Vec<u8>>,
         spoken: Mutex<Vec<(SocketAddr, Vec<u8>)>>,
     }
 
@@ -475,7 +845,12 @@ mod tests {
             _most: usize,
         ) -> io::Result<Vec<u8>> {
             self.spoken.lock().unwrap().push((to, opening.to_vec()));
-            match self.replies.get(&to) {
+            let table = if opening.get(4..8) == Some(&SMB1_MAGIC) {
+                &self.smb1
+            } else {
+                &self.replies
+            };
+            match table.get(&to) {
                 Some(reply) => Ok(reply.clone()),
                 None => Err(io::Error::new(io::ErrorKind::TimedOut, "nothing answered")),
             }
@@ -495,11 +870,102 @@ mod tests {
         }
     }
 
-    /// An SMB2 reply, framed the way Samba frames one.
+    /// An SMB2 reply, framed the way Samba frames one, with nothing readable
+    /// after the header.
     fn smb2_reply() -> Vec<u8> {
         let mut body = SMB2_MAGIC.to_vec();
         body.extend_from_slice(&[0u8; 60]);
         nbss(&body)
+    }
+
+    /// The `FILETIME` for noon on the first of June 2024, and for twelve days
+    /// before it. Hundred-nanosecond intervals since 1601, which is what every
+    /// SMB server on a network writes a time in.
+    const CLOCK: u64 = 133_617_168_000_000_000;
+    const STARTED: u64 = 133_606_800_000_000_000;
+    /// The same instant as [`CLOCK`], in the units the rest of the world uses.
+    const CLOCK_UNIX: u64 = 1_717_243_200;
+
+    const GUID: [u8; 16] = [
+        0x2b, 0x7a, 0x11, 0x9c, 0x5d, 0x4e, 0x40, 0x1a, 0x8f, 0x33, 0x0e, 0x91, 0xc4, 0x6d, 0x77,
+        0x02,
+    ];
+
+    /// A full SMB2 `NEGOTIATE` response.
+    ///
+    /// **Constructed from MS-SMB2 §2.2.4 rather than captured**: the network
+    /// this was written against has one file server and it was not going to
+    /// prove the Vista-era dialect or a broken clock on its own. Every offset
+    /// here is the specification's, and
+    /// `the_response_this_reads_is_the_shape_the_specification_describes`
+    /// checks the structure against it rather than against these bytes.
+    fn smb2_negotiate_response(dialect: u16, clock: u64, started: u64, status: u32) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(128);
+        msg.extend_from_slice(&SMB2_MAGIC);
+        msg.extend_from_slice(&64u16.to_le_bytes()); // StructureSize
+        msg.extend_from_slice(&0u16.to_le_bytes()); // CreditCharge
+        msg.extend_from_slice(&status.to_le_bytes());
+        msg.extend_from_slice(&0u16.to_le_bytes()); // Command: NEGOTIATE
+        msg.extend_from_slice(&1u16.to_le_bytes()); // CreditResponse
+        msg.extend_from_slice(&1u32.to_le_bytes()); // Flags: a response
+        msg.extend_from_slice(&0u32.to_le_bytes()); // NextCommand
+        msg.extend_from_slice(&0u64.to_le_bytes()); // MessageId
+        msg.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+        msg.extend_from_slice(&0u32.to_le_bytes()); // TreeId
+        msg.extend_from_slice(&0u64.to_le_bytes()); // SessionId
+        msg.extend_from_slice(&[0u8; 16]); // Signature
+
+        msg.extend_from_slice(&65u16.to_le_bytes()); // StructureSize
+        msg.extend_from_slice(&1u16.to_le_bytes()); // SecurityMode
+        msg.extend_from_slice(&dialect.to_le_bytes());
+        msg.extend_from_slice(&0u16.to_le_bytes()); // NegotiateContextCount
+        msg.extend_from_slice(&GUID);
+        msg.extend_from_slice(&0x0000_0007u32.to_le_bytes()); // Capabilities
+        msg.extend_from_slice(&0x0080_0000u32.to_le_bytes()); // MaxTransactSize
+        msg.extend_from_slice(&0x0080_0000u32.to_le_bytes()); // MaxReadSize
+        msg.extend_from_slice(&0x0080_0000u32.to_le_bytes()); // MaxWriteSize
+        msg.extend_from_slice(&clock.to_le_bytes());
+        msg.extend_from_slice(&started.to_le_bytes());
+        msg.extend_from_slice(&128u16.to_le_bytes()); // SecurityBufferOffset
+        msg.extend_from_slice(&0u16.to_le_bytes()); // SecurityBufferLength
+        msg.extend_from_slice(&0u32.to_le_bytes()); // NegotiateContextOffset
+
+        nbss(&msg)
+    }
+
+    /// An SMB1 `NEGOTIATE` response choosing the dialect at `index`, or
+    /// refusing them all with 0xFFFF.
+    ///
+    /// **Constructed from MS-CIFS §2.2.4.52.2 rather than captured.** The word
+    /// count is the seventeen a server sends when it has chosen `NT LM 0.12`;
+    /// only the first word is read here, and a refusal carries one word.
+    fn smb1_negotiate_response(index: u16) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(64);
+        msg.extend_from_slice(&SMB1_MAGIC);
+        msg.push(SMB_COM_NEGOTIATE);
+        msg.extend_from_slice(&0u32.to_le_bytes()); // Status
+        msg.push(0x98); // Flags: a reply
+        msg.extend_from_slice(&0x4001u16.to_le_bytes()); // Flags2
+        msg.extend_from_slice(&0u16.to_le_bytes()); // PIDHigh
+        msg.extend_from_slice(&[0u8; 8]); // SecurityFeatures
+        msg.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+        msg.extend_from_slice(&0xffffu16.to_le_bytes()); // TID
+        msg.extend_from_slice(&0u16.to_le_bytes()); // PIDLow
+        msg.extend_from_slice(&0u16.to_le_bytes()); // UID
+        msg.extend_from_slice(&0u16.to_le_bytes()); // MID
+
+        let words: u8 = if index == NO_DIALECT { 1 } else { 17 };
+        msg.push(words);
+        msg.extend_from_slice(&index.to_le_bytes());
+        msg.extend_from_slice(&vec![0u8; (words as usize - 1) * 2]);
+        msg.extend_from_slice(&0u16.to_le_bytes()); // ByteCount
+
+        nbss(&msg)
+    }
+
+    /// The instant [`CLOCK`] names, as this machine would hold it.
+    fn noon() -> SystemTime {
+        std::time::UNIX_EPOCH + Duration::from_secs(CLOCK_UNIX)
     }
 
     /// An accepted RPC reply with an empty `AUTH_NONE` verifier.
@@ -538,6 +1004,246 @@ mod tests {
         // A web server on the wrong port is not one.
         assert!(!smb_answered(b"HTTP/1.1 400 Bad Request\r\n"));
         assert!(!smb_answered(&[]));
+    }
+
+    /// Everything the `NEGOTIATE` response was already carrying, which used to
+    /// be counted as a `bool` and dropped.
+    #[test]
+    fn a_negotiate_response_is_read_field_by_field() {
+        let reply = smb2_negotiate_response(0x0302, CLOCK, STARTED, 0);
+        let smb = smb_details(&reply);
+        assert_eq!(smb.dialect, Some(0x0302));
+        assert_eq!(smb.dialect_label(), Some("SMB 3.0.2"));
+        assert_eq!(smb.guid, Some(GUID));
+        assert_eq!(smb.clock, Some(noon()));
+        assert_eq!(smb.uptime(), Some(Duration::from_secs(12 * 86_400)));
+        assert_eq!(smb.smb1, None, "nothing asked it about SMB1");
+    }
+
+    /// The unframed shape, which some devices answer with and which
+    /// [`smb_answered`] already had to allow for.
+    #[test]
+    fn a_reply_with_no_netbios_header_reads_the_same_way() {
+        let framed = smb2_negotiate_response(0x0210, CLOCK, STARTED, 0);
+        let bare = smb_details(&framed[4..]);
+        assert_eq!(bare.dialect, Some(0x0210));
+        assert_eq!(bare.dialect_label(), Some("SMB 2.1"));
+        assert_eq!(bare, smb_details(&framed));
+    }
+
+    /// **The rule this module is written for, applied to the new fields.** A
+    /// server that refuses the request has still proved it is a file server,
+    /// and it has said nothing else - so the refusal must not be read as a
+    /// dialect of zero and a clock at the start of 1601.
+    #[test]
+    fn a_refusal_is_a_file_server_that_said_nothing_further() {
+        // `STATUS_NOT_SUPPORTED`, which is what a server hardened to 3.1.1
+        // answers a request that did not offer it.
+        let reply = smb2_negotiate_response(0, 0, 0, 0xc000_00bb);
+        assert!(smb_answered(&reply), "it spoke SMB");
+        assert_eq!(smb_details(&reply), Smb::default(), "and said nothing else");
+
+        let mut fake = Fake::default();
+        fake.replies.insert(at("192.168.1.20", SMB_PORT), reply);
+        let serves = one(
+            "192.168.1.20".parse().unwrap(),
+            &fake,
+            &Bucket::new(1_000_000),
+            everything(),
+        );
+        assert!(
+            serves.smb.is_some(),
+            "the badge is unchanged by any of this"
+        );
+    }
+
+    /// The one field that separates a Windows machine from the NAS beside it,
+    /// and it separates them by being absent.
+    #[test]
+    fn a_server_that_keeps_no_start_time_is_reported_as_keeping_none() {
+        let samba = smb_details(&smb2_negotiate_response(0x0302, CLOCK, 0, 0));
+        assert_eq!(samba.clock, Some(noon()), "it still knows what time it is");
+        assert_eq!(samba.started, None);
+        assert_eq!(samba.uptime(), None);
+        assert!(
+            samba.stated(noon()).contains("did not say when it started"),
+            "{}",
+            samba.stated(noon())
+        );
+
+        let windows = smb_details(&smb2_negotiate_response(0x0302, CLOCK, STARTED, 0));
+        assert!(windows.started.is_some());
+        assert!(
+            !windows
+                .stated(noon())
+                .contains("did not say when it started")
+        );
+    }
+
+    /// The skew is measured against a clock the test hands it, which is the
+    /// only way a reading of somebody else's clock can be tested at all.
+    #[test]
+    fn a_drifted_clock_is_measured_against_a_clock_the_test_controls() {
+        let smb = smb_details(&smb2_negotiate_response(0x0302, CLOCK, STARTED, 0));
+        assert_eq!(smb.skew(noon()), Some(0));
+        // This machine is five minutes behind the server.
+        let behind = noon() - Duration::from_secs(300);
+        assert_eq!(smb.skew(behind), Some(300));
+        assert!(smb.stated(behind).contains("5 min ahead of this machine"));
+        // And five minutes in front of it.
+        let ahead = noon() + Duration::from_secs(300);
+        assert_eq!(smb.skew(ahead), Some(-300));
+        assert!(smb.stated(ahead).contains("5 min behind this machine"));
+
+        // Every clock on a network is a few seconds from every other, so a
+        // line that always has something in it would say nothing.
+        let near = noon() + Duration::from_secs(9);
+        assert!(!smb.stated(near).contains("clock"), "{}", smb.stated(near));
+    }
+
+    /// A zero is a server saying nothing, not a server that started in 1601.
+    #[test]
+    fn a_time_of_zero_is_not_a_time() {
+        assert_eq!(filetime(0), None);
+        assert_eq!(filetime(CLOCK), Some(noon()));
+        // Anything before 1970 is a clock with nothing behind it.
+        assert_eq!(filetime(1), None);
+    }
+
+    /// The structure this reads is the specification's, checked against the
+    /// request builder that has to agree with it about where a header ends.
+    #[test]
+    fn the_response_this_reads_is_the_shape_the_specification_describes() {
+        let reply = smb2_negotiate_response(0x0300, CLOCK, STARTED, 0);
+        // The NetBIOS length is the rest of the message, the same property the
+        // request is held to.
+        let length = u32::from_be_bytes([0, reply[1], reply[2], reply[3]]) as usize;
+        assert_eq!(length, reply.len() - 4);
+        // 64 bytes of header, then a structure that says it is 65.
+        assert_eq!(&reply[4 + 64..4 + 66], &NEGOTIATE_RESPONSE.to_le_bytes());
+        // A body that stops before the times is read for what it has and
+        // invents nothing.
+        let short = smb_details(&reply[..4 + 64 + 40]);
+        assert_eq!(short.dialect, Some(0x0300));
+        assert_eq!(short.clock, None);
+        assert_eq!(short.started, None);
+    }
+
+    /// **The whole honesty of the SMB1 probe.** A client may offer `SMB 2.002`
+    /// at the end of an SMB1 dialect list, and then a machine with SMB1
+    /// removed answers - in SMB2. Reading that as "it speaks SMB1" is the lie
+    /// this list is written to make impossible.
+    #[test]
+    fn the_smb1_negotiate_offers_nothing_but_smb1() {
+        let msg = smb1_negotiate();
+        let text = String::from_utf8_lossy(&msg);
+        assert!(!text.contains("SMB 2"), "no SMB2 dialect may be offered");
+        assert!(text.contains("NT LM 0.12"));
+        assert!(text.contains("PC NETWORK PROGRAM 1.0"));
+
+        let length = u32::from_be_bytes([0, msg[1], msg[2], msg[3]]) as usize;
+        assert_eq!(length, msg.len() - 4);
+        assert_eq!(&msg[4..8], &SMB1_MAGIC);
+        assert_eq!(msg[4 + 4], SMB_COM_NEGOTIATE);
+        // A negotiate carries no words, and the byte count is the rest of it.
+        assert_eq!(msg[4 + 32], 0);
+        let bytes = u16::from_le_bytes([msg[4 + 33], msg[4 + 34]]) as usize;
+        assert_eq!(bytes, msg.len() - 4 - 35);
+        // And nothing about this machine goes out in it.
+        assert!(msg[4 + 14..4 + 22].iter().all(|b| *b == 0));
+    }
+
+    /// A chosen dialect is the evidence, and a refusal is the opposite of it.
+    #[test]
+    fn only_a_chosen_dialect_proves_smb1() {
+        assert_eq!(
+            smb1_dialect(&smb1_negotiate_response(5)),
+            Some("NT LM 0.12")
+        );
+        assert_eq!(
+            smb1_dialect(&smb1_negotiate_response(0)),
+            Some("PC NETWORK PROGRAM 1.0")
+        );
+        // 0xFFFF is the server saying "none of those", which is what a Samba
+        // built without SMB1 answers. It is a reply, and it is a reply saying
+        // the opposite of what a badge would claim.
+        assert_eq!(smb1_dialect(&smb1_negotiate_response(NO_DIALECT)), None);
+        // An index outside the list that was offered names no dialect.
+        assert_eq!(smb1_dialect(&smb1_negotiate_response(9)), None);
+        // And an SMB2 answer to the SMB1 question is not an SMB1 answer.
+        assert_eq!(
+            smb1_dialect(&smb2_negotiate_response(0x0302, CLOCK, STARTED, 0)),
+            None
+        );
+        assert_eq!(smb1_dialect(b""), None);
+    }
+
+    /// A server with SMB1 left on says so, and it is said as a fact rather
+    /// than as a grade: this module reports what answered and has no opinion
+    /// about it.
+    #[test]
+    fn a_server_that_speaks_smb1_says_so_on_its_own_row() {
+        let mut fake = Fake::default();
+        fake.replies.insert(
+            at("192.168.1.21", SMB_PORT),
+            smb2_negotiate_response(0x0302, CLOCK, 0, 0),
+        );
+        fake.smb1
+            .insert(at("192.168.1.21", SMB_PORT), smb1_negotiate_response(5));
+
+        let serves = one(
+            "192.168.1.21".parse().unwrap(),
+            &fake,
+            &Bucket::new(1_000_000),
+            everything(),
+        );
+        let smb = serves.smb.expect("a file server");
+        assert_eq!(smb.dialect_label(), Some("SMB 3.0.2"));
+        assert_eq!(smb.smb1, Some("NT LM 0.12"));
+        assert!(smb.stated(noon()).contains("answered an SMB1 negotiate"));
+
+        // Two connections to 445, and the second one asked a different
+        // question. One reply cannot be allowed to answer both.
+        let spoken = fake.spoken.lock().unwrap();
+        let to_smb: Vec<&Vec<u8>> = spoken
+            .iter()
+            .filter(|(to, _)| to.port() == SMB_PORT)
+            .map(|(_, opening)| opening)
+            .collect();
+        assert_eq!(to_smb.len(), 2);
+        assert_eq!(to_smb[0].get(4..8), Some(&SMB2_MAGIC[..]));
+        assert_eq!(to_smb[1].get(4..8), Some(&SMB1_MAGIC[..]));
+    }
+
+    /// An old enough NAS answers the SMB1 question and nothing else, and it is
+    /// a file server.
+    #[test]
+    fn a_server_that_answers_only_smb1_is_still_a_file_server() {
+        let mut fake = Fake::default();
+        fake.smb1
+            .insert(at("192.168.1.22", SMB_PORT), smb1_negotiate_response(5));
+        let serves = one(
+            "192.168.1.22".parse().unwrap(),
+            &fake,
+            &Bucket::new(1_000_000),
+            everything(),
+        );
+        let smb = serves.smb.expect("a file server");
+        assert_eq!(smb.dialect, None, "it never answered in SMB2");
+        assert_eq!(smb.smb1, Some("NT LM 0.12"));
+    }
+
+    /// The switch covers both openings, and with it off neither goes out.
+    #[test]
+    fn the_smb1_question_is_behind_the_switch_the_rest_is_behind() {
+        let fake = Fake::default();
+        one(
+            "192.168.1.23".parse().unwrap(),
+            &fake,
+            &Bucket::new(1_000_000),
+            Options::default(),
+        );
+        assert!(fake.spoken.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -617,7 +1323,7 @@ mod tests {
             &Bucket::new(1_000_000),
             everything(),
         );
-        assert!(serves.smb);
+        assert!(serves.smb.is_some());
         assert!(serves.nfs);
         assert_eq!(serves.ssh.as_deref(), Some("SSH-2.0-OpenSSH_9.6"));
         assert!(!serves.is_empty());
@@ -697,9 +1403,12 @@ mod tests {
             &|_, _, _, _| {},
         );
         assert_eq!(out.len(), 3);
-        assert!(!out[0].smb);
-        assert!(out[1].smb, "the one that answered is the one that answered");
-        assert!(!out[2].smb);
+        assert!(out[0].smb.is_none());
+        assert!(
+            out[1].smb.is_some(),
+            "the one that answered is the one that answered"
+        );
+        assert!(out[2].smb.is_none());
     }
 
     #[test]
