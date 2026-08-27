@@ -3722,15 +3722,23 @@ fn history_column(ui: &mut egui::Ui, p: Palette, app: &mut App, address: std::ne
     }
 
     ui.add_space(metrics::S1);
+    // What the whole history adds up to. The counts come first because the
+    // loss is only readable beside them: `ping::Stats` keeps the probes this
+    // machine could not send out of the denominator and names them separately,
+    // so a row never reads as a device losing packets it was never sent.
+    let stats = crate::ping::Stats::of(samples);
     ui.label(
-        RichText::new(format!(
-            "{} kept, worst {} ms",
-            samples.len(),
-            (worst * 1000.0).round() as u64
-        ))
-        .size(text::TINY)
-        .color(p.text_dim),
+        RichText::new(stats.counts())
+            .size(text::TINY)
+            .color(if stats.unasked > 0 {
+                p.caution
+            } else {
+                p.text_dim
+            }),
     );
+    if let Some(trips) = stats.round_trips() {
+        ui.label(RichText::new(trips).size(text::TINY).color(p.text_dim));
+    }
     ui.add_space(metrics::S2);
 
     // Newest first, because the reason somebody opened this is the one that

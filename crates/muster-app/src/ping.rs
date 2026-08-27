@@ -72,6 +72,144 @@ pub struct Sample {
     pub asked: bool,
 }
 
+/// What a history says, taken together.
+///
+/// **Three counts, not two, and that is the whole design of this struct.** A
+/// history holds probes that were answered, probes that were sent and came back
+/// with nothing, and probes this machine could not send at all, and the third is
+/// not a lost packet. `CLAUDE.md`'s rule about `discover::recheck` is that a
+/// question never asked must never be reported as a device's silence, and loss
+/// is where that rule turns into arithmetic: **the readings that could not be
+/// asked are outside the denominator**, so a machine with its ping sockets shut
+/// reports that nothing was sent rather than "100% lost", which would be Muster
+/// blaming a device for a question it never put to it.
+///
+/// Everything here is a fact about the readings kept. Nothing is scored, and
+/// there is no threshold at which a figure becomes a verdict.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Probes that actually went out.
+    pub sent: usize,
+    /// Probes that came back with a round trip.
+    pub answered: usize,
+    /// Probes this machine could not send. See [`Sample::asked`].
+    pub unasked: usize,
+    /// The shortest round trip measured.
+    pub best: Option<Duration>,
+    /// The mean of the round trips measured.
+    ///
+    /// Over the answers alone: a silence has no duration, and counting it as
+    /// zero would flatter exactly the links that drop packets.
+    pub mean: Option<Duration>,
+    pub worst: Option<Duration>,
+    /// How far a round trip sits from the mean, on average.
+    ///
+    /// The **mean absolute deviation**, which is deliberately not the figure
+    /// `iputils` prints in its `mdev` column: that one is a standard deviation
+    /// wearing a similar name. Both describe the same spread and they are not
+    /// the same number, so this says which it is rather than leaving somebody
+    /// to compare the two and conclude that one of the tools is broken.
+    pub jitter: Option<Duration>,
+}
+
+impl Stats {
+    /// Folds a history down. Arithmetic over readings already taken, so it
+    /// sends nothing and can be called every frame.
+    pub fn of(samples: &[Sample]) -> Self {
+        let mut stats = Self::default();
+        let mut trips: Vec<f64> = Vec::with_capacity(samples.len());
+        for sample in samples {
+            // The one branch this whole struct is about: a probe that never
+            // went out is counted on its own and is not a probe.
+            if !sample.asked {
+                stats.unasked += 1;
+                continue;
+            }
+            stats.sent += 1;
+            if let Some(rtt) = sample.rtt {
+                stats.answered += 1;
+                trips.push(rtt.as_secs_f64());
+            }
+        }
+
+        if trips.is_empty() {
+            return stats;
+        }
+        let mean = trips.iter().sum::<f64>() / trips.len() as f64;
+        let spread = trips.iter().map(|t| (t - mean).abs()).sum::<f64>() / trips.len() as f64;
+        stats.best = trips.iter().copied().reduce(f64::min).map(seconds);
+        stats.worst = trips.iter().copied().reduce(f64::max).map(seconds);
+        stats.mean = Some(seconds(mean));
+        stats.jitter = Some(seconds(spread));
+        stats
+    }
+
+    /// Everything kept, asked or not.
+    pub fn kept(self) -> usize {
+        self.sent + self.unasked
+    }
+
+    /// Probes that went out and were not answered.
+    pub fn lost(self) -> usize {
+        self.sent - self.answered
+    }
+
+    /// Loss as a percentage **of the probes that were actually sent**.
+    ///
+    /// [`None`] when none were, which is the case this returns an option for: a
+    /// percentage over no probes is not zero, it is nothing at all, and a panel
+    /// showing "0% lost" about a machine that could not send a single echo is
+    /// the lie the amber reading exists to prevent.
+    pub fn loss(self) -> Option<f32> {
+        (self.sent > 0).then(|| self.lost() as f32 / self.sent as f32 * 100.0)
+    }
+
+    /// The counts, said out loud, in the order somebody reads them.
+    ///
+    /// The probes that could not be asked are named rather than folded in, and
+    /// the percentage is absent rather than zero where nothing was sent.
+    pub fn counts(self) -> String {
+        if self.kept() == 0 {
+            return "nothing kept yet".to_string();
+        }
+        let mut line = format!("{} sent, {} answered", self.sent, self.answered);
+        if let Some(loss) = self.loss() {
+            line = format!("{line}, {}% lost", loss.round() as u32);
+        }
+        if self.unasked > 0 {
+            line = format!("{line}, {} this machine could not ask", self.unasked);
+        }
+        line
+    }
+
+    /// The round trips, where any were measured.
+    ///
+    /// [`None`] is a history with no answer in it, and the caller says nothing
+    /// rather than drawing a row of zeroes.
+    pub fn round_trips(self) -> Option<String> {
+        let (best, mean, worst, jitter) = (self.best?, self.mean?, self.worst?, self.jitter?);
+        Some(format!(
+            "best {} ms, mean {} ms, worst {} ms, jitter {} ms",
+            millis(best),
+            millis(mean),
+            millis(worst),
+            millis(jitter)
+        ))
+    }
+}
+
+/// Seconds back into a duration, saturating rather than panicking on the
+/// nonsense a negative would be.
+fn seconds(value: f64) -> Duration {
+    Duration::try_from_secs_f64(value.max(0.0)).unwrap_or_default()
+}
+
+/// Milliseconds to one decimal, because a wired link answers in less than one
+/// and whole milliseconds would round every device on it to the same figure.
+fn millis(value: Duration) -> String {
+    format!("{:.1}", value.as_secs_f64() * 1000.0)
+}
+
 /// How long a paced loop sleeps between looks at the cancel flag.
 const TICK: Duration = Duration::from_millis(25);
 
@@ -347,6 +485,12 @@ impl State {
         self.history.get(&address).map_or(&[], Vec::as_slice)
     }
 
+    /// What that history adds up to. See [`Stats`], and in particular what is
+    /// and is not in the loss denominator.
+    pub fn stats_for(&self, address: IpAddr) -> Stats {
+        Stats::of(self.history_for(address))
+    }
+
     /// Puts a made-up history in, for `examples/docs-images.rs`.
     ///
     /// The pictures in the README are taken by the real interface — see that
@@ -517,6 +661,103 @@ mod tests {
     #[test]
     fn cancelling_nothing_is_harmless() {
         State::default().cancel();
+    }
+
+    /// **The rule the statistics exist to keep.** Three of these probes went
+    /// out and one of them was never sent, so the loss is one in three and not
+    /// one in four: a probe this machine could not send is not a probe the
+    /// device failed to answer.
+    #[test]
+    fn a_probe_that_was_never_sent_is_outside_the_loss() {
+        let mut state = State::default();
+        let one = ip("192.168.0.2");
+        state.seed(one, &[(10, true), (0, true), (20, true), (0, false)]);
+
+        let stats = state.stats_for(one);
+        assert_eq!(stats.kept(), 4, "four readings are kept");
+        assert_eq!(stats.sent, 3, "three of them were sent");
+        assert_eq!(stats.answered, 2);
+        assert_eq!(stats.unasked, 1);
+        assert_eq!(stats.lost(), 1);
+        let loss = stats.loss().expect("something was sent");
+        assert!(
+            (loss - 100.0 / 3.0).abs() < 0.01,
+            "one lost in three sent, not one in four kept: {loss}"
+        );
+        assert!(
+            stats.counts().contains("this machine could not ask"),
+            "and the count that is outside the denominator is named: {}",
+            stats.counts()
+        );
+    }
+
+    /// A machine whose ping sockets are shut has lost nothing, because it sent
+    /// nothing. A percentage here would be the application blaming the device.
+    #[test]
+    fn nothing_sent_is_not_a_hundred_percent_lost() {
+        let mut state = State::default();
+        let quiet = ip("192.168.0.3");
+        state.seed(quiet, &[(0, false), (0, false)]);
+
+        let stats = state.stats_for(quiet);
+        assert_eq!(stats.sent, 0);
+        assert_eq!(stats.unasked, 2);
+        assert_eq!(stats.loss(), None, "no denominator, so no percentage");
+        assert!(
+            !stats.counts().contains('%'),
+            "and none is printed either: {}",
+            stats.counts()
+        );
+        assert_eq!(stats.round_trips(), None, "and nothing was measured");
+    }
+
+    /// An empty history says so rather than reporting a perfect link.
+    #[test]
+    fn an_empty_history_reports_nothing_rather_than_zero() {
+        let stats = State::default().stats_for(ip("192.168.0.4"));
+        assert_eq!(stats, Stats::default());
+        assert_eq!(stats.loss(), None);
+        assert_eq!(stats.counts(), "nothing kept yet");
+    }
+
+    /// The spread is over the answers alone. A silence has no duration, and
+    /// folding it in as zero would make a dropping link look steadier than a
+    /// clean one.
+    #[test]
+    fn the_round_trips_are_the_answers_and_only_the_answers() {
+        let mut state = State::default();
+        let one = ip("192.168.0.5");
+        // 10 ms, 20 ms and 30 ms answered, one silence, one never asked.
+        state.seed(
+            one,
+            &[(10, true), (0, true), (20, true), (30, true), (0, false)],
+        );
+
+        let stats = state.stats_for(one);
+        assert_eq!(stats.best, Some(Duration::from_millis(10)));
+        assert_eq!(stats.worst, Some(Duration::from_millis(30)));
+        assert_eq!(stats.mean, Some(Duration::from_millis(20)));
+        // Mean absolute deviation of 10, 20, 30 about 20 is (10 + 0 + 10) / 3.
+        let jitter = stats.jitter.expect("three answers have a spread");
+        assert!(
+            (jitter.as_secs_f64() - 0.020 / 3.0).abs() < 1e-9,
+            "{jitter:?}"
+        );
+        let line = stats.round_trips().expect("something answered");
+        assert!(line.contains("best 10.0 ms"), "{line}");
+        assert!(line.contains("worst 30.0 ms"), "{line}");
+    }
+
+    /// One answer has no spread, and the figure is zero rather than absent:
+    /// there was something to measure and it did not vary.
+    #[test]
+    fn a_single_answer_has_no_spread() {
+        let mut state = State::default();
+        let one = ip("192.168.0.6");
+        state.seed(one, &[(7, true)]);
+        let stats = state.stats_for(one);
+        assert_eq!(stats.jitter, Some(Duration::ZERO));
+        assert_eq!(stats.loss(), Some(0.0), "it was asked, and it answered");
     }
 
     /// The distinction the whole module exists for: a device that did not
