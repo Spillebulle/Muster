@@ -56,6 +56,7 @@
 //! speaking about itself, while reverse DNS is what the router was told once,
 //! possibly by a previous occupant of the address.
 
+use crate::claim::{Claim, Route};
 use crate::dns;
 use crate::mac::MacAddr;
 use crate::netbios;
@@ -185,7 +186,36 @@ pub struct Identity {
     /// A hardware address reported by NetBIOS, which is worth keeping beside
     /// the one ARP found: when they disagree, something is answering for
     /// another machine.
+    ///
+    /// The best of [`Self::said`] by that list's own priority, and never an
+    /// address an ARP reply or the neighbour table produced: everything here
+    /// is a device's statement about itself.
     pub mac: Option<MacAddr>,
+    /// Every hardware address the device *stated*, with the route that carried
+    /// it, best route first.
+    ///
+    /// **A different kind of claim from one a stack answered**, which is why
+    /// it is a list of [`Claim`] rather than one more `Option<MacAddr>`: an
+    /// ARP reply is written below the level anything on the device has an
+    /// opinion about, and every one of these is the device writing its own
+    /// address into a payload. See [`crate::claim`].
+    ///
+    /// Kept whole rather than resolved down to one, because two routes
+    /// disagreeing is information — usually a device answering for a second
+    /// interface, or a proxy answering for somebody else. [`Self::disputed_mac`]
+    /// is the question the interface asks.
+    pub said: Vec<Claim>,
+    /// The device's own persistent identifier, where it published one: a UPnP
+    /// `UDN`, or a WS-Discovery endpoint reference where no UPnP one was
+    /// heard.
+    ///
+    /// UPnP Device Architecture requires a `UDN` to be fixed over time and to
+    /// survive a reboot, which makes it the most stable thing the televisions
+    /// and set-top boxes ARP is worst at ever say about themselves. It used to
+    /// be split off the `USN` and thrown away. Opaque: nothing reads meaning
+    /// into it, and nothing here builds label persistence or scan comparison
+    /// on top of it — those are their own piece of work.
+    pub udn: Option<String>,
     /// mDNS service types seen, such as `_ipp._tcp` for a printer.
     pub services: Vec<String>,
     /// UPnP device and service types announced over SSDP, lower cased, such as
@@ -248,6 +278,8 @@ impl Identity {
             && self.services.is_empty()
             && self.upnp.is_empty()
             && self.wsd.is_empty()
+            && self.said.is_empty()
+            && self.udn.is_none()
             && self.product.is_none()
             && self.model.is_none()
             && self.resolver.is_none()
@@ -374,6 +406,12 @@ impl Identity {
         if self.mac.is_none() {
             self.mac = other.mac;
         }
+        for claim in &other.said {
+            self.says(*claim);
+        }
+        if self.udn.is_none() {
+            self.udn.clone_from(&other.udn);
+        }
         if self.product.is_none() {
             self.product.clone_from(&other.product);
         }
@@ -402,6 +440,55 @@ impl Identity {
         if self.product.is_none() {
             self.product.clone_from(&announcement.server);
         }
+        // The half of `USN` that used to be dropped on the floor: the device's
+        // own identifier, and — where it was built the way UPnP recommends —
+        // the hardware address inside it. See [`crate::claim`].
+        if self.udn.is_none() {
+            self.udn = announcement.udn();
+        }
+        if let Some(claim) = announcement.hardware() {
+            self.says(claim);
+        }
+    }
+
+    /// Records a hardware address the device stated about itself.
+    ///
+    /// Ordered by [`Route`]'s own priority rather than by arrival, for the
+    /// reason every other merge here is: the answer must not depend on which
+    /// datagram came back first. [`Self::mac`] follows the best of them, and
+    /// only where nothing has set it — a NetBIOS statistics block that was
+    /// read before the claims existed keeps its place.
+    pub fn says(&mut self, claim: Claim) {
+        if !self.said.contains(&claim) {
+            self.said.push(claim);
+            self.said.sort_unstable();
+        }
+        if self.mac.is_none() {
+            self.mac = self.said.first().map(|c| c.mac);
+        }
+    }
+
+    /// The best-supported route for the address on [`Self::mac`], where the
+    /// device stated it.
+    ///
+    /// [`None`] where nothing stated one, which is the ordinary case for a
+    /// device whose address came out of an ARP reply or the neighbour table.
+    pub fn mac_route(&self) -> Option<Route> {
+        let mac = self.mac?;
+        self.said.iter().find(|c| c.mac == mac).map(|c| c.route)
+    }
+
+    /// Do the routes disagree about this device's hardware address?
+    ///
+    /// Worth surfacing rather than resolving away, the same as
+    /// [`Self::disputed`] is for names: a device stating two addresses is
+    /// usually stating both of its interfaces, and occasionally it is
+    /// something answering on another machine's behalf.
+    pub fn disputed_mac(&self) -> bool {
+        let mut seen: Vec<MacAddr> = self.said.iter().map(|c| c.mac).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        seen.len() > 1
     }
 
     pub fn add(&mut self, value: String, source: Source) {
@@ -707,6 +794,9 @@ pub fn one<A: Ask>(address: IpAddr, ask: &A, rate: &Bucket, opts: Options, id: u
             }
             found.workgroup = status.workgroup().map(str::to_string);
             found.mac = status.mac;
+            if let Some(mac) = status.mac {
+                found.says(Claim::new(mac, Route::NetBios));
+            }
         }
     }
 
@@ -841,6 +931,12 @@ pub fn subject(msg: &dns::Message, from: IpAddr) -> IpAddr {
 /// and `A` records for the same service without being asked, and those carry
 /// the service type as their own name.
 pub fn harvest(msg: &dns::Message, found: &mut Identity, models: &mut Vec<(usize, String)>) {
+    // The hardware addresses the reply states about itself, which are a
+    // whitelist of fields rather than anything in it that looks like one. See
+    // [`crate::claim`], and the HomeKit identifier it refuses.
+    for claim in crate::claim::from_mdns(msg) {
+        found.says(claim);
+    }
     let offered = |service: Option<String>, found: &mut Identity| {
         if let Some(service) = service
             && !found.services.contains(&service)
