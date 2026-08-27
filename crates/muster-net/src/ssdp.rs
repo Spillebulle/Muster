@@ -35,14 +35,22 @@
 //! to send in, which is the same defect the mDNS table's ordering note is
 //! about.
 //!
-//! ## What is read, and what is not
+//! ## What is read here, and what is read next door
 //!
-//! The headers, and nothing more. A reply carries a `LOCATION` URL pointing at
-//! an XML description with the manufacturer, the model name and often a serial
-//! number, and fetching it is the obvious next step — but it is a TCP request
-//! per device and it belongs with the banner grabbing and certificate reading
-//! that phase four does not do yet. `SERVER` and the device type URNs are in
-//! the datagram already and are enough to name a kind.
+//! The headers, and nothing more. That is enough for a kind: `SERVER` and the
+//! device type URNs are in the datagram already, they cost no connection, and
+//! they are what this module is for.
+//!
+//! **The `LOCATION` is the exception, and following it is [`crate::igd`]'s
+//! job.** It points at an XML description carrying the manufacturer, the model
+//! name and often a serial number, and on a router it carries the control URL
+//! that leads to the port forwards and the public address as well. All of that
+//! costs a TCP request per device, which is a different shape of question from
+//! a datagram and is off by default for the reason
+//! [`crate::igd::Options`] gives, so it lives beside this module rather than
+//! inside it. What is kept here is the header, unfollowed, which is the honest
+//! division: this module reads what arrived, and the other one decides whether
+//! to open a connection about it.
 
 use crate::identify::Ask;
 use std::collections::BTreeMap;
@@ -165,7 +173,13 @@ pub struct Announcement {
     /// `SERVER`: the operating system and product, in HTTP product-token form.
     /// `Linux/4.19 UPnP/1.0 LG WebOS TV/1.0` names a television outright.
     pub server: Option<String>,
-    /// Where the XML description lives. Not fetched; see the module note.
+    /// Where the XML description lives.
+    ///
+    /// Read out of the datagram and left alone here. It is **text a device
+    /// wrote**, so nothing in this module treats it as an address, and
+    /// [`crate::igd::describe`] refuses it outright unless it names the device
+    /// that sent it: a `LOCATION` of `http://example.com/` would otherwise have
+    /// this machine open a connection to the internet on a stranger's say-so.
     pub location: Option<String>,
 }
 
