@@ -317,7 +317,7 @@ impl Identity {
         if self.resolver.is_some() {
             out.push(Role::Dns);
         }
-        if self.serves.smb {
+        if self.serves.smb.is_some() {
             out.push(Role::Smb);
         }
         if self.serves.nfs {
@@ -339,7 +339,13 @@ impl Identity {
     /// A merge rather than an assignment: a scan that asked only about SMB must
     /// not wipe what an earlier answer said about the rest.
     pub fn serves(&mut self, serves: &crate::service::Serves) {
-        self.serves.smb |= serves.smb;
+        // What one answer said is kept whole rather than folded into what
+        // another said: the fields of an SMB negotiate describe one exchange
+        // with one server, and a dialect from one reply beside a clock from
+        // another would be a machine that never existed.
+        if self.serves.smb.is_none() {
+            self.serves.smb.clone_from(&serves.smb);
+        }
         self.serves.nfs |= serves.nfs;
         if self.serves.ssh.is_none() {
             self.serves.ssh.clone_from(&serves.ssh);
@@ -902,8 +908,8 @@ pub fn harvest(msg: &dns::Message, found: &mut Identity, models: &mut Vec<(usize
                 // every `TXT` on the network: a printer's `_ipp` record
                 // carries a dozen entries and somebody's is going to be `ci`
                 // one day meaning something else entirely.
-                let homekit = service_type(&record.name)
-                    .is_some_and(|service| service.starts_with("_hap."));
+                let homekit =
+                    service_type(&record.name).is_some_and(|service| service.starts_with("_hap."));
                 for entry in strings {
                     if homekit
                         && found.hap.is_none()
@@ -1196,7 +1202,14 @@ mod tests {
     fn a_homekit_accessory_says_which_kind_of_accessory_it_is() {
         let reply = txt_reply(
             "Doorbell 4C2E._hap._tcp.local",
-            &["c#=2", "id=A1:B2:C3:D4:E5:F6", "md=Video Doorbell", "s#=1", "sf=0", "ci=18"],
+            &[
+                "c#=2",
+                "id=A1:B2:C3:D4:E5:F6",
+                "md=Video Doorbell",
+                "s#=1",
+                "sf=0",
+                "ci=18",
+            ],
         );
         let message = dns::parse(&reply).expect("a reply");
         let mut found = Identity::default();
@@ -1204,7 +1217,10 @@ mod tests {
         harvest(&message, &mut found, &mut models);
         assert_eq!(found.hap, Some(18), "18 is a video doorbell");
         // And the record's other keys still read the way they always did.
-        assert_eq!(models.first().map(|(_, m)| m.as_str()), Some("Video Doorbell"));
+        assert_eq!(
+            models.first().map(|(_, m)| m.as_str()),
+            Some("Video Doorbell")
+        );
         assert!(found.services.iter().any(|s| s == "_hap._tcp"));
     }
 
@@ -1611,7 +1627,7 @@ mod tests {
         // A second pass that learned only about SMB adds to what is known
         // rather than replacing it.
         identity.serves(&crate::service::Serves {
-            smb: true,
+            smb: Some(crate::service::Smb::default()),
             ..Default::default()
         });
         assert_eq!(identity.roles(), vec![Role::Smb, Role::Nfs, Role::Ssh]);

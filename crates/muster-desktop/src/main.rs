@@ -639,6 +639,14 @@ fn device_row(
     if let Some(version) = named.and_then(|i| i.resolver.as_ref()?.version.as_deref()) {
         why.push(version.to_string());
     }
+    // And what the file server said while it was answering, which is the same
+    // sentence the window puts in its SMB row.
+    if let Some(smb) = named.and_then(|i| i.serves.smb.as_ref()) {
+        let said = smb.stated(std::time::SystemTime::now());
+        if !said.is_empty() {
+            why.push(said);
+        }
+    }
 
     // The kind, and its reason with the rest of the evidence. The window shows
     // the same guess from the same function; a text mode that could not say
