@@ -273,6 +273,17 @@ fn read(watch: &Watch, datagrams: Vec<(IpAddr, Vec<u8>)>) -> Vec<(IpAddr, Protoc
                             entry.wsd.push(kind);
                         }
                     }
+                    // The device's own stable identifier, and the hardware
+                    // address inside it where it was built the one way that
+                    // puts one there. See [`crate::claim`].
+                    if let Some(endpoint) = &matched.endpoint {
+                        if entry.udn.is_none() {
+                            entry.udn = Some(endpoint.clone());
+                        }
+                        if let Some(claim) = crate::claim::from_endpoint(endpoint) {
+                            entry.says(claim);
+                        }
+                    }
                 }
             }
             Protocol::NetBios => {
@@ -285,6 +296,9 @@ fn read(watch: &Watch, datagrams: Vec<(IpAddr, Vec<u8>)>) -> Vec<(IpAddr, Protoc
                     }
                     if entry.mac.is_none() {
                         entry.mac = status.mac;
+                    }
+                    if let Some(mac) = status.mac {
+                        entry.says(crate::claim::Claim::new(mac, crate::claim::Route::NetBios));
                     }
                 }
             }

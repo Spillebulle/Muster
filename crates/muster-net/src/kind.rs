@@ -1023,6 +1023,7 @@ mod tests {
         Found {
             address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5)),
             mac: mac.map(MacAddr::new),
+            mac_said: None,
             evidence: ports.iter().map(|p| Evidence::TcpOpen(*p)).collect(),
             rtt: None,
         }
@@ -1944,6 +1945,7 @@ mod tests {
         Found {
             address: address.parse().unwrap(),
             mac: None,
+            mac_said: None,
             evidence: vec![Evidence::Ping],
             rtt: None,
         }

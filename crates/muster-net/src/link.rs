@@ -297,6 +297,7 @@ pub fn fold(heard: &Heard, sweep: &mut Sweep, names: &mut Vec<Identity>) -> Vec<
                 }
                 if sweep.found[at].mac.is_none() {
                     sweep.found[at].mac = voice.identity.mac;
+                    sweep.found[at].mac_said = voice.identity.mac_route();
                 }
             }
             Err(at) => {
@@ -304,7 +305,19 @@ pub fn fold(heard: &Heard, sweep: &mut Sweep, names: &mut Vec<Identity>) -> Vec<
                 let Some(protocol) = heard.credit(*address) else {
                     continue;
                 };
-                sweep.found.insert(at, Found::announced(*address, protocol));
+                let mut row = Found::announced(*address, protocol);
+                // **The address the device stated, on the row that has no
+                // other.** A device the sweep never probed has no ARP reply
+                // and no neighbour entry behind it, so this is the only
+                // hardware address its row will ever carry — and without it
+                // the vendor column is blank for exactly the devices this
+                // phase exists to find. The route is carried beside it,
+                // because a device saying its own address is a weaker claim
+                // than a stack answering for it and the interface has to be
+                // able to say which happened.
+                row.mac = voice.identity.mac;
+                row.mac_said = voice.identity.mac_route();
+                sweep.found.insert(at, row);
                 if at <= names.len() {
                     names.insert(at, voice.identity.clone());
                 }
@@ -505,6 +518,19 @@ fn windows<A: Ask + ?Sized>(ask: &A, opts: Options) -> Answer {
                 identity.wsd.push(kind);
             }
         }
+        // The endpoint reference, which WS-Discovery requires to be a stable
+        // identifier for the device. Kept as identity whatever kind of uuid it
+        // is; an address comes out of it only where it was built the one way
+        // that puts one there, which is not the way Windows builds it. See
+        // [`crate::claim`].
+        if let Some(endpoint) = &matched.endpoint {
+            if identity.udn.is_none() {
+                identity.udn = Some(endpoint.clone());
+            }
+            if let Some(claim) = crate::claim::from_endpoint(endpoint) {
+                identity.says(claim);
+            }
+        }
     }
     let out = by
         .into_iter()
@@ -556,6 +582,9 @@ fn nbns<A: Ask + ?Sized>(ask: &A, opts: Options) -> Answer {
         }
         if identity.mac.is_none() {
             identity.mac = status.mac;
+        }
+        if let Some(mac) = status.mac {
+            identity.says(crate::claim::Claim::new(mac, crate::claim::Route::NetBios));
         }
     }
     let out = by
@@ -738,6 +767,12 @@ mod tests {
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
+
+    fn mac(s: &str) -> crate::MacAddr {
+        s.parse().unwrap()
+    }
+
+    use crate::claim::Route;
 
     /// Every question off, so a test switches on the one it is about.
     fn quiet() -> Options {
@@ -1183,6 +1218,7 @@ SERVER: TP-LINK/TP-LINK UPnP/1.1 MiniUPnPd/2.2.2
             sweep.found.push(Found {
                 address: ip(address),
                 mac: None,
+                mac_said: None,
                 evidence: vec![Evidence::Ping],
                 rtt: None,
             });
@@ -1218,6 +1254,72 @@ SERVER: TP-LINK/TP-LINK UPnP/1.1 MiniUPnPd/2.2.2
             "the row that was already there keeps its own name"
         );
         assert_eq!(names[3].best().map(|n| n.value.as_str()), Some("forty"));
+    }
+
+    /// **The gap this whole route exists to close.** A device that only ever
+    /// answered a multicast question has no ARP reply and no neighbour entry
+    /// behind it, so its row used to carry a blank hardware column and a blank
+    /// vendor beside a perfectly good name — and the reply that put it on the
+    /// list had its address in it all along. The row now takes what the device
+    /// stated, and carries the route beside it, because a stated address is a
+    /// weaker claim than an answered one and the interface has to be able to
+    /// say which it is showing.
+    #[test]
+    fn an_announced_row_takes_the_address_the_device_stated() {
+        let mut sweep = Sweep::default();
+        let mut names: Vec<Identity> = Vec::new();
+
+        let mut heard = Heard::default();
+        let voice = heard.by.entry(ip("192.168.1.62")).or_default();
+        voice.protocols.insert(Protocol::Mdns);
+        voice.identity.says(crate::claim::Claim::new(
+            mac("f4:cf:a2:f7:5c:84"),
+            Route::EspHome,
+        ));
+
+        assert_eq!(
+            fold(&heard, &mut sweep, &mut names),
+            vec![ip("192.168.1.62")]
+        );
+        assert_eq!(sweep.found[0].mac, Some(mac("f4:cf:a2:f7:5c:84")));
+        assert_eq!(sweep.found[0].mac_said, Some(Route::EspHome));
+        assert!(!sweep.found[0].was_probed(), "nothing was ever sent to it");
+        assert_eq!(
+            crate::vendor::lookup(sweep.found[0].mac.unwrap()).name(),
+            Some("Espressif Inc."),
+            "which is the whole point: the vendor column is no longer blank"
+        );
+    }
+
+    /// A device the sweep *did* reach keeps the address its stack answered
+    /// with, and the row says nothing about a stated one. The two claims are
+    /// not the same rank, and the stated one is still kept whole beside the
+    /// name.
+    #[test]
+    fn an_answered_address_is_not_overwritten_by_a_stated_one() {
+        let answered = mac("3c:22:fb:11:22:33");
+        let mut sweep = Sweep::default();
+        sweep.found.push(Found {
+            address: ip("192.168.1.62"),
+            mac: Some(answered),
+            mac_said: None,
+            evidence: vec![Evidence::Arp(answered)],
+            rtt: None,
+        });
+        let mut names = vec![Identity::default()];
+
+        let mut heard = Heard::default();
+        let voice = heard.by.entry(ip("192.168.1.62")).or_default();
+        voice.protocols.insert(Protocol::Mdns);
+        voice.identity.says(crate::claim::Claim::new(
+            mac("f4:cf:a2:f7:5c:84"),
+            Route::EspHome,
+        ));
+
+        fold(&heard, &mut sweep, &mut names);
+        assert_eq!(sweep.found[0].mac, Some(answered));
+        assert_eq!(sweep.found[0].mac_said, None, "a stack answered this one");
+        assert_eq!(names[0].said.len(), 1, "and the device's account is kept");
     }
 
     /// A resolver's record names a device the sweep found and never invents
