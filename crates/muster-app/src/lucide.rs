@@ -446,6 +446,37 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// Every number the scan takes out of a `d` attribute, exactly as it took it.
+///
+/// **The one thing [`Lexer::number`] throws away.** It answers a token it
+/// cannot read with zero, which is a legal coordinate inside a legal box, so a
+/// path scanned wrongly draws a wrong icon and nothing anywhere says so. This
+/// hands the tokens back unparsed for [`crate::icons`] to ask the question the
+/// `unwrap_or` answers away.
+#[cfg(test)]
+pub fn number_tokens(d: &str) -> Vec<String> {
+    let mut lexer = Lexer::new(d);
+    let mut out = Vec::new();
+    loop {
+        if lexer.command().is_some() {
+            continue;
+        }
+        if !lexer.at_number() {
+            break;
+        }
+        let before = lexer.rest;
+        lexer.number();
+        let taken = before.len() - lexer.rest.len();
+        // A number the scan takes nothing for would loop for ever. It cannot
+        // happen after `at_number`, and this is cheaper than trusting that.
+        if taken == 0 {
+            break;
+        }
+        out.push(before[..taken].to_string());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +498,16 @@ mod tests {
     fn a_second_point_ends_the_number_before_it() {
         let mut lexer = Lexer::new("6-5.5.08-1.25 .5.5");
         for want in [6.0, -5.5, 0.08, -1.25, 0.5, 0.5] {
+            let got = lexer.number();
+            assert!((got - want).abs() < 0.001, "wanted {want}, got {got}");
+        }
+    }
+
+    /// The same rule with nothing before the point either side of it.
+    #[test]
+    fn a_number_may_begin_with_its_point() {
+        let mut lexer = Lexer::new(".4.4 3.4-3.4");
+        for want in [0.4, 0.4, 3.4, -3.4] {
             let got = lexer.number();
             assert!((got - want).abs() < 0.001, "wanted {want}, got {got}");
         }

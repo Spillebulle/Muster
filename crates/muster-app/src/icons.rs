@@ -522,6 +522,40 @@ mod tests {
         }
     }
 
+    /// Every number in every path is a number.
+    ///
+    /// **This is the test the other two cannot be.** A token the scan reads
+    /// past the end of parses as nothing and becomes `0.0`, and zero is a
+    /// coordinate like any other: it is inside the box, so
+    /// `every_icon_fills_its_box` is satisfied, and it is inside the grammar,
+    /// so `every_command_is_one_the_parser_knows` is too. Anything that round
+    /// trips through the same lexer agrees with itself. The only question left
+    /// is whether the text the lexer took is a number, which is exactly what
+    /// `parse().unwrap_or(0.0)` stops asking — so it is asked here.
+    ///
+    /// It caught a real one: SVG ends a number at a second decimal point and
+    /// the scan used to read straight on, which put two dozen tokens like
+    /// `.113.82` in the GitHub mark's path on the origin.
+    #[test]
+    fn every_number_in_every_icon_parses() {
+        for icon in Icon::ALL {
+            for node in icon.nodes() {
+                let Node::Path(d) = node else {
+                    continue;
+                };
+                for token in crate::lucide::number_tokens(d) {
+                    assert!(
+                        token.parse::<f32>().is_ok(),
+                        "{icon:?}: the scan took {token:?} out of its path as one \
+                         number, and it is not one. `Lexer::number` answers that with \
+                         0.0, which is a legal coordinate in a legal box, so the icon \
+                         comes out deformed and every other test here passes."
+                    );
+                }
+            }
+        }
+    }
+
     /// No icon uses a command the parser would stop at.
     ///
     /// Quadratics and the smooth forms are not implemented, and the day a
