@@ -268,11 +268,7 @@ fn read(watch: &Watch, datagrams: Vec<(IpAddr, Vec<u8>)>) -> Vec<(IpAddr, Protoc
             }
             Protocol::WsDiscovery => {
                 if let Some(matched) = wsd::parse(&datagram) {
-                    for kind in matched.types {
-                        if !entry.wsd.contains(&kind) {
-                            entry.wsd.push(kind);
-                        }
-                    }
+                    entry.probed(&matched);
                 }
             }
             Protocol::NetBios => {

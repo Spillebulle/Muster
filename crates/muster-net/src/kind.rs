@@ -1067,6 +1067,33 @@ mod tests {
         assert_eq!(guess.clue, Clue::Service);
     }
 
+    /// The `Scopes` of a WS-Discovery reply name the hardware, and they were
+    /// parsed and dropped. A model ranks below a service, which is the second
+    /// half of this test.
+    ///
+    /// The device identifier is **constructed from Microsoft's WS-Print
+    /// documentation rather than captured**; the spelling is the one that
+    /// documentation gives.
+    #[test]
+    fn a_printer_named_only_by_its_scopes_is_still_a_printer() {
+        let mut identity = Identity::default();
+        identity.probed(&crate::wsd::Match {
+            scopes: vec!["MFG:HP;MDL:HP LaserJet MFP M428fdw".into()],
+            ..Default::default()
+        });
+        let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
+        assert_eq!(guess.kind, Kind::Printer);
+        assert_eq!(guess.clue, Clue::Product, "a model is what a scope carries");
+
+        // And where the same reply also claims a type, the type wins: a model
+        // is free text and a `Types` value is a protocol the device has to
+        // implement. `CLAUDE.md`, and the reason `Clue::Product` sits below
+        // `Clue::Service`.
+        identity.wsd.push("wprt:printdevicetype".into());
+        let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
+        assert_eq!(guess.clue, Clue::Service);
+    }
+
     /// A UPnP device type is the same class of statement as an mDNS service and
     /// is ranked with it. DIAL is on televisions and streaming boxes only.
     #[test]

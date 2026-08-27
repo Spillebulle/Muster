@@ -499,12 +499,7 @@ fn windows<A: Ask + ?Sized>(ask: &A, opts: Options) -> Answer {
         let Some(matched) = wsd::parse(&reply) else {
             continue;
         };
-        let identity = by.entry(from).or_default();
-        for kind in matched.types {
-            if !identity.wsd.contains(&kind) {
-                identity.wsd.push(kind);
-            }
-        }
+        by.entry(from).or_default().probed(&matched);
     }
     let out = by
         .into_iter()

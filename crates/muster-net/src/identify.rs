@@ -404,6 +404,28 @@ impl Identity {
         }
     }
 
+    /// Folds one WS-Discovery `ProbeMatch` in.
+    ///
+    /// The counterpart of [`Self::announced`], and it exists for the same
+    /// reason: the two callers that read this protocol - the link phase and the
+    /// listen - were each unrolling the same loop over `Types`, so the day the
+    /// reply started carrying something else worth having there were two places
+    /// to remember, and one of them would have been forgotten.
+    ///
+    /// **The scopes are where the hardware is named**, and they were being
+    /// parsed and dropped. See [`crate::wsd::Match::model`] for which of them
+    /// is read and, more to the point, which is not.
+    pub fn probed(&mut self, matched: &crate::wsd::Match) {
+        for kind in &matched.types {
+            if !self.wsd.contains(kind) {
+                self.wsd.push(kind.clone());
+            }
+        }
+        if self.model.is_none() {
+            self.model = matched.model();
+        }
+    }
+
     pub fn add(&mut self, value: String, source: Source) {
         let value = value.trim_end_matches('.').to_string();
         if value.is_empty() {
@@ -1112,6 +1134,32 @@ mod tests {
             resolver: Some(ip(resolver)),
             ..Default::default()
         }
+    }
+
+    /// The WS-Discovery scopes are folded in through one method rather than
+    /// through the same loop written out in the link phase and in the listen.
+    #[test]
+    fn a_probe_match_gives_up_its_types_and_its_model() {
+        let mut found = Identity::default();
+        found.probed(&crate::wsd::Match {
+            types: vec!["wsdp:device".into(), "wprt:printdevicetype".into()],
+            scopes: vec!["MFG:HP;MDL:HP LaserJet MFP M428fdw".into()],
+            ..Default::default()
+        });
+        assert_eq!(found.wsd, vec!["wsdp:device", "wprt:printdevicetype"]);
+        assert_eq!(found.model.as_deref(), Some("HP LaserJet MFP M428fdw"));
+
+        // A model already known is the more specific one and is kept, which is
+        // the rule every other source here follows.
+        let mut found = Identity {
+            model: Some("HP OfficeJet 6950".into()),
+            ..Default::default()
+        };
+        found.probed(&crate::wsd::Match {
+            scopes: vec!["MFG:HP;MDL:HP LaserJet MFP M428fdw".into()],
+            ..Default::default()
+        });
+        assert_eq!(found.model.as_deref(), Some("HP OfficeJet 6950"));
     }
 
     #[test]
