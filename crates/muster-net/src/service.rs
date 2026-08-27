@@ -206,13 +206,17 @@ pub fn one<S: Speak>(address: IpAddr, speak: &S, rate: &Bucket, opts: Options) -
 ///
 /// Returns one [`Serves`] per input address, in the same order, so the caller
 /// can zip it against the sweep the way it does with [`crate::identify::many`].
+///
+/// **Every report carries the device it is about**, for the reason
+/// [`crate::identify::many`] gives: a badge that is known now is worth showing
+/// now, and a count cannot carry one.
 pub fn many<S: Speak>(
     addresses: &[IpAddr],
     speak: &S,
     rate: &Bucket,
     opts: Options,
     cancel: &AtomicBool,
-    progress: &(dyn Fn(usize, usize) + Sync),
+    progress: &(dyn Fn(usize, usize, IpAddr, &Serves) + Sync),
 ) -> Vec<Serves> {
     let next = AtomicU64::new(0);
     let done = AtomicU64::new(0);
@@ -236,11 +240,14 @@ pub fn many<S: Speak>(
                     let Some(&address) = addresses.get(i) else {
                         break;
                     };
-                    mine.push((i, one(address, speak, rate, opts)));
+                    let serves = one(address, speak, rate, opts);
                     progress(
                         done.fetch_add(1, Ordering::Relaxed) as usize + 1,
                         addresses.len(),
+                        address,
+                        &serves,
                     );
+                    mine.push((i, serves));
                 }
                 mine
             }));
@@ -687,7 +694,7 @@ mod tests {
                 ..Default::default()
             },
             &AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _, _| {},
         );
         assert_eq!(out.len(), 3);
         assert!(!out[0].smb);
@@ -709,7 +716,7 @@ mod tests {
                 ..Default::default()
             },
             &AtomicBool::new(true),
-            &|_, _| {},
+            &|_, _, _, _| {},
         );
         assert!(out[0].is_empty());
         assert!(fake.spoken.lock().unwrap().is_empty());

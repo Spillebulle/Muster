@@ -934,13 +934,22 @@ fn service_type(name: &str) -> Option<String> {
 /// by [`crate::link`], as a phase of its own that runs beside the sweep and
 /// can *add* to the device list rather than only annotate it. What is left here
 /// is what it says: questions put to one device, about itself.
+///
+/// **Every report carries the device it is about**, which is
+/// [`crate::discover::sweep`]'s arrangement and is here for the same reason.
+/// A count on its own says a phase is moving and nothing about what it learned,
+/// so a caller with only the count has nothing to show until this returns — and
+/// then it has everything at once, which is how the name and the services
+/// arrived in one blip at the end of a scan while the answers had in fact been
+/// coming in for a minute. The identity handed over is the one that goes in the
+/// returned list at that index.
 pub fn many<A: Ask>(
     addresses: &[IpAddr],
     ask: &A,
     rate: &Bucket,
     opts: Options,
     cancel: &AtomicBool,
-    progress: &(dyn Fn(usize, usize) + Sync),
+    progress: &(dyn Fn(usize, usize, IpAddr, &Identity) + Sync),
 ) -> Vec<Identity> {
     let next = AtomicU64::new(0);
     let done = AtomicU64::new(0);
@@ -965,11 +974,13 @@ pub fn many<A: Ask>(
                     // meant for another device recognisable rather than merely
                     // unlikely.
                     let found = one(address, ask, rate, opts, i as u16);
-                    mine.push((i, found));
                     progress(
                         done.fetch_add(1, Ordering::Relaxed) as usize + 1,
                         addresses.len(),
+                        address,
+                        &found,
                     );
+                    mine.push((i, found));
                 }
                 mine
             }));
@@ -1507,6 +1518,65 @@ mod tests {
         assert_eq!(service_type("_services._dns-sd._udp.local"), None);
     }
 
+    /// Each device is reported as it is finished, with what was learned about
+    /// it.
+    ///
+    /// **A count cannot be shown.** The window fills the table from these
+    /// reports, so a report that carried only `done of total` left it with
+    /// nothing to draw until this function returned — and then the whole table
+    /// filled at once, a minute after the first answer came in. The test is
+    /// that every address is reported exactly once and that what it was
+    /// reported with is what ends up in the returned list, because a report
+    /// that disagreed with the result would put a name on screen that the
+    /// finished scan then took away.
+    #[test]
+    fn every_device_is_reported_as_it_is_identified() {
+        let mut fake = Fake::default();
+        for last in [3u8, 9, 21] {
+            fake.replies.insert(
+                SocketAddr::new(ip(&format!("192.168.0.{last}")), 5353),
+                ptr_reply(
+                    &format!("{last}.0.168.192.in-addr.arpa"),
+                    &format!("host{last}.local"),
+                ),
+            );
+        }
+        let addresses: Vec<IpAddr> = (1..=30).map(|n| ip(&format!("192.168.0.{n}"))).collect();
+        let reported: Mutex<Vec<(IpAddr, Identity)>> = Mutex::new(Vec::new());
+        let found = many(
+            &addresses,
+            &fake,
+            &Bucket::new(1_000_000),
+            Options::default(),
+            &AtomicBool::new(false),
+            &|_, _, address, identity| {
+                reported.lock().unwrap().push((address, identity.clone()));
+            },
+        );
+
+        let reported = reported.into_inner().unwrap();
+        assert_eq!(
+            reported.len(),
+            addresses.len(),
+            "every address is reported exactly once"
+        );
+        for (address, identity) in &reported {
+            let at = addresses
+                .iter()
+                .position(|a| a == address)
+                .expect("an address that was asked about");
+            assert_eq!(
+                identity.best().map(|n| n.value.clone()),
+                found[at].best().map(|n| n.value.clone()),
+                "{address} was reported as something other than what it is"
+            );
+        }
+        assert!(
+            reported.iter().any(|(_, i)| i.best().is_some()),
+            "nothing was reported with a name, so this proves nothing"
+        );
+    }
+
     #[test]
     fn many_keeps_results_in_the_order_it_was_given() {
         let mut fake = Fake::default();
@@ -1526,7 +1596,7 @@ mod tests {
             &Bucket::new(1_000_000),
             Options::default(),
             &AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _, _| {},
         );
         assert_eq!(found.len(), 30);
         assert_eq!(found[2].best().unwrap().value, "host0.local"); // .3
@@ -1550,7 +1620,7 @@ mod tests {
                 ..Default::default()
             },
             &cancel,
-            &|_, _| {
+            &|_, _, _, _| {
                 if seen.fetch_add(1, Ordering::SeqCst) >= 4 {
                     cancel.store(true, Ordering::SeqCst);
                 }

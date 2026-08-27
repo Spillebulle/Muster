@@ -135,6 +135,19 @@ pub enum Update {
         /// finished scan will show.
         protocol: muster_net::discover::Protocol,
     },
+    /// What is known about one device, the moment it is known.
+    ///
+    /// **The whole identity, not the part that just arrived**, and the receiver
+    /// replaces rather than merges. Identification learns about a device from
+    /// several sources with a priority between them — what it answered
+    /// privately, what it answered the link, what it serves — and folding them
+    /// in a different order gives a different answer, so the order is decided
+    /// once, in the scan, and the window is handed the result. A row therefore
+    /// never shows something the finished scan will disagree with.
+    Named {
+        address: IpAddr,
+        identity: Box<Identity>,
+    },
     Identifying {
         done: usize,
         total: usize,
@@ -245,6 +258,13 @@ pub enum State {
         /// is a few seconds; on anything larger it is the difference between a
         /// tool that is working and a tool that has hung.
         devices: Vec<Found>,
+        /// What is known about each of them, one for one with `devices`.
+        ///
+        /// Kept in step by index rather than looked up by address, because the
+        /// table reads the two together and a row's name arriving is not a
+        /// reason to search. A device with nothing known yet holds a default
+        /// identity, which is what an empty cell in the table means.
+        names: Vec<Identity>,
         cancel: Arc<AtomicBool>,
         rx: Receiver<Update>,
     },
@@ -317,6 +337,7 @@ impl State {
             },
             found: 0,
             devices: Vec::new(),
+            names: Vec::new(),
             cancel,
             rx,
         }
@@ -332,6 +353,7 @@ impl State {
             phase,
             found,
             devices,
+            names,
             rx,
             ..
         } = self
@@ -348,6 +370,7 @@ impl State {
                         *found = f;
                         if let Some(device) = hit {
                             devices.push(*device);
+                            names.push(Identity::default());
                         }
                         moved = true;
                     }
@@ -356,7 +379,18 @@ impl State {
                         // so a row does not jump when the scan ends.
                         if let Err(at) = devices.binary_search_by_key(&address, |d| d.address) {
                             devices.insert(at, Found::announced(address, protocol));
+                            names.insert(at, Identity::default());
                             *found += 1;
+                        }
+                        moved = true;
+                    }
+                    Ok(Update::Named { address, identity }) => {
+                        // **A name is not a device**, so an identity for an
+                        // address that is not on the list is dropped rather
+                        // than given a row. The engine folds by the same set of
+                        // addresses, so there is nothing here to lose.
+                        if let Some(i) = devices.iter().position(|d| d.address == address) {
+                            names[i] = *identity;
                         }
                         moved = true;
                     }
@@ -466,14 +500,21 @@ impl State {
 
     /// The names learned, parallel to [`Self::devices`].
     ///
-    /// Empty while a sweep is running: identification is phase four and has not
-    /// started yet, so a device on screen mid-scan has an address and no name.
-    /// That is honest — the alternative is holding the whole table back until
-    /// every name is in.
+    /// **Filled as the scan runs, not at the end of it.** A row shows what is
+    /// known about it the moment it is known: what the link answered arrives
+    /// while the sweep is still going, the private questions land one device at
+    /// a time, and the badges follow. Blank means nothing is known *yet*, which
+    /// is the same thing a blank cell means in a finished scan and is why the
+    /// table needs no third state for it.
+    ///
+    /// This was the whole outcome or nothing at all, and the effect on screen
+    /// was that every name and every badge in the table appeared in one blip
+    /// when the scan finished, a minute after the first of them was known.
     pub fn names(&self) -> &[Identity] {
         match self {
             Self::Finished(o) => &o.names,
-            _ => &[],
+            Self::Running { names, .. } => names,
+            Self::Idle => &[],
         }
     }
 }
@@ -646,6 +687,21 @@ fn run(job: Job) {
         sweep.not_done.extend(heard.not_done.iter().cloned());
 
         let addresses: Vec<_> = sweep.found.iter().map(|f| f.address).collect();
+
+        // **What the link already said, said now.** The link phase ran beside
+        // the sweep and has finished; its answers used to sit here until the
+        // whole scan ended, which on a network where the televisions and the
+        // printers answer a multicast question and nothing else meant their
+        // names were known for a minute before anything showed them.
+        for address in &addresses {
+            if let Some(voice) = heard.by.get(address) {
+                let _ = tx.send(Update::Named {
+                    address: *address,
+                    identity: Box::new(voice.identity.clone()),
+                });
+            }
+        }
+
         let mut names = identify::many(
             &addresses,
             &muster_net::platform::udp::Udp,
@@ -660,8 +716,21 @@ fn run(job: Job) {
                 ..Default::default()
             },
             &cancel,
-            &|done, total| {
+            &|done, total, address, identity| {
                 let _ = tx.send(Update::Identifying { done, total });
+                // Merged with what the link heard, in that order, because that
+                // is the order the assembly below uses and a row must not show
+                // one answer now and another at the end. The fold below stays:
+                // this is a copy sent onwards, and the list this function
+                // returns is still the one the outcome is built from.
+                let mut merged = identity.clone();
+                if let Some(voice) = heard.by.get(&address) {
+                    merged.merge(&voice.identity);
+                }
+                let _ = tx.send(Update::Named {
+                    address,
+                    identity: Box::new(merged),
+                });
             },
         );
 
@@ -685,8 +754,20 @@ fn run(job: Job) {
                 &rate,
                 opts.serving(),
                 &cancel,
-                &|done, total| {
+                &|done, total, address, serves| {
                     let _ = tx.send(Update::Serving { done, total });
+                    // The identity as it stands plus what this device serves.
+                    // `names` is not touched until this call returns, so
+                    // reading it here is reading what identification and the
+                    // link between them settled on.
+                    if let Some(i) = addresses.iter().position(|a| *a == address) {
+                        let mut merged = names[i].clone();
+                        merged.serves(serves);
+                        let _ = tx.send(Update::Named {
+                            address,
+                            identity: Box::new(merged),
+                        });
+                    }
                 },
             );
             for (identity, serves) in names.iter_mut().zip(serving.iter()) {
@@ -792,6 +873,109 @@ mod tests {
             Phase::Identifying { done: 2, total: 9 }.label(),
             "Identifying 2 of 9"
         );
+    }
+
+    /// A running scan, with a channel a test can talk down.
+    fn running() -> (Sender<Update>, State) {
+        let (tx, rx) = channel();
+        (
+            tx,
+            State::Running {
+                phase: Phase::Sweeping {
+                    probed: 0,
+                    total: 4,
+                },
+                found: 0,
+                devices: Vec::new(),
+                names: Vec::new(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+            },
+        )
+    }
+
+    fn address(last: u8) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, last))
+    }
+
+    /// A name lands on the row it is about, whatever order the rows arrived in.
+    ///
+    /// **This is the failure worth a test.** The names are held one for one with
+    /// the devices, and the two lists grow from different messages: a sweep hit
+    /// appends, and a device the *link* answered for is inserted in address
+    /// order in among them. A list that grew by one on one path and not the
+    /// other would put every name below the insertion on the wrong device — a
+    /// table that is confidently wrong, which is worse than a blank one.
+    #[test]
+    fn a_name_lands_on_the_row_it_is_about() {
+        let (tx, mut state) = running();
+        for last in [1, 9] {
+            tx.send(Update::Swept {
+                probed: 1,
+                total: 4,
+                found: 1,
+                hit: Some(Box::new(Found::announced(
+                    address(last),
+                    muster_net::discover::Protocol::Mdns,
+                ))),
+            })
+            .unwrap();
+        }
+        // In between the two, by address, which is where the sweep's own list
+        // would have put it.
+        tx.send(Update::Heard {
+            address: address(5),
+            protocol: muster_net::discover::Protocol::Ssdp,
+        })
+        .unwrap();
+        for last in [9, 5, 1] {
+            let mut identity = Identity::default();
+            identity.add(format!("host{last}"), muster_net::identify::Source::Mdns);
+            tx.send(Update::Named {
+                address: address(last),
+                identity: Box::new(identity),
+            })
+            .unwrap();
+        }
+        assert!(state.poll());
+
+        let devices: Vec<_> = state.devices().iter().map(|d| d.address).collect();
+        assert_eq!(devices.len(), 3, "three devices: {devices:?}");
+        assert_eq!(state.names().len(), devices.len(), "one name per device");
+        for (device, name) in state.devices().iter().zip(state.names()) {
+            let want = match device.address {
+                a if a == address(1) => "host1",
+                a if a == address(5) => "host5",
+                _ => "host9",
+            };
+            assert_eq!(
+                name.best().map(|n| n.value.as_str()),
+                Some(want),
+                "{} is wearing {:?}",
+                device.address,
+                name.best().map(|n| &n.value)
+            );
+        }
+    }
+
+    /// A name for an address that is not on the list is dropped, not given a
+    /// row. `CLAUDE.md`: a name is not a device.
+    #[test]
+    fn a_name_alone_is_not_a_device() {
+        let (tx, mut state) = running();
+        let mut identity = Identity::default();
+        identity.add(
+            "router".to_string(),
+            muster_net::identify::Source::ReverseDns,
+        );
+        tx.send(Update::Named {
+            address: address(7),
+            identity: Box::new(identity),
+        })
+        .unwrap();
+        assert!(state.poll());
+        assert!(state.devices().is_empty(), "a PTR put a row on the list");
+        assert!(state.names().is_empty());
     }
 
     /// An idle or running scan shows no devices rather than a stale list from

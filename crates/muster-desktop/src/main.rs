@@ -414,7 +414,7 @@ fn scan(target: Option<&str>, dhcp: bool, serves: muster_net::service::Options) 
                 ..Default::default()
             },
             &cancel,
-            &|done, total| {
+            &|done, total, _device, _identity| {
                 if live {
                     eprint!("\r  identifying {done} of {total}   ");
                     let _ = std::io::stderr().flush();
@@ -452,7 +452,7 @@ fn scan(target: Option<&str>, dhcp: bool, serves: muster_net::service::Options) 
                 &rate,
                 serves,
                 &cancel,
-                &|done, total| {
+                &|done, total, _device, _serves| {
                     if live {
                         eprint!("\r  asking {done} of {total} what they serve   ");
                         let _ = std::io::stderr().flush();
