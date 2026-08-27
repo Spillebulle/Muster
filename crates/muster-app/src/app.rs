@@ -147,6 +147,37 @@ pub struct App {
     /// wherever an answer changes one, which is what `CLAUDE.md` means by the
     /// setting living in one place.
     updates: Updates,
+    /// What the device table has worked out about the scan, kept between
+    /// frames. See [`Rows`], which holds the reason there is a cache at all.
+    rows: Option<Rows>,
+    /// Where the device table's scroll was left.
+    ///
+    /// Kept because the table draws only the rows on screen: a row the keyboard
+    /// has just moved to may not exist as a widget, so there is nothing to ask
+    /// to scroll itself into view and the offset has to be worked out. See
+    /// [`scroll_to_row`].
+    table_scroll: f32,
+    /// The row the keyboard is on, by address.
+    ///
+    /// By address for the same reason [`Self::selected`] and [`Self::marked`]
+    /// are, and separate from egui's own focus on purpose: a row that is
+    /// scrolled out of the table is not drawn at all, so it cannot be the thing
+    /// egui is holding focus for, and the arrow keys still have to be able to
+    /// walk on to it.
+    focused: Option<std::net::IpAddr>,
+    /// The filter field is to take the keyboard on this frame.
+    ///
+    /// A flag rather than a call, because Ctrl+F is read before the toolbar is
+    /// drawn and the field it names does not exist yet at that point.
+    focus_filter: bool,
+    /// The filter field had the keyboard when the last frame ended.
+    ///
+    /// **Escape is why this is remembered.** egui drops a field's focus at the
+    /// top of the frame the key arrives in, so by the time the table asks who
+    /// has the keyboard the answer is already "nobody" and Escape out of the
+    /// filter would clear the table's focus and close a device window as well.
+    /// Last frame's answer is the one the key was pressed against.
+    filter_focused: bool,
 }
 
 impl App {
@@ -200,6 +231,11 @@ impl App {
             copied: None,
             port_queue: std::collections::VecDeque::new(),
             updates,
+            rows: None,
+            table_scroll: 0.0,
+            focused: None,
+            focus_filter: false,
+            filter_focused: false,
         };
         apply_for(&cc.egui_ctx, Palette::of(app.mode), app.mode);
         app
@@ -253,6 +289,11 @@ impl App {
             copied: None,
             port_queue: std::collections::VecDeque::new(),
             updates,
+            rows: None,
+            table_scroll: 0.0,
+            focused: None,
+            focus_filter: false,
+            filter_focused: false,
         }
     }
 
@@ -1318,37 +1359,167 @@ fn progress(ui: &mut egui::Ui, p: Palette, fraction: Option<f32>) {
     }
 }
 
+/// What the device table is derived from, reduced to four numbers.
+///
+/// The rows are a function of the scan, and a scan changes a handful of times a
+/// second at most: a device answers, a port scan folds its ports back in, a run
+/// ends and the names arrive. Everything else a frame does — hovering,
+/// scrolling, sorting, searching — leaves it alone. So this is what says
+/// whether [`Rows`] is still about the scan in front of the reader.
+///
+/// **The evidence total is the one that is not obvious.**
+/// [`State::record_open_ports`] folds a port scan back into a device that is
+/// already on the list, which moves neither count above and changes both the
+/// Ports cell and the kind guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    /// Which of the three states the scan is in. A finished scan swaps the
+    /// list it was accumulating for the sweep's own, and the two can be the
+    /// same length.
+    phase: u8,
+    devices: usize,
+    names: usize,
+    evidence: usize,
+}
+
+impl Stamp {
+    fn of(scan: &State) -> Self {
+        Self {
+            phase: match scan {
+                State::Idle => 0,
+                State::Running { .. } => 1,
+                State::Finished(_) => 2,
+            },
+            devices: scan.devices().len(),
+            names: scan.names().len(),
+            evidence: scan.devices().iter().map(|d| d.evidence.len()).sum(),
+        }
+    }
+}
+
+/// The table's own copy of the scan, and what it costs to work a row out.
+///
+/// **This exists because the table was doing all of it sixty times a second.**
+/// Every frame cloned the device list, the identity list and the survey out of
+/// the app — so that the drawing loop could still hold the app mutably to set a
+/// selection — and then asked [`muster_net::kind::identify`] what each device
+/// was, once per row to draw it and twice per comparison to sort it. At forty
+/// rows none of that is visible. At two hundred and fifty it is the worst frame
+/// in the application, and none of the work changes between one frame and the
+/// next.
+///
+/// So it is done once per [`Stamp`] and kept. The app *owns* this and
+/// [`devices_view`] takes it out for the length of the frame and puts it back,
+/// which is what leaves the app free to be held mutably while the rows are read
+/// straight out of here.
+struct Rows {
+    stamp: Stamp,
+    devices: Vec<muster_net::discover::Found>,
+    names: Vec<Identity>,
+    /// What each device appears to be and why, in `devices` order.
+    ///
+    /// Parallel to the devices rather than a map keyed by address, because the
+    /// stamp already pins the device list: within one stamp a position *is* an
+    /// address, and a lookup per row per frame would be paying for a fact that
+    /// cannot change.
+    guesses: Vec<Option<muster_net::kind::Guess>>,
+}
+
+impl Rows {
+    fn build(
+        stamp: Stamp,
+        devices: &[muster_net::discover::Found],
+        names: &[Identity],
+        survey: &Survey,
+    ) -> Self {
+        let empty = Identity::default();
+        let guesses = devices
+            .iter()
+            .enumerate()
+            .map(|(i, host)| {
+                let named = names.get(i).unwrap_or(&empty);
+                muster_net::kind::identify(host, named, survey.vantage(host.address))
+            })
+            .collect();
+        Self {
+            stamp,
+            devices: devices.to_vec(),
+            names: names.to_vec(),
+            guesses,
+        }
+    }
+
+    /// The guess for one row, or none where nothing was learned.
+    fn guess(&self, i: usize) -> Option<muster_net::kind::Guess> {
+        self.guesses.get(i).copied().flatten()
+    }
+
+    /// What row `i` is, with [`muster_net::Kind::Unknown`] where nothing was
+    /// learned. A blank kind cell is an answer.
+    fn kind(&self, i: usize) -> muster_net::Kind {
+        self.guess(i).map_or(muster_net::Kind::Unknown, |g| g.kind)
+    }
+}
+
 /// The device list. This is the app, so it is the densest thing in it.
+///
+/// Two lines of bookkeeping and then [`device_table`], which is the drawing.
+/// The split is what makes the cache impossible to leak: the derived rows are
+/// taken out of the app here and put back here, on every path out of the table
+/// including the empty ones.
 fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
-    // Cloned out of the scan so the loop below can hold `app` mutably to set
-    // the selection. A device list is a few dozen rows of small structs; the
-    // alternative is threading a "what was clicked" value out through two
-    // closures to satisfy the borrow checker, which is more code and no faster.
-    let devices: Vec<muster_net::discover::Found> = app.scan.devices().to_vec();
-    let names: Vec<Identity> = app.scan.names().to_vec();
-    // Read once for the whole table rather than per row: the routing table
-    // cannot change while a frame is being drawn, and `kind::identify` only
-    // wants the answer to "is this the way out".
-    let survey = app.survey.clone();
+    let stamp = Stamp::of(&app.scan);
+    let rows = match app.rows.take() {
+        Some(rows) if rows.stamp == stamp => rows,
+        _ => Rows::build(stamp, app.scan.devices(), app.scan.names(), &app.survey),
+    };
+    device_table(ui, p, app, &rows);
+    app.rows = Some(rows);
+}
+
+/// The toolbar, the header and the rows.
+fn device_table(ui: &mut egui::Ui, p: Palette, app: &mut App, rows: &Rows) {
+    let shown = shown_rows(rows, app.sort, &app.search, &app.ping);
+    // **Nothing is read while something is over the table.** A table that
+    // answered an arrow key while somebody was typing in the filter, or Escape
+    // while a menu was open, would be the worst kind of shortcut. Worked out
+    // here rather than inside [`keyboard`] so what it means to be busy is a
+    // reading the caller takes and the keys are a pure function of it.
+    let busy = app.settings.open
+        || !app.updates.notice_seen
+        || app.updates.flow().is_some()
+        || egui::Popup::is_any_open(ui.ctx());
+    // Before the toolbar is drawn, because Ctrl+F names a field that does not
+    // exist yet at this point and Ctrl+A changes what the two menus are about.
+    let jump = keyboard(
+        ui,
+        busy,
+        app.filter_focused,
+        Reachable {
+            focused: &mut app.focused,
+            selected: &mut app.selected,
+            marked: &mut app.marked,
+            filter: &mut app.focus_filter,
+        },
+        rows,
+        &shown,
+    );
 
     // Above the empty state as well as above the table: a scan that found
     // nothing is exactly when somebody wants to change the range. It is drawn
     // after the rows have been decided rather than before, because the two
     // menus in it act on exactly the rows the filter is showing.
-    let shown = shown_rows(app, &devices, &names, &survey);
     devices_toolbar(
         ui,
         p,
         app,
         Table {
-            devices: &devices,
-            names: &names,
-            survey: &survey,
+            rows,
             shown: &shown,
         },
     );
 
-    if devices.is_empty() {
+    if rows.devices.is_empty() {
         let (message, action) = match &app.scan {
             State::Running { .. } => ("Sweeping. Devices appear here as they answer.", None),
             State::Finished(_) => ("Nothing answered on this network.", Some("Scan again")),
@@ -1362,143 +1533,314 @@ fn devices_view(ui: &mut egui::Ui, p: Palette, app: &mut App) {
 
     let marked_here = shown
         .iter()
-        .filter(|i| app.marked.contains(&devices[**i].address))
+        .filter(|i| app.marked.contains(&rows.devices[**i].address))
         .count();
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.add_space(metrics::S2);
-            let before = app.prefs.columns;
-            if let Some(mark_all) = table_header(
+    // **The header is above the scroll area rather than the first thing in
+    // it.** Inside, it scrolled away with the rows: forty devices down a
+    // two-hundred-and-fifty-device table there was nothing left on screen
+    // saying which column was which, and the sort controls and the box that
+    // marks everything had gone with it.
+    ui.add_space(metrics::S2);
+    let before = app.prefs.columns;
+    if let Some(all) = table_header(
+        ui,
+        p,
+        &mut app.sort,
+        Marks::of(marked_here, shown.len()),
+        &mut app.prefs.columns,
+    ) {
+        mark_shown(&mut app.marked, rows, &shown, all);
+    }
+    // A dragged column is a setting like any other, and it is written the
+    // moment it stops changing rather than on every frame of a drag: the file
+    // would otherwise be rewritten sixty times a second for as long as
+    // somebody held the edge.
+    if app.prefs.columns != before && !ui.ctx().input(|i| i.pointer.any_down()) {
+        crate::prefs::save(&app.prefs);
+    }
+
+    if shown.is_empty() {
+        empty_state(ui, p, "Nothing here matches that.", None);
+        return;
+    }
+
+    let widths = app.prefs.columns;
+    let mode = app.mode;
+    let viewport = ui.available_height();
+    let spacing = ui.spacing().item_spacing.y;
+    let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+    // A row an arrow key has just moved on to is very often not drawn at all,
+    // so there is no response to ask to scroll itself into view and the offset
+    // has to be worked out. See [`scroll_to_row`].
+    if let Some(row) = jump {
+        area = area.vertical_scroll_offset(scroll_to_row(app.table_scroll, viewport, row, spacing));
+    }
+    // **`show_rows`, not `show`.** Every row here is exactly `metrics::ROW`
+    // tall, which is the one condition it asks for, and in exchange the table
+    // draws the twenty rows on screen rather than all two hundred and fifty.
+    let out = area.show_rows(ui, metrics::ROW, shown.len(), |ui, range| {
+        for i in &shown[range] {
+            let host = &rows.devices[*i];
+            let selected = app.selected == Some(host.address);
+            let marked = app.marked.contains(&host.address);
+            let ping = if app.ping.waiting_for(host.address) {
+                PingCell::Waiting
+            } else {
+                match app.ping.answer_for(host.address) {
+                    Some(answer) => PingCell::Answer(answer),
+                    None => PingCell::Never,
+                }
+            };
+            let row = device_row(
                 ui,
                 p,
-                &mut app.sort,
-                Marks::of(marked_here, shown.len()),
-                &mut app.prefs.columns,
-            ) {
-                for i in &shown {
-                    let address = devices[*i].address;
-                    if mark_all {
-                        app.marked.insert(address);
-                    } else {
-                        app.marked.remove(&address);
-                    }
-                }
-            }
-            // A dragged column is a setting like any other, and it is written
-            // the moment it stops changing rather than on every frame of a
-            // drag: the file would otherwise be rewritten sixty times a second
-            // for as long as somebody held the edge.
-            if app.prefs.columns != before && !ui.ctx().input(|i| i.pointer.any_down()) {
-                crate::prefs::save(&app.prefs);
-            }
-            let widths = app.prefs.columns;
-            let mode = app.mode;
-            for i in &shown {
-                let host = &devices[*i];
-                let named = names.get(*i);
-                let vantage = survey.vantage(host.address);
-                let selected = app.selected == Some(host.address);
-                let marked = app.marked.contains(&host.address);
-                let ping = if app.ping.waiting_for(host.address) {
-                    PingCell::Waiting
+                host,
+                RowInput {
+                    mode,
+                    named: rows.names.get(*i),
+                    guess: rows.guess(*i),
+                    selected,
+                    marked,
+                    focused: app.focused == Some(host.address),
+                    ping,
+                    widths,
+                },
+            );
+            if row.marked {
+                if marked {
+                    app.marked.remove(&host.address);
                 } else {
-                    match app.ping.answer_for(host.address) {
-                        Some(answer) => PingCell::Answer(answer),
-                        None => PingCell::Never,
-                    }
-                };
-                let row = device_row(
-                    ui,
-                    p,
-                    host,
-                    RowInput {
-                        mode,
-                        named,
-                        vantage,
-                        selected,
-                        marked,
-                        ping,
-                        widths,
-                    },
-                );
-                if row.marked {
-                    if marked {
-                        app.marked.remove(&host.address);
-                    } else {
-                        app.marked.insert(host.address);
-                    }
-                }
-                if row.clicked {
-                    // Clicking the open row shuts the window, which is the way
-                    // back to the table without reaching for a close button.
-                    app.selected = if selected { None } else { Some(host.address) };
+                    app.marked.insert(host.address);
                 }
             }
-            if shown.is_empty() {
-                empty_state(ui, p, "Nothing here matches that.", None);
+            if row.clicked {
+                // Clicking the open row shuts the window, which is the way
+                // back to the table without reaching for a close button. The
+                // keyboard follows the mouse, so the arrows carry on from
+                // whichever row was last touched.
+                app.selected = if selected { None } else { Some(host.address) };
+                app.focused = Some(host.address);
             }
-            ui.add_space(metrics::S2);
-        });
+        }
+    });
+    app.table_scroll = out.state.offset.y;
 }
 
-/// The rows to draw, sorted and filtered, as indices into the scan's own
-/// vectors.
+/// Where the scroll has to be for row `index` to be on screen, given where it
+/// is now.
+///
+/// The **least** movement that does the job, which is what an arrow key is for:
+/// a row one below the fold comes up by one row rather than jumping to the
+/// middle of the window, and a row already in view moves nothing.
+fn scroll_to_row(offset: f32, viewport: f32, index: usize, spacing: f32) -> f32 {
+    let pitch = metrics::ROW + spacing;
+    let top = index as f32 * pitch;
+    let bottom = top + metrics::ROW;
+    if top < offset {
+        top
+    } else if bottom > offset + viewport {
+        (bottom - viewport).max(0.0)
+    } else {
+        offset
+    }
+}
+
+/// Mark, or clear, every row the filter is showing.
+///
+/// **One definition of "everything", shared by the header's box and by Ctrl+A.**
+/// `CLAUDE.md`: everything means everything in front of the reader, and a
+/// second answer to that question is exactly how the two would come to
+/// disagree about it.
+fn mark_shown(
+    marked: &mut std::collections::BTreeSet<std::net::IpAddr>,
+    rows: &Rows,
+    shown: &[usize],
+    on: bool,
+) {
+    for i in shown {
+        let address = rows.devices[*i].address;
+        if on {
+            marked.insert(address);
+        } else {
+            marked.remove(&address);
+        }
+    }
+}
+
+/// The rows to draw, sorted and filtered, as indices into [`Rows`].
 ///
 /// Indices rather than devices: the devices and the names are two parallel
 /// vectors and sorting either one would break the pairing, while sorting pairs
 /// would copy an identity per row per frame.
-fn shown_rows(
-    app: &App,
-    devices: &[muster_net::discover::Found],
-    names: &[Identity],
-    survey: &Survey,
-) -> Vec<usize> {
-    let empty = Identity::default();
-    let mut order: Vec<usize> = (0..devices.len()).collect();
-    let sort = app.sort;
-    order.sort_by(|a, b| {
-        let key = |i: usize| {
-            let host = &devices[i];
-            let named = names.get(i);
-            let vantage = survey.vantage(host.address);
-            let kind = muster_net::kind::kind_of(host, named.unwrap_or(&empty), vantage);
-            sort_key(
+///
+/// **The key is worked out once per row rather than once per comparison.**
+/// `sort_by` asks its closure for both sides of every comparison it makes, so
+/// ordering 250 devices used to be some four thousand kind inferences and as
+/// many allocated strings to produce 250 of each. Decorating first is the same
+/// order and a fraction of the work.
+///
+/// Takes the sort, the filter and the re-checks rather than the whole app, so
+/// a test can hand it a table without a window.
+fn shown_rows(rows: &Rows, sort: Sort, search: &str, ping: &ping::State) -> Vec<usize> {
+    let mut keyed: Vec<((bool, String, u128), usize)> = (0..rows.devices.len())
+        .map(|i| {
+            let host = &rows.devices[i];
+            let key = sort_key(
                 sort.column,
                 host,
-                named,
-                kind,
-                app.ping.rtt_for(host.address),
-            )
-        };
-        let (left, right) = (key(*a), key(*b));
-        // The emptiness flag is the first element of the key and is compared
-        // ascending whichever way the column points, so blank cells stay at
-        // the bottom. See `sort_key`.
+                rows.names.get(i),
+                rows.kind(i),
+                ping.rtt_for(host.address),
+            );
+            (key, i)
+        })
+        .collect();
+    // The emptiness flag is the first element of the key and is compared
+    // ascending whichever way the column points, so blank cells stay at the
+    // bottom. See `sort_key`.
+    keyed.sort_by(|(left, _), (right, _)| {
         left.0.cmp(&right.0).then_with(|| {
-            let rest = (left.1, left.2).cmp(&(right.1, right.2));
+            let rest = (&left.1, left.2).cmp(&(&right.1, right.2));
             if sort.ascending { rest } else { rest.reverse() }
         })
     });
     // Which rows the filter leaves. The header's box and both menus act on
     // exactly these: "everything" means everything in front of the reader,
     // never forty devices a search has hidden.
-    order
+    keyed
         .into_iter()
-        .filter(|i| {
-            let host = &devices[*i];
-            let named = names.get(*i);
-            let vantage = survey.vantage(host.address);
-            let kind = muster_net::kind::kind_of(host, named.unwrap_or(&empty), vantage);
-            matches(&app.search, host, named, kind)
-        })
+        .map(|(_, i)| i)
+        .filter(|i| matches(search, &rows.devices[*i], rows.names.get(*i), rows.kind(*i)))
         .collect()
+}
+
+/// The device table's keys.
+///
+/// **The keyboard is a route to the table, not a decoration on it.** Until this
+/// there was exactly one key handler in the whole application — Escape, in the
+/// update dialog — so a dense table of two hundred and fifty rows could only be
+/// reached with a pointer, and the icon column could only be *read* by hovering
+/// each row in turn for its tooltip. See [`spoken`], which is the other half of
+/// the same gap.
+///
+/// Ctrl+F asks the filter for the keyboard, the arrows walk the rows, Enter
+/// opens the row's window, Space marks it, Ctrl+A marks everything the filter
+/// is showing and Escape steps back out: the window a row opened first, then
+/// the row's own focus.
+///
+/// **Nothing is read while something else has the keyboard or something is over
+/// the table.** `busy` is the second of those and the caller takes that
+/// reading; egui's own focus is the first, and is read here. Ctrl+F is the one
+/// key answered through both, because a filter that cannot be reached from a
+/// focused field is a filter that has to be reached twice.
+///
+/// Returns the row the table has to bring into view, where a key moved the
+/// focus. The table draws only the rows on screen, so a row the focus has just
+/// walked on to may not exist as a widget for [`egui::Response::scroll_to_me`]
+/// to act on.
+///
+/// Takes [`Reachable`] rather than the whole app, which is what lets a test
+/// press a key with no window under it.
+fn keyboard(
+    ui: &egui::Ui,
+    busy: bool,
+    typing: bool,
+    at: Reachable<'_>,
+    rows: &Rows,
+    shown: &[usize],
+) -> Option<usize> {
+    if busy {
+        return None;
+    }
+
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+        *at.filter = true;
+        return None;
+    }
+    if ui.ctx().memory(|m| m.focused().is_some()) {
+        return None;
+    }
+
+    // Where the focus is *now*, as a position in the rows on screen. A focused
+    // device the filter has hidden, or a rescan has dropped, is simply not
+    // here, and the arrows start again from the end they came from.
+    let here = at.focused.and_then(|address| {
+        shown
+            .iter()
+            .position(|i| rows.devices[*i].address == address)
+    });
+
+    let down = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown));
+    let up = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp));
+    if (down || up) && !shown.is_empty() {
+        let last = shown.len() - 1;
+        let row = match (here, down) {
+            (Some(row), true) => (row + 1).min(last),
+            (Some(row), false) => row.saturating_sub(1),
+            (None, true) => 0,
+            (None, false) => last,
+        };
+        *at.focused = Some(rows.devices[shown[row]].address);
+        return Some(row);
+    }
+
+    let focused = here.map(|row| rows.devices[shown[row]].address);
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+        && let Some(address) = focused
+    {
+        *at.selected = Some(address);
+    }
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
+        && let Some(address) = focused
+        && !at.marked.insert(address)
+    {
+        at.marked.remove(&address);
+    }
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
+        mark_shown(at.marked, rows, shown, true);
+    }
+    // `typing` is why Escape is asked about last frame rather than this one:
+    // egui has already dropped the filter field's focus by the time the table
+    // is drawn, so the guard above cannot see who the key was really pressed
+    // at. See [`App::filter_focused`].
+    if !typing && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        // Innermost first: the window a row opened, and then the row's focus.
+        if at.selected.is_some() {
+            *at.selected = None;
+        } else {
+            *at.focused = None;
+        }
+    }
+    None
+}
+
+/// What a key press is allowed to touch.
+///
+/// The four pieces of the app a key reaches, borrowed one at a time rather than
+/// the whole app behind them. `CLAUDE.md`'s rule for the engine is that every
+/// reading is injected and every decision is a pure function of the readings;
+/// this is that rule applied to the one function in the window that reads the
+/// keyboard, and it is what lets [`keyboard`] be tested by pressing keys into a
+/// bare [`egui::Context`] with no window, no adapter and no scan under it.
+struct Reachable<'a> {
+    /// The row the keyboard is on.
+    focused: &'a mut Option<std::net::IpAddr>,
+    /// The device whose window is open.
+    selected: &'a mut Option<std::net::IpAddr>,
+    /// The marks, which Space and Ctrl+A move.
+    marked: &'a mut std::collections::BTreeSet<std::net::IpAddr>,
+    /// Set where Ctrl+F asked the filter field for the keyboard.
+    filter: &'a mut bool,
 }
 
 /// The device-kind icon's column. Narrow: it carries a picture and no text,
 /// and the kind's name is in the row's tooltip rather than in a column of its
 /// own, because a word per row would cost more width than the icon saves.
+///
+/// **The tooltip is not the only place it is written down**, and for a long
+/// time it was: see [`spoken`], which is what the row publishes about itself
+/// and the only route to this column that does not go through a pointer.
 const COL_KIND: f32 = 26.0;
 
 /// The corner radius of a selected table row.
@@ -1509,6 +1851,13 @@ const COL_KIND: f32 = 26.0;
 /// neighbours top and bottom, and rounding each one leaves pale notches down
 /// both edges of the column. Named so the two call sites disagree on purpose.
 const TABLE_SELECTION_RADIUS: f32 = 0.0;
+
+/// §7.11's focus ring, and it is 2 px there too.
+///
+/// Named rather than written at the one call site, because the field's ring
+/// and the row's ring are the same ring and a reader has to be able to see
+/// that they were meant to be.
+const FOCUS_RING: f32 = 2.0;
 
 /// The size the app mark is rasterised at before being scaled into the top bar.
 ///
@@ -2007,6 +2356,14 @@ fn table_header(
     );
     let response = ui.interact(box_rect, ui.id().with("mark-all"), Sense::click());
     checkbox(ui, p, box_rect, marks, response.hovered());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            true,
+            marks == Marks::All,
+            "Mark every device shown",
+        )
+    });
     let pressed = response.clicked().then_some(marks != Marks::All);
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -2324,9 +2681,10 @@ fn device_row(
     let RowInput {
         mode,
         named,
-        vantage,
+        guess,
         selected,
         marked,
+        focused,
         ping,
         widths,
     } = row;
@@ -2364,15 +2722,22 @@ fn device_row(
         if marked { Marks::All } else { Marks::None },
         mark.hovered(),
     );
+    mark.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            true,
+            marked,
+            format!("Mark {}", host.address),
+        )
+    });
     if mark.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     x += COL_MARK;
 
-    // What this device appears to be, and why. The guess is `muster-net`'s;
-    // this file only decides how big to draw it.
-    let empty = Identity::default();
-    let guess = muster_net::kind::identify(host, named.unwrap_or(&empty), vantage);
+    // What this device appears to be, and why. The guess is `muster-net`'s and
+    // is made once per scan rather than once per row per frame; see [`Rows`].
+    // This file only decides how big to draw it.
     let kind = guess.map_or(muster_net::Kind::Unknown, |g| g.kind);
     let icon = Rect::from_center_size(pos2(x + metrics::ICON / 2.0, y), Vec2::splat(metrics::ICON));
     // The cut-outs are filled with whatever the row is sitting on, so a hovered
@@ -2515,6 +2880,34 @@ fn device_row(
 
     hairline_across(ui, p, rect.bottom());
 
+    // §7.11's focus ring: 2 px of `accent_ring`, the family's one focus
+    // indication, and the only thing in the table that says where the keyboard
+    // is. Drawn after the row's own hairline so that hairline does not cut
+    // across it.
+    if focused {
+        ui.painter().rect_stroke(
+            rect,
+            TABLE_SELECTION_RADIUS,
+            Stroke::new(FOCUS_RING, p.accent_ring),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    // **What the row says out loud.** A row painted with `allocate_exact_size`
+    // publishes nothing at all, so a screen reader met two hundred and fifty
+    // anonymous rectangles; worse, the kind column's entire meaning lived in
+    // the tooltip below, which has no keyboard route and is never announced, so
+    // the one column that exists to be read without reading could not be read
+    // at all. Everything the first three cells show is in this sentence.
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            true,
+            selected,
+            spoken(host, named, kind, marked),
+        )
+    });
+
     if response.hovered() {
         let why: Vec<String> = host.evidence.iter().map(|e| e.reason()).collect();
         let mut tip = String::new();
@@ -2573,11 +2966,16 @@ fn device_row(
 struct RowInput<'a> {
     mode: Mode,
     named: Option<&'a Identity>,
-    vantage: muster_net::kind::Vantage,
+    /// What this device appears to be and why, worked out once per scan by
+    /// [`Rows`] rather than once per row per frame here.
+    guess: Option<muster_net::kind::Guess>,
     /// Its panel is open.
     selected: bool,
     /// It is marked for the toolbar's menus.
     marked: bool,
+    /// The keyboard is on it. A different thing from `selected`: the keyboard
+    /// walks rows without opening any of them.
+    focused: bool,
     ping: PingCell<'a>,
     /// The columns as the reader has dragged them. The header owns these and
     /// the row is told, so the two cannot lay the table out differently.
@@ -2594,6 +2992,41 @@ struct Row {
     clicked: bool,
     /// The box at its left: mark or unmark this device.
     marked: bool,
+}
+
+/// What a row is called, in words.
+///
+/// **The kind is spelled out here and nowhere else on the row.** In the table
+/// it is a coloured shape whose name is in a tooltip, and a tooltip is a hover
+/// away from a pointer and infinitely far from anything else: it is not
+/// announced, it cannot be focused, and it is never in the accessibility tree.
+/// So the icon column, which exists so that the printer can be found without
+/// reading, could not be read at all. This is the sentence that fixes that, and
+/// it says the first three columns in the order they are in.
+///
+/// **A kind that was never learned says so.** `CLAUDE.md`'s blank row is an
+/// answer, and "kind not known" is that answer in words rather than a silence a
+/// listener would have to interpret.
+fn spoken(
+    host: &muster_net::discover::Found,
+    named: Option<&Identity>,
+    kind: muster_net::Kind,
+    marked: bool,
+) -> String {
+    let mut said = host.address.to_string();
+    if let Some(name) = named.and_then(Identity::best) {
+        said.push_str(", ");
+        said.push_str(&name.value);
+    }
+    said.push_str(", ");
+    said.push_str(match kind {
+        muster_net::Kind::Unknown => "kind not known",
+        known => known.label(),
+    });
+    if marked {
+        said.push_str(", marked");
+    }
+    said
 }
 
 /// What the Ping column has to show about one device.
@@ -4200,7 +4633,16 @@ fn devices_toolbar(ui: &mut egui::Ui, p: Palette, app: &mut App, table: Table<'_
                 if !app.search.is_empty() && button(ui, p, "Clear", Kind::Ghost, true).clicked() {
                     app.search.clear();
                 }
-                field(ui, p, &mut app.search, 200.0, "Search");
+                let search = field(ui, p, &mut app.search, 200.0, "Search");
+                // What Ctrl+F asked for. [`keyboard`] reads the key before this
+                // field exists — the toolbar's two menus have to know what the
+                // keys did to the marks before they draw — so the request
+                // arrives as a flag rather than as a call.
+                if std::mem::take(&mut app.focus_filter) {
+                    search.request_focus();
+                }
+                // Whose Escape the next one is. See [`App::filter_focused`].
+                app.filter_focused = search.has_focus();
                 ui.label(RichText::new("Filter").size(text::TINY).color(p.text_dim));
             });
         });
@@ -4216,10 +4658,10 @@ fn devices_toolbar(ui: &mut egui::Ui, p: Palette, app: &mut App, table: Table<'_
 /// "which devices" for itself would be a second answer to a question that has
 /// one.
 pub(crate) struct Table<'a> {
-    devices: &'a [muster_net::discover::Found],
-    names: &'a [Identity],
-    survey: &'a Survey,
-    /// Indices into `devices`, in the order the rows are drawn.
+    /// The scan as the table sees it, kinds included: a menu asking what a
+    /// device is gets the same answer the icon column drew.
+    rows: &'a Rows,
+    /// Indices into [`Rows::devices`], in the order the rows are drawn.
     shown: &'a [usize],
 }
 
@@ -4241,7 +4683,7 @@ impl Targets {
         let shown: Vec<std::net::IpAddr> = table
             .shown
             .iter()
-            .map(|i| table.devices[*i].address)
+            .map(|i| table.rows.devices[*i].address)
             .collect();
         let marked: Vec<std::net::IpAddr> = shown
             .iter()
@@ -4500,23 +4942,18 @@ fn copy_menu(ui: &mut egui::Ui, p: Palette, app: &mut App, table: &Table<'_>, ta
     let Some(field) = chosen else {
         return;
     };
-    let empty = Identity::default();
     let mut lines = Vec::new();
     for address in &targets.addresses {
         let Some(i) = table
             .shown
             .iter()
-            .find(|i| table.devices[**i].address == *address)
+            .find(|i| table.rows.devices[**i].address == *address)
         else {
             continue;
         };
-        let host = &table.devices[*i];
-        let named = table.names.get(*i);
-        let kind = muster_net::kind::kind_of(
-            host,
-            named.unwrap_or(&empty),
-            table.survey.vantage(host.address),
-        );
+        let host = &table.rows.devices[*i];
+        let named = table.rows.names.get(*i);
+        let kind = table.rows.kind(*i);
         let value = field_value(field, host, named, kind, app.ping.answer_for(host.address));
         // A blank line is not a value. The count has to be what was actually
         // put on the clipboard or the pill is claiming more than it did.
@@ -4840,7 +5277,7 @@ pub(crate) fn field(
     // hairline otherwise: §7.11, and the one focus indication in the
     // application.
     let (edge, width) = if response.has_focus() {
-        (p.accent_ring, 2.0)
+        (p.accent_ring, FOCUS_RING)
     } else {
         (p.line, metrics::HAIRLINE)
     };
@@ -5189,5 +5626,550 @@ mod tests {
             "the columns want {fixed} and the window is {}",
             crate::WINDOW[0]
         );
+    }
+
+    /// A finished scan holding these devices and these names.
+    fn finished(found: Vec<Found>, names: Vec<Identity>) -> State {
+        State::Finished(Box::new(scan::Outcome {
+            sweep: muster_net::discover::Sweep {
+                found,
+                ..Default::default()
+            },
+            names,
+            prefix: "192.0.2.0/24".parse().unwrap(),
+            dhcp: None,
+        }))
+    }
+
+    /// A scan of `n` devices, every other one advertising a printer so that
+    /// `kind::identify` has its tables to walk rather than an early return.
+    fn a_network_of(n: usize) -> (State, Vec<Identity>) {
+        let mut found = Vec::new();
+        let mut names = Vec::new();
+        for i in 0..n {
+            found.push(at(&format!("192.0.2.{}", i % 254)));
+            names.push(if i % 2 == 0 {
+                Identity {
+                    services: vec!["_ipp._tcp.local".to_string()],
+                    ..Default::default()
+                }
+            } else {
+                Identity::default()
+            });
+        }
+        let scan = finished(found, names.clone());
+        (scan, names)
+    }
+
+    /// A frame that changed nothing leaves the stamp where it was, which is
+    /// what lets the table keep the rows it worked out last frame rather than
+    /// inferring a kind per row sixty times a second.
+    #[test]
+    fn a_frame_that_changed_nothing_leaves_the_stamp_alone() {
+        let (scan, _) = a_network_of(8);
+        assert_eq!(Stamp::of(&scan), Stamp::of(&scan));
+    }
+
+    /// **The one invalidation that is not obvious.** A port scan folds its
+    /// ports back into a device already on the list, which moves neither count
+    /// in the stamp and changes both the Ports cell and the kind guess. A
+    /// stamp that missed it would leave the table showing a device the scan
+    /// had stopped describing.
+    #[test]
+    fn a_port_scan_folded_back_in_moves_the_stamp() {
+        let (mut scan, _) = a_network_of(3);
+        let before = Stamp::of(&scan);
+        let address = scan.devices()[0].address;
+        scan.record_open_ports(address, &[9100]);
+        assert_ne!(before, Stamp::of(&scan), "the evidence changed");
+    }
+
+    /// And so does the phase, because a finished scan swaps the list it was
+    /// accumulating for the sweep's own and the two can be the same length.
+    #[test]
+    fn the_phase_is_part_of_the_stamp() {
+        let (scan, _) = a_network_of(4);
+        assert_ne!(Stamp::of(&State::Idle), Stamp::of(&scan));
+    }
+
+    /// The clue behind a kind is kept beside it, because the row's tooltip
+    /// shows the reason and not only the claim.
+    #[test]
+    fn every_row_carries_the_clue_its_kind_came_from() {
+        let (scan, names) = a_network_of(2);
+        let rows = Rows::build(Stamp::of(&scan), scan.devices(), &names, &Survey::default());
+        assert_eq!(rows.guesses.len(), rows.devices.len());
+        assert_eq!(rows.kind(0), muster_net::Kind::Printer);
+        assert_eq!(
+            rows.guess(0).map(|g| g.clue),
+            Some(muster_net::kind::Clue::Service)
+        );
+        assert_eq!(
+            rows.kind(1),
+            muster_net::Kind::Unknown,
+            "a blank row is an answer"
+        );
+    }
+
+    /// **A frame reads the kind, it does not work it out.** A table of 250
+    /// devices is drawn sixty times a second, and every one of those frames
+    /// used to clone both vectors out of the scan and then ask
+    /// `kind::identify` what each device was: once per row to draw it, and
+    /// twice per comparison to sort it. Some four thousand inferences a frame
+    /// to produce two hundred and fifty facts that had not changed since the
+    /// last one.
+    ///
+    /// Measured over 120 frames of 250 devices while this was written: 57 ms
+    /// for the old comparator against 2.1 ms for this one.
+    ///
+    /// **The guard is deliberately not a stopwatch.** A wall-clock budget is a
+    /// measurement of whichever machine ran it, and the first draft of this
+    /// test failed on a run where the other two hundred tests were using the
+    /// cores. So the cache is filled with an answer nothing could have
+    /// inferred — every device a camera — and then the sort and the filter are
+    /// asked. They can only agree if they are reading [`Rows`]; anything that
+    /// called `kind::identify` a second time would get the printers back.
+    #[test]
+    fn a_frame_reads_the_kind_rather_than_working_it_out_again() {
+        let (scan, names) = a_network_of(6);
+        let mut rows = Rows::build(Stamp::of(&scan), scan.devices(), &names, &Survey::default());
+        assert_eq!(rows.kind(0), muster_net::Kind::Printer, "half are printers");
+
+        rows.guesses.fill(Some(muster_net::kind::Guess {
+            kind: muster_net::Kind::Camera,
+            clue: muster_net::kind::Clue::Service,
+        }));
+        let ping = ping::State::default();
+        assert_eq!(
+            shown_rows(&rows, Sort::default(), "camera", &ping).len(),
+            6,
+            "the filter reads the table's own answer"
+        );
+        assert!(
+            shown_rows(&rows, Sort::default(), "printer", &ping).is_empty(),
+            "and nothing asks the engine a second time"
+        );
+
+        // The sort reads it too, and the sort is where the cost was: `sort_by`
+        // asks its closure for both sides of every comparison it makes.
+        let by_kind = Sort {
+            column: Column::Kind,
+            ascending: true,
+        };
+        let order = shown_rows(&rows, by_kind, "", &ping);
+        assert_eq!(order.len(), 6);
+        assert!(
+            order
+                .iter()
+                .all(|i| rows.kind(*i) == muster_net::Kind::Camera),
+            "every row sorted as what the table says it is"
+        );
+    }
+
+    /// The filter leaves the rows the sort put in order, and it reaches the
+    /// kind the icon column drew rather than a second opinion about it.
+    #[test]
+    fn the_filter_reaches_the_kind_the_icon_column_drew() {
+        let (scan, names) = a_network_of(6);
+        let rows = Rows::build(Stamp::of(&scan), scan.devices(), &names, &Survey::default());
+        let ping = ping::State::default();
+        assert_eq!(shown_rows(&rows, Sort::default(), "", &ping).len(), 6);
+        let printers = shown_rows(&rows, Sort::default(), "printer", &ping);
+        assert_eq!(printers.len(), 3);
+        assert!(printers.iter().all(|i| i % 2 == 0));
+    }
+
+    /// An arrow key moves the table the least it can: a row already on screen
+    /// scrolls nothing, and one just past either edge comes exactly into view
+    /// rather than jumping to the middle of the window.
+    #[test]
+    fn an_arrow_key_scrolls_the_least_it_can() {
+        let pitch = metrics::ROW + metrics::S1;
+        let viewport = pitch * 10.0;
+        assert_eq!(
+            scroll_to_row(0.0, viewport, 3, metrics::S1),
+            0.0,
+            "a row on screen moves nothing"
+        );
+        let down = scroll_to_row(0.0, viewport, 20, metrics::S1);
+        assert!((down - (20.0 * pitch + metrics::ROW - viewport)).abs() < 0.01);
+        assert_eq!(
+            scroll_to_row(500.0, viewport, 2, metrics::S1),
+            2.0 * pitch,
+            "a row above the fold comes to the top edge"
+        );
+        assert!(
+            scroll_to_row(0.0, viewport * 100.0, 0, metrics::S1) >= 0.0,
+            "never above the top of the table"
+        );
+    }
+
+    /// **The kind column could not be read at all before this.** Its meaning
+    /// was in a tooltip, which is a hover away from a pointer and infinitely
+    /// far from anything else, so the row says it in words.
+    #[test]
+    fn a_row_says_its_address_its_name_and_its_kind_in_words() {
+        let named = Identity {
+            names: vec![muster_net::identify::Name {
+                value: "office-printer".into(),
+                source: muster_net::identify::Source::Mdns,
+            }],
+            ..Default::default()
+        };
+        let said = spoken(
+            &at("192.0.2.7"),
+            Some(&named),
+            muster_net::Kind::Printer,
+            false,
+        );
+        assert!(said.contains("192.0.2.7"), "{said}");
+        assert!(said.contains("office-printer"), "{said}");
+        assert!(
+            said.contains(muster_net::Kind::Printer.label()),
+            "the kind is a word and not only a colour: {said}"
+        );
+    }
+
+    /// A device nothing was learned about says so. A blank row is an answer,
+    /// and a silence a listener has to interpret is not one.
+    #[test]
+    fn a_row_that_learned_nothing_says_that_rather_than_nothing() {
+        let said = spoken(&at("192.0.2.8"), None, muster_net::Kind::Unknown, true);
+        assert!(said.contains("kind not known"), "{said}");
+        assert!(said.contains("marked"), "a mark is part of what the row is");
+    }
+
+    /// What one key press leaves behind.
+    ///
+    /// The whole point of [`Reachable`]: the table's keys can be pressed with
+    /// no window, no graphics adapter and no scan under them, so what a key
+    /// does is a test rather than a thing somebody has to sit down and try.
+    #[derive(Default, PartialEq, Eq, Debug)]
+    struct Pressed {
+        focused: Option<std::net::IpAddr>,
+        selected: Option<std::net::IpAddr>,
+        marked: std::collections::BTreeSet<std::net::IpAddr>,
+        filter: bool,
+        jump: Option<usize>,
+    }
+
+    /// Press `key` at a table, starting from `state`, and say what changed.
+    fn press(
+        rows: &Rows,
+        shown: &[usize],
+        mut state: Pressed,
+        modifiers: egui::Modifiers,
+        key: egui::Key,
+        busy: bool,
+        typing: bool,
+    ) -> Pressed {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        let mut jump = None;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                jump = keyboard(
+                    ui,
+                    busy,
+                    typing,
+                    Reachable {
+                        focused: &mut state.focused,
+                        selected: &mut state.selected,
+                        marked: &mut state.marked,
+                        filter: &mut state.filter,
+                    },
+                    rows,
+                    shown,
+                );
+            });
+        });
+        state.jump = jump;
+        state
+    }
+
+    /// A four-device table with nothing filtered out.
+    fn a_table() -> (Rows, Vec<usize>) {
+        let (scan, names) = a_network_of(4);
+        let rows = Rows::build(Stamp::of(&scan), scan.devices(), &names, &Survey::default());
+        let shown = shown_rows(&rows, Sort::default(), "", &ping::State::default());
+        (rows, shown)
+    }
+
+    /// The arrows walk the rows and stop at the ends rather than wrapping: a
+    /// list that wraps loses the reader's place in a table of 250 devices.
+    #[test]
+    fn the_arrows_walk_the_rows_and_stop_at_the_ends() {
+        let (rows, shown) = a_table();
+        let first = rows.devices[shown[0]].address;
+        let last = rows.devices[shown[3]].address;
+
+        // From nowhere, down starts at the top and up starts at the bottom.
+        let down = press(
+            &rows,
+            &shown,
+            Pressed::default(),
+            egui::Modifiers::NONE,
+            egui::Key::ArrowDown,
+            false,
+            false,
+        );
+        assert_eq!(down.focused, Some(first));
+        assert_eq!(down.jump, Some(0), "the table is asked to show it");
+        let up = press(
+            &rows,
+            &shown,
+            Pressed::default(),
+            egui::Modifiers::NONE,
+            egui::Key::ArrowUp,
+            false,
+            false,
+        );
+        assert_eq!(up.focused, Some(last));
+
+        // And neither end wraps.
+        let past_the_top = press(
+            &rows,
+            &shown,
+            Pressed {
+                focused: Some(first),
+                ..Default::default()
+            },
+            egui::Modifiers::NONE,
+            egui::Key::ArrowUp,
+            false,
+            false,
+        );
+        assert_eq!(past_the_top.focused, Some(first));
+        let past_the_end = press(
+            &rows,
+            &shown,
+            Pressed {
+                focused: Some(last),
+                ..Default::default()
+            },
+            egui::Modifiers::NONE,
+            egui::Key::ArrowDown,
+            false,
+            false,
+        );
+        assert_eq!(past_the_end.focused, Some(last));
+    }
+
+    /// Enter opens the focused row's window and Space marks it. Two keys, two
+    /// meanings: the keyboard has the same pair the mouse has.
+    #[test]
+    fn enter_opens_the_row_and_space_marks_it() {
+        let (rows, shown) = a_table();
+        let second = rows.devices[shown[1]].address;
+        let from = || Pressed {
+            focused: Some(second),
+            ..Default::default()
+        };
+
+        let opened = press(
+            &rows,
+            &shown,
+            from(),
+            egui::Modifiers::NONE,
+            egui::Key::Enter,
+            false,
+            false,
+        );
+        assert_eq!(opened.selected, Some(second));
+        assert!(opened.marked.is_empty(), "opening is not marking");
+
+        let marked = press(
+            &rows,
+            &shown,
+            from(),
+            egui::Modifiers::NONE,
+            egui::Key::Space,
+            false,
+            false,
+        );
+        assert_eq!(marked.marked.iter().copied().collect::<Vec<_>>(), [second]);
+        assert!(marked.selected.is_none(), "marking is not opening");
+
+        // And Space again takes the mark off, which is what a mark is.
+        let cleared = press(
+            &rows,
+            &shown,
+            marked,
+            egui::Modifiers::NONE,
+            egui::Key::Space,
+            false,
+            false,
+        );
+        assert!(cleared.marked.is_empty());
+    }
+
+    /// **Ctrl+A means everything in front of the reader**, which is the set the
+    /// header's box and both menus already act on. It reaches the filtered rows
+    /// and nothing else, because a shortcut that reached devices a search had
+    /// hidden is the one surprise this control cannot afford.
+    #[test]
+    fn ctrl_a_marks_everything_the_filter_is_showing_and_no_more() {
+        let (scan, names) = a_network_of(6);
+        let rows = Rows::build(Stamp::of(&scan), scan.devices(), &names, &Survey::default());
+        let printers = shown_rows(&rows, Sort::default(), "printer", &ping::State::default());
+        assert_eq!(printers.len(), 3, "the filter is hiding half the table");
+
+        let all = press(
+            &rows,
+            &printers,
+            Pressed::default(),
+            egui::Modifiers::COMMAND,
+            egui::Key::A,
+            false,
+            false,
+        );
+        let wanted: std::collections::BTreeSet<_> =
+            printers.iter().map(|i| rows.devices[*i].address).collect();
+        assert_eq!(all.marked, wanted);
+    }
+
+    /// Escape steps back out, innermost first: the window a row opened, and
+    /// only then the row's own focus.
+    #[test]
+    fn escape_closes_the_window_before_it_drops_the_focus() {
+        let (rows, shown) = a_table();
+        let first = rows.devices[shown[0]].address;
+        let open = Pressed {
+            focused: Some(first),
+            selected: Some(first),
+            ..Default::default()
+        };
+        let closed = press(
+            &rows,
+            &shown,
+            open,
+            egui::Modifiers::NONE,
+            egui::Key::Escape,
+            false,
+            false,
+        );
+        assert_eq!(closed.selected, None);
+        assert_eq!(closed.focused, Some(first), "the row keeps the keyboard");
+
+        let dropped = press(
+            &rows,
+            &shown,
+            closed,
+            egui::Modifiers::NONE,
+            egui::Key::Escape,
+            false,
+            false,
+        );
+        assert_eq!(dropped.focused, None);
+    }
+
+    /// **Escape out of the filter belongs to the filter.** egui drops a text
+    /// field's focus at the top of the frame the key arrives in, so the table
+    /// cannot see who the key was pressed at and has to be told: without that,
+    /// one Escape emptied the field's focus, closed the open device window and
+    /// dropped the row's focus, all at once.
+    #[test]
+    fn escape_out_of_the_filter_leaves_the_table_alone() {
+        let (rows, shown) = a_table();
+        let first = rows.devices[shown[0]].address;
+        let open = Pressed {
+            focused: Some(first),
+            selected: Some(first),
+            ..Default::default()
+        };
+        let after = press(
+            &rows,
+            &shown,
+            open,
+            egui::Modifiers::NONE,
+            egui::Key::Escape,
+            false,
+            true,
+        );
+        assert_eq!(after.selected, Some(first), "the window stays open");
+        assert_eq!(after.focused, Some(first), "and the row keeps the keyboard");
+    }
+
+    /// Ctrl+F asks the filter for the keyboard rather than acting on a row.
+    #[test]
+    fn ctrl_f_asks_the_filter_for_the_keyboard() {
+        let (rows, shown) = a_table();
+        let asked = press(
+            &rows,
+            &shown,
+            Pressed::default(),
+            egui::Modifiers::COMMAND,
+            egui::Key::F,
+            false,
+            false,
+        );
+        assert!(asked.filter);
+        assert_eq!(asked.focused, None, "it is not a move");
+    }
+
+    /// **Nothing is read while something is over the table.** A menu is open,
+    /// or the settings page, or the update dialog: the keys belong to that and
+    /// a table answering them underneath is the worst kind of shortcut.
+    #[test]
+    fn a_key_is_left_alone_while_something_is_over_the_table() {
+        let (rows, shown) = a_table();
+        for key in [
+            egui::Key::ArrowDown,
+            egui::Key::Enter,
+            egui::Key::Space,
+            egui::Key::Escape,
+            egui::Key::F,
+            egui::Key::A,
+        ] {
+            let busy = press(
+                &rows,
+                &shown,
+                Pressed {
+                    focused: Some(rows.devices[shown[1]].address),
+                    selected: Some(rows.devices[shown[1]].address),
+                    ..Default::default()
+                },
+                egui::Modifiers::COMMAND,
+                key,
+                true,
+                false,
+            );
+            assert_eq!(
+                busy.focused,
+                Some(rows.devices[shown[1]].address),
+                "{key:?}"
+            );
+            assert_eq!(
+                busy.selected,
+                Some(rows.devices[shown[1]].address),
+                "{key:?}"
+            );
+            assert!(busy.marked.is_empty(), "{key:?}");
+            assert!(!busy.filter, "{key:?}");
+        }
+    }
+
+    /// An empty table has nowhere for an arrow key to go, and says so by not
+    /// going anywhere rather than by indexing off the end of it.
+    #[test]
+    fn an_arrow_key_over_an_empty_table_does_nothing() {
+        let (rows, _) = a_table();
+        let nothing = press(
+            &rows,
+            &[],
+            Pressed::default(),
+            egui::Modifiers::NONE,
+            egui::Key::ArrowDown,
+            false,
+            false,
+        );
+        assert_eq!(nothing, Pressed::default());
     }
 }
