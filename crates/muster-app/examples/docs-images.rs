@@ -421,6 +421,7 @@ fn scan() -> Outcome {
             mac: Some(MacAddr::new(*mac)),
             evidence: evidence.clone(),
             rtt: Some(Duration::from_micros(*rtt)),
+            ttl: None,
         })
         .collect();
 

@@ -262,7 +262,16 @@ wearing a confident face.
 - **Fingerprinting states its confidence and its method.** Initial TTL and TCP
   window from a single SYN-ACK give a coarse OS class for free and should be
   taken; nmap-grade active fingerprinting is a much larger probe set and a much
-  larger claim. Label which one answered.
+  larger claim. Label which one answered. **The TTL half of that needed no raw
+  socket at all**, which this file had wrong for a long time by filing it under
+  the privileged engine: an ICMP echo *reply* carries a TTL, both platforms
+  already hand it over — Windows in `ICMP_ECHO_REPLY`'s options, a raw ICMP
+  socket on Linux in the IP header, a ping socket through `IP_RECVTTL` — and
+  the sweep was already sending the echo. `discover::Stack` rounds it up to 64,
+  128 or 255 and `kind::Clue::Stack` is what the ranking does with it, last of
+  all: **only the Windows band names a kind**, because 64 is every kind there
+  is and 255 is three of them, and a value too far below a band is left blank
+  rather than rounded to the nearest guess.
 - **A device that sends a datagram is a device, and it goes on the list.** This
   is the rule the link phase and the listen exist for, and for a long time the
   engine had it backwards: the multicast questions ran *inside*

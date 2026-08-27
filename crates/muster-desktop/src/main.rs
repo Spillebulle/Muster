@@ -1036,6 +1036,7 @@ mod tests {
                     mac: Some(mac),
                     evidence: vec![Evidence::Arp(mac), Evidence::Ping],
                     rtt: Some(Duration::from_micros(300)),
+                    ttl: Some(64),
                 },
                 // The wide case: a randomised MAC and a three-digit time.
                 Found {
@@ -1043,6 +1044,7 @@ mod tests {
                     mac: Some(randomised),
                     evidence: vec![Evidence::Arp(randomised)],
                     rtt: Some(Duration::from_millis(937)),
+                    ttl: None,
                 },
                 // No hardware address and no timing at all: found by a refusal.
                 Found {
@@ -1050,6 +1052,7 @@ mod tests {
                     mac: None,
                     evidence: vec![Evidence::TcpRefused(443)],
                     rtt: None,
+                    ttl: None,
                 },
             ],
             probed: 3,

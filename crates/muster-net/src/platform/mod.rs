@@ -17,6 +17,29 @@ pub mod procfs;
 pub mod tcp;
 pub mod udp;
 
+/// The TTL an IPv4 datagram arrived with, out of the header in front of it.
+///
+/// The reading a raw socket needs, because a raw socket is handed the whole
+/// datagram rather than the payload; a ping socket is handed the payload and
+/// has to be told to send the TTL along beside it. See `linux::echo`.
+///
+/// **Here rather than in the Linux module**, which is where its only caller
+/// is, because it is a pure reading of a recorded packet and this file compiles
+/// on every platform. That means the test for it runs on the machine Muster is
+/// developed on as well as on the ones that use it, which for a byte offset
+/// into a header is the difference between a checked reading and a hopeful one.
+///
+/// The offset is fixed and the header's *length* is not, which is why this
+/// reads the version rather than the length: byte 8 is the TTL in every IPv4
+/// header, options or no options, and anything that is not IPv4 is not read at
+/// all.
+pub fn datagram_ttl(datagram: &[u8]) -> Option<u8> {
+    if datagram.first()? >> 4 != 4 {
+        return None;
+    }
+    datagram.get(8).copied()
+}
+
 /// What to do about it, when this machine will not let Muster send an ICMP
 /// echo.
 ///
@@ -109,7 +132,7 @@ pub use unsupported::Host;
 
 #[cfg(not(any(windows, target_os = "linux")))]
 mod unsupported {
-    use crate::discover::{Capabilities, Outcome, Transport};
+    use crate::discover::{Capabilities, Echo, Outcome, Transport};
     use crate::mac::MacAddr;
     use crate::sysinfo::{Interface, Neighbour, Route, SystemProbe};
     use std::io;
@@ -155,11 +178,76 @@ mod unsupported {
         fn arp(&self, _: Ipv4Addr, _: Duration) -> io::Result<Option<MacAddr>> {
             Err(no("hardware addresses"))
         }
-        fn ping(&self, _: IpAddr, _: Duration) -> io::Result<Option<Duration>> {
+        fn ping(&self, _: IpAddr, _: Duration) -> io::Result<Option<Echo>> {
             Err(no("ICMP echoes"))
         }
         fn tcp(&self, addr: IpAddr, port: u16, timeout: Duration) -> Outcome {
             super::tcp::knock(addr, port, timeout)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::datagram_ttl;
+    use crate::discover::Stack;
+
+    /// A recorded echo reply as a raw socket hands it over: the IPv4 header,
+    /// then the ICMP message. Only the header is written out, because the TTL
+    /// is in it and nothing below byte 20 is read here.
+    ///
+    /// `ttl` goes in at byte 8 and `ihl` is the header length in 32-bit words,
+    /// which is 5 with no options and more with them.
+    fn recorded(ihl: u8, ttl: u8) -> Vec<u8> {
+        let mut ip = vec![0u8; usize::from(ihl) * 4];
+        let total = ip.len() as u16 + 8;
+        ip[0] = 0x40 | ihl;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip[8] = ttl;
+        ip[9] = 1; // IPPROTO_ICMP.
+        ip[12..16].copy_from_slice(&[192, 168, 1, 1]);
+        ip[16..20].copy_from_slice(&[192, 168, 1, 42]);
+        // The echo reply itself: type 0, code 0, and the rest of the header.
+        ip.extend_from_slice(&[0, 0, 0, 0, 0x1e, 0x2f, 0, 1]);
+        ip
+    }
+
+    /// Three recorded replies, read through the whole chain: the byte out of
+    /// the header, and the band it rounds up to.
+    #[test]
+    fn the_ttl_comes_out_of_a_recorded_reply_and_names_a_stack() {
+        assert_eq!(datagram_ttl(&recorded(5, 64)), Some(64));
+        assert_eq!(
+            datagram_ttl(&recorded(5, 64)).and_then(Stack::of),
+            Some(Stack::Unix)
+        );
+        assert_eq!(
+            datagram_ttl(&recorded(5, 128)).and_then(Stack::of),
+            Some(Stack::Windows)
+        );
+        // A router two hops off, which is what the rounding is for.
+        assert_eq!(
+            datagram_ttl(&recorded(5, 253)).and_then(Stack::of),
+            Some(Stack::Embedded)
+        );
+    }
+
+    /// The header's length varies and the TTL's offset does not, so a reply
+    /// carrying IP options must read the same. A reader that skipped `ihl * 4`
+    /// bytes and then looked would find a byte of the payload.
+    #[test]
+    fn a_header_carrying_options_is_read_at_the_same_offset() {
+        assert_eq!(datagram_ttl(&recorded(9, 64)), Some(64));
+    }
+
+    /// And what is not read: anything that is not IPv4, and anything too short
+    /// to hold the field. Neither is a TTL of zero.
+    #[test]
+    fn a_datagram_that_is_not_ipv4_or_is_too_short_reads_nothing() {
+        let mut six = recorded(5, 64);
+        six[0] = 0x60;
+        assert_eq!(datagram_ttl(&six), None);
+        assert_eq!(datagram_ttl(&[]), None);
+        assert_eq!(datagram_ttl(&recorded(5, 64)[..8]), None);
     }
 }

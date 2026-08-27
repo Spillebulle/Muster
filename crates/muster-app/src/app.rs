@@ -4851,6 +4851,7 @@ mod tests {
             mac: None,
             evidence: vec![Evidence::Arp(MacAddr::new([0, 0, 0, 0, 0, 1]))],
             rtt: None,
+            ttl: None,
         }
     }
 
