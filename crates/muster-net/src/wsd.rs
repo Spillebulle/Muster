@@ -234,8 +234,14 @@ impl Match {
         }
         match (maker, model) {
             (Some(maker), Some(model)) => {
-                let same = model.to_ascii_lowercase().starts_with(&maker.to_ascii_lowercase());
-                Some(if same { model } else { format!("{maker} {model}") })
+                let same = model
+                    .to_ascii_lowercase()
+                    .starts_with(&maker.to_ascii_lowercase());
+                Some(if same {
+                    model
+                } else {
+                    format!("{maker} {model}")
+                })
             }
             (None, Some(model)) => Some(model),
             // A maker with no model names nobody's hardware, so it is not a

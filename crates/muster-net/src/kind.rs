@@ -1158,7 +1158,11 @@ mod tests {
         identity.hap = Some(18);
         let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
         assert_eq!(guess.kind, Kind::Camera, "18 is a video doorbell");
-        assert_eq!(guess.clue, Clue::Service, "a number in a protocol, not free text");
+        assert_eq!(
+            guess.clue,
+            Clue::Service,
+            "a number in a protocol, not free text"
+        );
     }
 
     /// A category nobody has heard of is not a kind. HomeKit's list grows, and
@@ -1169,7 +1173,11 @@ mod tests {
         let mut identity = advertising(&["_hap._tcp"]);
         identity.hap = Some(99);
         let guess = identify(&host(&[], None), &identity, Vantage::default()).expect("a guess");
-        assert_eq!(guess.kind, Kind::SmartHome, "the service is still a service");
+        assert_eq!(
+            guess.kind,
+            Kind::SmartHome,
+            "the service is still a service"
+        );
     }
 
     /// The table is Apple's list, and the rows that are missing from it are as
@@ -1182,8 +1190,15 @@ mod tests {
         seen.dedup();
         assert_eq!(seen.len(), count, "a category cannot name two kinds");
         for (id, kind) in HAP_CATEGORIES {
-            assert!((3..=36).contains(id), "{id} is not a category Apple defines");
-            assert_ne!(*kind, Kind::Unknown, "a row that names nothing is not a row");
+            assert!(
+                (3..=36).contains(id),
+                "{id} is not a category Apple defines"
+            );
+            assert_ne!(
+                *kind,
+                Kind::Unknown,
+                "a row that names nothing is not a row"
+            );
         }
         // `Other`, `Bridge` and `Target controller` name no kind, and a bridge
         // is a Hue hub as readily as it is a computer running Homebridge.
