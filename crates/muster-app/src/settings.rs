@@ -460,6 +460,27 @@ fn scanning(ui: &mut egui::Ui, p: Palette, state: &mut State, prefs: &mut Prefs)
         },
     );
 
+    // A datagram, and off with the three above it all the same. The wording
+    // says what the question actually is, because "SNMP" and "default
+    // community" are the two halves somebody needs to decide: it is the
+    // community the standard publishes, sent once, and there is no second one.
+    row(
+        ui,
+        p,
+        "Read SNMP descriptions",
+        Some(
+            "One query on port 161 for the three things an agent publishes about \
+             itself. It carries public, the community the standard names as the \
+             default, sent once and never followed by a second one.",
+        ),
+        |ui| {
+            let mut on = prefs.scan_snmp;
+            if toggle(ui, p, &mut on) {
+                prefs.scan_snmp = on;
+            }
+        },
+    );
+
     ui.add_space(metrics::S4);
     eyebrow(ui, p, "TARGET");
     row(

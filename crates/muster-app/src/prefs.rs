@@ -155,6 +155,17 @@ pub struct Prefs {
     /// Read the greeting an SSH server volunteers, which costs it a connection
     /// and this machine nothing to send: see `muster_net::service`.
     pub scan_ssh: bool,
+    /// Ask each device that answered for the three objects an SNMP agent
+    /// publishes about itself.
+    ///
+    /// **Off, and for a conduct reason rather than a technical one**, which is
+    /// why it sits with the three above rather than with the datagram questions
+    /// it otherwise resembles. The question carries `public`, the community the
+    /// standard names as the default; it is sent once and no second string is
+    /// ever tried, because a list of them would be credential guessing. Many
+    /// agents log a request they refuse. So it is a deliberate act, and then it
+    /// is remembered. See `muster_net::snmp`.
+    pub scan_snmp: bool,
     /// Ask this network's own resolver for a name for every address in it.
     ///
     /// **On, where the three above are off, and the difference is who is being
@@ -197,6 +208,7 @@ impl Default for Prefs {
             scan_smb: false,
             scan_nfs: false,
             scan_ssh: false,
+            scan_snmp: false,
             scan_reverse: true,
             scan_listen: true,
         }
@@ -282,6 +294,7 @@ pub fn parse(text: &str) -> Prefs {
             "scan_smb" => prefs.scan_smb = flag,
             "scan_nfs" => prefs.scan_nfs = flag,
             "scan_ssh" => prefs.scan_ssh = flag,
+            "scan_snmp" => prefs.scan_snmp = flag,
             "scan_reverse" => prefs.scan_reverse = flag,
             "scan_listen" => prefs.scan_listen = flag,
             // Not a flag, and the only line here that is a list of figures.
@@ -323,6 +336,7 @@ pub fn render(prefs: &Prefs) -> String {
     out.push_str(&format!("scan_smb = {}\n", prefs.scan_smb));
     out.push_str(&format!("scan_nfs = {}\n", prefs.scan_nfs));
     out.push_str(&format!("scan_ssh = {}\n", prefs.scan_ssh));
+    out.push_str(&format!("scan_snmp = {}\n", prefs.scan_snmp));
     out.push_str(&format!("scan_reverse = {}\n", prefs.scan_reverse));
     out.push_str(&format!("scan_listen = {}\n", prefs.scan_listen));
     out.push_str(&format!(
@@ -389,6 +403,7 @@ mod tests {
             scan_smb: true,
             scan_nfs: false,
             scan_ssh: true,
+            scan_snmp: true,
             scan_reverse: false,
             scan_listen: false,
             columns: crate::app::Widths {

@@ -59,6 +59,8 @@ pub struct Options {
     pub nfs: bool,
     /// Read the greeting an SSH server volunteers. Nothing is sent.
     pub ssh: bool,
+    /// Ask each device that answered what its SNMP agent says about it.
+    pub snmp: bool,
     /// Ask this network's own resolver for a name for every address in it.
     ///
     /// Separate from [`Self::identify`] because it is a different kind of
@@ -83,6 +85,15 @@ impl Options {
             ..Default::default()
         }
     }
+
+    /// What [`muster_net::snmp`] is to be asked. One place, for the same reason
+    /// [`Self::serving`] is one place.
+    pub fn asking_agents(self) -> muster_net::snmp::Options {
+        muster_net::snmp::Options {
+            ask: self.snmp,
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for Options {
@@ -99,6 +110,11 @@ impl Default for Options {
             smb: false,
             nfs: false,
             ssh: false,
+            // A datagram rather than a connection, and off with the three
+            // above it all the same: it carries the standard's default
+            // community string, which is a thing a lot of agents write down.
+            // See `prefs::Prefs::scan_snmp`.
+            snmp: false,
             // On, and it is the only new question here that is. It goes to one
             // server that already holds the answers, it never leaves the link,
             // and it is what names the devices that are asleep.
@@ -156,6 +172,10 @@ pub enum Update {
         done: usize,
         total: usize,
     },
+    Asking {
+        done: usize,
+        total: usize,
+    },
     Listening {
         left: Duration,
         window: Duration,
@@ -196,6 +216,16 @@ pub enum Phase {
         done: usize,
         total: usize,
     },
+    /// Asking the devices that answered what their SNMP agent says about them.
+    ///
+    /// A phase of its own rather than a question inside identification, for the
+    /// same reason [`Self::Serving`] is one: it is usually not asked at all,
+    /// and a bar that said "Identifying" while a switched-on extra ran would be
+    /// counting something the reader did not ask for.
+    Asking {
+        done: usize,
+        total: usize,
+    },
     /// Sitting on the discovery ports with nothing left to ask.
     ///
     /// It ran through every phase above it and this is only what is left of its
@@ -219,7 +249,11 @@ impl Phase {
     pub fn fraction(self) -> Option<f32> {
         match self {
             Self::Sweeping { probed, total } if total > 0 => Some(probed as f32 / total as f32),
-            Self::Identifying { done, total } | Self::Serving { done, total } if total > 0 => {
+            Self::Identifying { done, total }
+            | Self::Serving { done, total }
+            | Self::Asking { done, total }
+                if total > 0 =>
+            {
                 Some(done as f32 / total as f32)
             }
             // The seconds are the total, and they are knowable.
@@ -236,6 +270,9 @@ impl Phase {
             Self::Identifying { done, total } => format!("Identifying {done} of {total}"),
             Self::Serving { done, total } => {
                 format!("Asking {done} of {total} what they serve")
+            }
+            Self::Asking { done, total } => {
+                format!("Asking {done} of {total} over SNMP")
             }
             Self::Listening { left, .. } => {
                 format!("Listening for {} more seconds", left.as_secs() + 1)
@@ -396,6 +433,10 @@ impl State {
                     }
                     Ok(Update::Identifying { done, total }) => {
                         *phase = Phase::Identifying { done, total };
+                        moved = true;
+                    }
+                    Ok(Update::Asking { done, total }) => {
+                        *phase = Phase::Asking { done, total };
                         moved = true;
                     }
                     Ok(Update::Serving { done, total }) => {
@@ -772,6 +813,29 @@ fn run(job: Job) {
             );
             for (identity, serves) in names.iter_mut().zip(serving.iter()) {
                 identity.serves(serves);
+            }
+        }
+
+        // And what their SNMP agents say about them. A datagram phase like
+        // identification and a switched-on extra like the one above, so it runs
+        // here rather than inside `identify::one`: this is the question that
+        // reaches the switch, the access point and the printer that answered
+        // every other question with silence.
+        if opts.asking_agents().any() && !cancel.load(Ordering::SeqCst) {
+            let agents = muster_net::snmp::many(
+                &addresses,
+                &muster_net::platform::udp::Udp,
+                &rate,
+                opts.asking_agents(),
+                &cancel,
+                &|done, total| {
+                    let _ = tx.send(Update::Asking { done, total });
+                },
+            );
+            for (identity, agent) in names.iter_mut().zip(agents) {
+                if identity.snmp.is_none() {
+                    identity.snmp = agent;
+                }
             }
         }
 

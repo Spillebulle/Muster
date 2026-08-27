@@ -50,6 +50,7 @@ pub mod prefix;
 pub mod rate;
 pub mod service;
 pub mod siphash;
+pub mod snmp;
 pub mod ssdp;
 pub mod survey;
 pub mod sysinfo;
