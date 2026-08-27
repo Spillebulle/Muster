@@ -343,6 +343,16 @@ impl Evidence {
 pub struct Found {
     pub address: IpAddr,
     pub mac: Option<MacAddr>,
+    /// Where [`Self::mac`] came from, when the device *said* it rather than
+    /// its own stack answering for it.
+    ///
+    /// [`None`] means an ARP reply or this machine's neighbour table produced
+    /// the address, which is a claim of a different order: those are written
+    /// below the level anything on the device has an opinion about, and every
+    /// route here is the device writing its address into a payload it
+    /// composed. `CLAUDE.md` asks that a claim carry its reason, and this is
+    /// that reason for the hardware column. See [`crate::claim`].
+    pub mac_said: Option<crate::claim::Route>,
     /// Every reason, in the order they were obtained. Never empty: a `Found`
     /// with no evidence is a host nothing attests to, and this module does not
     /// build one.
@@ -368,6 +378,7 @@ impl Found {
         Self {
             address,
             mac: None,
+            mac_said: None,
             evidence: vec![Evidence::Announced(protocol)],
             rtt: None,
             ttl: None,
@@ -379,6 +390,7 @@ impl Found {
         Self {
             address,
             mac: Some(mac),
+            mac_said: None,
             evidence: vec![Evidence::Neighbour],
             rtt: None,
             ttl: None,
@@ -673,6 +685,7 @@ impl Sweep {
                 // already known is never overwritten.
                 if existing.mac.is_none() {
                     existing.mac = host.mac;
+                    existing.mac_said = host.mac_said;
                 }
                 if existing.rtt.is_none() {
                     existing.rtt = host.rtt;
@@ -708,8 +721,15 @@ impl Sweep {
         match self.found.binary_search_by_key(&address, |f| f.address) {
             Ok(at) => {
                 let existing = &mut self.found[at];
-                if existing.mac.is_none() {
+                // An address the device *said* yields to one a stack answered.
+                // The table is what the kernel wrote down after a frame came
+                // back; a stated address is the device's own account of
+                // itself, and the two are not the same claim. Nothing is lost
+                // by preferring this one — the account is kept whole in
+                // [`crate::identify::Identity::said`].
+                if existing.mac.is_none() || existing.mac_said.is_some() {
                     existing.mac = Some(mac);
+                    existing.mac_said = None;
                 }
                 false
             }
@@ -1115,6 +1135,9 @@ fn probe_one<T: Transport>(
     (!evidence.is_empty()).then_some(Found {
         address,
         mac,
+        // The sweep only ever learns an address from an ARP reply or the
+        // neighbour table, and neither is the device speaking.
+        mac_said: None,
         evidence,
         rtt,
         ttl,
@@ -1406,6 +1429,7 @@ mod tests {
         sweep.found.push(Found {
             address: ip("192.168.1.9"),
             mac: None,
+            mac_said: None,
             evidence: vec![Evidence::Ping],
             rtt: Some(Duration::from_millis(3)),
             ttl: Some(64),
@@ -1436,6 +1460,7 @@ mod tests {
         sweep.found.push(Found {
             address: ip("192.168.1.9"),
             mac: Some(mac),
+            mac_said: None,
             evidence: vec![Evidence::Arp(mac)],
             rtt: None,
             ttl: None,

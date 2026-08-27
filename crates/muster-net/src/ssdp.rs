@@ -170,6 +170,32 @@ pub struct Announcement {
 }
 
 impl Announcement {
+    /// The device's own identifier, out of `USN`, kept whole.
+    ///
+    /// **This used to be thrown away.** [`Self::types`] splits `USN` on the
+    /// `::` and keeps the half after it, and the half before it — the `UDN` —
+    /// was dropped on the floor. UPnP Device Architecture requires that
+    /// identifier to be fixed over time and to survive a reboot, which makes
+    /// it the most stable thing a television or a set-top box ever says about
+    /// itself, and those are precisely the devices ARP is worst at. Carried as
+    /// an opaque string; nothing here reads meaning into it beyond
+    /// [`Self::hardware`].
+    pub fn udn(&self) -> Option<String> {
+        self.usn.as_deref().and_then(crate::claim::udn_of)
+    }
+
+    /// The hardware address this reply states, where it states one.
+    ///
+    /// A `UDN` is an identifier rather than an address field, and two of the
+    /// ways one is built put the interface's address in it: Sonos writes it
+    /// after `RINCON_`, and the RFC 4122 time-and-MAC algorithm that UPnP
+    /// recommends puts it in the node field. Neither is a promise, so
+    /// [`crate::claim`] checks the shape before believing it and the route is
+    /// carried beside the address all the way to the screen.
+    pub fn hardware(&self) -> Option<crate::claim::Claim> {
+        self.usn.as_deref().and_then(crate::claim::from_usn)
+    }
+
     /// Every type this reply claims, both the header's and the one folded into
     /// `USN`, lower cased for matching.
     pub fn types(&self) -> Vec<String> {

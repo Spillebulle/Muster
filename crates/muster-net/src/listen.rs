@@ -282,6 +282,9 @@ fn read(watch: &Watch, datagrams: Vec<(IpAddr, Vec<u8>)>) -> Vec<(IpAddr, Protoc
                     if entry.mac.is_none() {
                         entry.mac = status.mac;
                     }
+                    if let Some(mac) = status.mac {
+                        entry.says(crate::claim::Claim::new(mac, crate::claim::Route::NetBios));
+                    }
                 }
             }
             Protocol::Dns => {}

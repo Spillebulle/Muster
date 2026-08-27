@@ -15,3 +15,8 @@ Thumbs.db
 *.pcap
 *.pcapng
 !crates/muster-net/tests/data/*.pcap
+
+# Worktrees this session's agents worked in. Real git worktrees, so they
+# carry a `.git` file and get swept up as embedded repositories by a bare
+# `git add -A`; the branches they hold are already in this repository.
+/.claude/worktrees/

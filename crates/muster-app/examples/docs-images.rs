@@ -419,6 +419,7 @@ fn scan() -> Outcome {
         .map(|(host, mac, evidence, rtt)| Found {
             address: v4(192, 0, 2, *host),
             mac: Some(MacAddr::new(*mac)),
+            mac_said: None,
             evidence: evidence.clone(),
             rtt: Some(Duration::from_micros(*rtt)),
             ttl: None,
