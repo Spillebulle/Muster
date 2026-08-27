@@ -3,6 +3,65 @@
 The notes for each version are what the GitHub release publishes, verbatim.
 Newest first.
 
+## 0.0.16
+
+Added
+
+- **Devices now say their own hardware address, and Muster listens.** A device
+  found only because it was overheard has no ARP reply behind it, so its
+  vendor column was blank - which is the column that tells a nameless row from
+  a nameless row made by Espressif. Ten protocols write a hardware address
+  into something they already send: a NetBIOS node status, an ESPHome `mac=`,
+  Avahi's `_workstation` name, an AirPlay `deviceid`, a Chromecast's `bs`, a
+  Sonos identifier, a Matter host name and a UPnP or WS-Discovery identifier
+  built the one way that puts one there. Where the address is inferred rather
+  than stated the IEEE registry is the test, because a hex string of the right
+  shape is not a hardware address, and a device saying its own is a weaker
+  claim than a stack answering for it - so the interface says which happened.
+  HomeKit's identifier looks exactly like one and is deliberately refused: it
+  is random by design.
+- **A HomeKit accessory now says which kind it is.** Every one of them was a
+  smart home icon; the accessory category is in the reply Muster was already
+  reading, so the cameras, doorbells, televisions and speakers now look like
+  what they are.
+- **The reply to a ping carries a hint about the stack that sent it**, and the
+  hint is free: the TTL is in the reply already. Rounded to the nearest of the
+  three initial values, it tells a Windows stack from a Unix-like one, and only
+  the Windows band names a kind, because 64 is every other kind on the list.
+  It is ranked below everything a device actually said about itself.
+- **SMB now answers more than whether it is there.** The negotiate reply
+  carries the dialect, the server's clock and, on Windows, its uptime; a server
+  that will go no higher than the Vista-era dialect is worth seeing. Muster can
+  also ask whether SMB1 is still spoken, which is off unless you ask for it.
+- **Networks that hand out a captive portal address now say so**, read from the
+  DHCP offer itself rather than by making a request that gets intercepted.
+- **A camera or printer that answers WS-Discovery now gives up its model**,
+  which was in the reply and being dropped. The friendly name beside it is not
+  read, because that is what somebody typed during the installation.
+- **Muster can ask a device for its SNMP description**, which reaches the
+  switches, access points, printers and power supplies that answer nothing
+  else on the network and were the blank rows. It is off unless you ask for
+  it, it sends one question carrying `public` - the community the standard
+  names as the default - and it never sends a second.
+- **Ping history now has arithmetic under it**: how many were sent, how many
+  answered, the best, the mean and the worst, and the jitter. Probes this
+  machine could not send are counted apart and left out of the loss, because a
+  question never asked is not an answer never given.
+
+Changed
+
+- **The device list is quick again at two hundred rows.** Every frame was
+  working out what kind each device was, twice per comparison while sorting,
+  and copying the whole list to do it. It now works each one out once and
+  draws only the rows on screen. Measured over a table of 250: 57 ms a frame
+  before, 2.1 ms after.
+- **The device list can be driven from the keyboard.** Ctrl+F to search, the
+  arrows to move, Enter to open a device, Space to mark it, Ctrl+A to mark
+  everything the search is showing, Escape to come back out. Each row now also
+  says its address, its name and its kind in words to a screen reader, which
+  the icon column could not do at all when its only explanation was a tooltip.
+- **The device table's heading stays put** while the list scrolls under it.
+
 ## 0.0.15
 
 Changed

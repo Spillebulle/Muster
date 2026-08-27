@@ -11,8 +11,15 @@ Windows and Linux, installable and self-updating.
 **Released and building out.** The survey, the sweep, identification by name
 and vendor, device-kind inference, the `connect()` port scan, DHCP discovery,
 SSDP and UPnP, the link phase and the passive listen, the window, the text
-mode, the packaging and the updater are all built. The
-**privileged engine** is not: no raw transport, so no SYN scan, no ARP sweep,
+mode, the packaging and the updater are all built. So are `snmp.rs`, the
+hardware addresses devices state about themselves (`claim.rs`), the stack hint
+in an echo reply, and `http.rs`/`igd.rs` for following an SSDP `LOCATION`.
+**Two of those are engine-only and reach no user yet**: `igd.rs` is never
+called by a scan, and `anomaly.rs` - the cross-row findings, duplicate names
+and hardware addresses, a device with no lease, a link that isolates its
+clients - is never called by the window. Both want an interface pass, and
+until they get one they are not features. The
+**privileged engine** is not built: no raw transport, so no SYN scan, no ARP sweep,
 no passive fingerprinting and no LLDP or CDP. Neither is IPv6 sweeping.
 `README.md`'s "What is not there yet" is the user-facing list and is kept
 honest.
@@ -53,6 +60,20 @@ Rejected, so they do not come back:
   hosted apps and Muster does not use it. Desktop app, not stamped.
 - **A second binary for the GUI.** Two things to package, sign and update, and
   two things to keep in step.
+- **A build targeting an old Android SDK to get the neighbour table.** This one
+  is real and was checked rather than assumed, which is why it is written down:
+  AOSP's `seapp_contexts` picks an app's SELinux domain from its
+  *targetSdkVersion*, and `untrusted_app_30.te` still carries
+  `allow untrusted_app_30 self:netlink_route_socket nlmsg_getneigh;`. So an app
+  declaring `targetSdkVersion 30` can read ARP and NDP on a current device, and
+  a build outside Play is not bound by Play's floor. It is refused anyway. It
+  costs a second engine and a second capability report against a project whose
+  first decision is one binary; Play Protect shows every installer *"built for
+  an older version of Android"*, on a network scanner; the whole build would be
+  frozen at Android 11 semantics for ever; and the grant carries an
+  `auditallow`, meaning its removal is already instrumented. The addresses
+  `claim.rs` reads out of payloads work on every Android, on both builds, and
+  on the desktop.
 
 ## Commands
 
@@ -202,7 +223,7 @@ port 68, passive stack fingerprinting, LLDP/CDP listening.
 Unprivileged, and more capable than it sounds:
 
 - **Windows.** `SendARP` resolves a MAC for an address with no elevation at all,
-  and `IcmpSendEcho2` pings. `GetAdaptersAddresses`, `GetIpForwardTable2` and
+  and `IcmpSendEcho` pings. `GetAdaptersAddresses`, `GetIpForwardTable2` and
   `GetIpNetTable2` give the interfaces, the gateway, the DNS servers and the
   neighbour table.
 - **Linux.** Netlink gives the routes and the neighbour table; `SOCK_DGRAM`
@@ -232,10 +253,10 @@ The devices announce themselves. Ask before probing:
 | Source | Gives |
 |---|---|
 | mDNS / DNS-SD (`_services._dns-sd._udp.local`) | hostnames, service list, Apple `_device-info._tcp` model strings, printers, Chromecasts. Built |
-| SSDP / UPnP | device type URNs and a `SERVER` product string, from the headers; a description URL, and from it manufacturer, model and serial, which is not fetched yet. Built |
+| SSDP / UPnP | device type URNs and a `SERVER` product string, from the headers; a description URL, and from it manufacturer, model and serial. The `USN` also carries a UDN the specification requires to be stable across reboots, which is the best identifier there is for a device ARP cannot reach. Built, `igd.rs`, not yet wired into a scan |
 | NetBIOS name service (UDP 137) | Windows names and workgroup |
 | LLMNR | names on modern Windows networks. Asked; no device on the network this was developed against has answered one, and it stays because it costs a datagram and is the only question a Windows machine with NetBIOS switched off answers |
-| DHCP (`dhcp.rs`) | **all** offers, not the first — two offers is a rogue DHCP server, and detecting that is a feature, not an error case. Built, and part of a scan when the scan menu says so |
+| DHCP (`dhcp.rs`) | option 114's captive-portal URL, which is the only way to know a network is a portal without making a request that gets intercepted; and **all** offers, not the first — two offers is a rogue DHCP server, and detecting that is a feature, not an error case. Built, and part of a scan when the scan menu says so |
 | DNS (`version.bind`, CHAOS) | which devices are name servers, and what software they run. Built |
 | LLDP / CDP (privileged, passive) | the switch, and the port a device is on |
 | TLS certificates on any open port | subject and SAN, often the best identifier on the network |
@@ -327,7 +348,7 @@ wearing a confident face.
   DHCP and DNS are datagrams and belong with the rest of `identify`; SMB, NFS
   and SSH cannot be asked without a TCP connection, so they are a phase of their
   own with a transport of their own and one recorded fake behind it. Each sends
-  the protocol's *opening move* and nothing else: an SMB2 `NEGOTIATE`, an ONC
+  the protocol's *opening move* and nothing else: an SMB2 `NEGOTIATE` (and, when asked for, an SMB1 one beside it, offering **only** SMB1 dialects, because a list carrying `SMB 2.002` would get an SMB2 answer from a machine with SMB1 removed and reading that as SMB1 is the lie this whole module exists to refuse), an ONC
   RPC `NULL` call, and for SSH nothing at all, because a server greets whoever
   connects. Two rules came out of writing them and are worth keeping. **A reply
   in the protocol is the test, never a successful one** — a server refusing
@@ -454,7 +475,7 @@ Two things the design language decides for this application specifically:
   columns align. This is the screen everything else hangs off.
 - **The device icons are colourful, and that is a stated departure.** §11 of
   the style guide asks for one stroke set and §2.5 reserves colour for state;
-  the kind icons are filled shapes in eleven hues. The reason is that twelve
+  the kind icons are filled shapes in twelve hues. The reason is that twelve
   monochrome outlines are twelve things to *read*, and the column exists so that
   the printer can be found without reading. What keeps it in the family:
   **no icon names a colour.** Every one is `theme::hued`, the accent's own
