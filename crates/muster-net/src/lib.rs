@@ -34,6 +34,7 @@
 pub mod dhcp;
 pub mod discover;
 pub mod dns;
+pub mod http;
 pub mod identify;
 pub mod kind;
 pub mod link;
