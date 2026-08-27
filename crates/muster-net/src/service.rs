@@ -30,7 +30,14 @@
 //!   costs another packet - it arrived in the answer to the question that was
 //!   already being asked, and for a long time it was counted as a `bool` and
 //!   dropped. See [`Smb`].
-
+//!
+//! * **SMB1**, on the same port and behind the same switch, as a second
+//!   opening. A server that answers an SMB1 `NEGOTIATE` with a dialect has
+//!   proved it speaks SMB1, which is a thing an administrator would want to
+//!   know about a machine on their network and which nothing else here can
+//!   establish. It is reported as what it is, "it answered an SMB1 negotiate",
+//!   and never as a grade, a score or a warning. Muster says what answered;
+//!   what to do about it is not its opinion to have.
 //! * **NFS**, port 2049. The same question asked of the other half of the
 //!   world. The opening is an ONC RPC `NULL` call to the NFS programme, which
 //!   is the no-op the protocol defines for exactly this: it asks the server to
@@ -169,6 +176,15 @@ pub struct Smb {
     /// more than a banner. Muster reports what the field said; it does not name
     /// an operating system on the strength of it.
     pub started: Option<SystemTime>,
+    /// The SMB1 dialect the server chose, where it was asked and chose one.
+    ///
+    /// One of [`SMB1_DIALECTS`], because it can only be one of the dialects
+    /// that were offered. [`None`] is "it did not answer an SMB1 negotiate, or
+    /// it answered by refusing every dialect", and a refusal here is a server
+    /// saying it does not speak SMB1 - which is the opposite claim from the one
+    /// a refusal makes in SMB2, and the reason this field is read from the
+    /// chosen dialect rather than from the reply having arrived.
+    pub smb1: Option<&'static str>,
 }
 
 impl Smb {
@@ -226,6 +242,9 @@ impl Smb {
                 Some(number) => format!("an SMB2 dialect of {number:#06x}"),
                 None => "answered without settling on a dialect".to_string(),
             }),
+        }
+        if let Some(dialect) = self.smb1 {
+            parts.push(format!("answered an SMB1 negotiate as {dialect}"));
         }
         if let Some(skew) = self.skew(now)
             && skew.abs() >= 60
@@ -310,6 +329,29 @@ pub fn one<S: Speak>(address: IpAddr, speak: &S, rate: &Bucket, opts: Options) -
         ) && smb_answered(&reply)
         {
             serves.smb = Some(smb_details(&reply));
+        }
+
+        // The SMB1 question, on a connection of its own because a `NEGOTIATE`
+        // is a connection's first packet and there is no second one to send.
+        //
+        // **It rides on the same switch rather than getting one of its own.**
+        // The question the switch asks is "may Muster connect to this device
+        // and ask what it serves", and somebody who has answered yes has
+        // answered it for both halves of the same question about the same
+        // service on the same port. A second switch would be a second thing to
+        // find, for a second connection to a port already being connected to.
+        rate.wait();
+        if let Ok(reply) = speak.speak(
+            SocketAddr::new(address, SMB_PORT),
+            &smb1_negotiate(),
+            opts.timeout,
+            MOST,
+        ) && smb_answered(&reply)
+        {
+            // A device that answers only here is a file server too, and an old
+            // enough NAS answers nothing else.
+            let details = serves.smb.get_or_insert_with(Smb::default);
+            details.smb1 = smb1_dialect(&reply);
         }
     }
 
@@ -574,6 +616,107 @@ fn filetime(raw: u64) -> Option<SystemTime> {
 /// Seconds between the `FILETIME` epoch and the Unix one.
 const FILETIME_EPOCH: u64 = 11_644_473_600;
 
+/// The SMB1 dialects offered, oldest first, which is the order the protocol
+/// requires and the order a server's `DialectIndex` counts in.
+///
+/// **Only SMB1 dialects are here, and that is the whole honesty of this
+/// probe.** A client may put `SMB 2.002` and `SMB 2.???` at the end of this
+/// list, and every modern server answers those with an SMB2 message - so a
+/// probe that offered them would be answered by a machine with SMB1 removed
+/// entirely, and reading that answer as "it speaks SMB1" would be exactly the
+/// lie this module exists to avoid. Offering nothing but SMB1 means the only
+/// thing that can choose a dialect here is a server that speaks one.
+pub const SMB1_DIALECTS: [&str; 6] = [
+    "PC NETWORK PROGRAM 1.0",
+    "LANMAN1.0",
+    "Windows for Workgroups 3.1a",
+    "LM1.2X002",
+    "LANMAN2.1",
+    "NT LM 0.12",
+];
+
+/// An SMB1 `NEGOTIATE` request: the opening move of the older protocol.
+///
+/// The same shape of question as [`smb_negotiate`] and the same conduct: a
+/// fixed 32-byte header, a word count of zero, and a list of dialect strings.
+/// No credential, no name, and nothing about this machine - the process id, the
+/// tree id and the user id are all left at zero or at the wildcard, because a
+/// probe has no session to identify.
+///
+/// `NT_STATUS` is set in the flags so that the reply reports its status as one
+/// thirty-two-bit code rather than as the DOS class-and-code pair, which is the
+/// difference between reading one field and reading two.
+pub fn smb1_negotiate() -> Vec<u8> {
+    let mut msg = Vec::with_capacity(64);
+    msg.extend_from_slice(&SMB1_MAGIC);
+    msg.push(SMB_COM_NEGOTIATE);
+    msg.extend_from_slice(&0u32.to_le_bytes()); // Status
+    msg.push(0x18); // Flags: case insensitive, canonicalised paths
+    msg.extend_from_slice(&0x4001u16.to_le_bytes()); // Flags2: long names, NT status
+    msg.extend_from_slice(&0u16.to_le_bytes()); // PIDHigh
+    msg.extend_from_slice(&[0u8; 8]); // SecurityFeatures
+    msg.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+    msg.extend_from_slice(&0xffffu16.to_le_bytes()); // TID: no tree connected
+    msg.extend_from_slice(&0u16.to_le_bytes()); // PIDLow
+    msg.extend_from_slice(&0u16.to_le_bytes()); // UID
+    msg.extend_from_slice(&0u16.to_le_bytes()); // MID
+
+    msg.push(0); // WordCount: a negotiate carries no words
+    let mut dialects = Vec::new();
+    for dialect in SMB1_DIALECTS {
+        // Each is a buffer-format byte, the name, and a terminator.
+        dialects.push(0x02);
+        dialects.extend_from_slice(dialect.as_bytes());
+        dialects.push(0);
+    }
+    msg.extend_from_slice(&(dialects.len() as u16).to_le_bytes()); // ByteCount
+    msg.extend_from_slice(&dialects);
+
+    nbss(&msg)
+}
+
+/// `SMB_COM_NEGOTIATE`, the only SMB1 command this module can build.
+const SMB_COM_NEGOTIATE: u8 = 0x72;
+/// The `DialectIndex` a server sends when it will speak none of what it was
+/// offered.
+const NO_DIALECT: u16 = 0xffff;
+
+/// Which SMB1 dialect the server chose, if it chose one.
+///
+/// **A reply is not the test here, and that is a departure worth stating.**
+/// Everywhere else in this module a reply in the protocol is the whole of the
+/// claim, because the claim is "there is a file server here" and a server that
+/// refuses a request has still proved that. The claim here is narrower - "it
+/// speaks SMB1" - and a server that answers an SMB1 negotiate with
+/// `DialectIndex` 0xFFFF has said the opposite of it: those are the words for
+/// "none of those, thank you", which is what a Samba built with SMB1 disabled
+/// answers. So the evidence is the dialect it picked, and nothing else.
+///
+/// An error status is read the same way, for the same reason.
+pub fn smb1_dialect(reply: &[u8]) -> Option<&'static str> {
+    let header = [0usize, 4]
+        .into_iter()
+        .find(|at| reply.get(*at..at + 4) == Some(&SMB1_MAGIC))?;
+    if *reply.get(header + 4)? != SMB_COM_NEGOTIATE {
+        return None;
+    }
+    if reply.get(header + 5..header + 9)? != [0, 0, 0, 0] {
+        return None;
+    }
+    // `WordCount`, then the first word, which is the chosen dialect's index
+    // into the list that was sent. A response with no words at all is a server
+    // that answered without answering.
+    if *reply.get(header + 32)? == 0 {
+        return None;
+    }
+    let index = reply
+        .get(header + 33..header + 35)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))?;
+    (index != NO_DIALECT)
+        .then(|| SMB1_DIALECTS.get(index as usize).copied())
+        .flatten()
+}
+
 /// The NFS programme number, its version, and the call's id. All three fixed by
 /// the protocol, except the last, which is fixed by us. See [`one`].
 const NFS_PROGRAM: u32 = 100_003;
@@ -685,6 +828,11 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         replies: BTreeMap<SocketAddr, Vec<u8>>,
+        /// What answers the *SMB1* opening, which goes to the same address and
+        /// the same port as the SMB2 one and is a different question. Keyed by
+        /// address alone, a fake would answer both with one datagram, which is
+        /// the one thing a recorded transport must not do.
+        smb1: BTreeMap<SocketAddr, Vec<u8>>,
         spoken: Mutex<Vec<(SocketAddr, Vec<u8>)>>,
     }
 
@@ -697,7 +845,12 @@ mod tests {
             _most: usize,
         ) -> io::Result<Vec<u8>> {
             self.spoken.lock().unwrap().push((to, opening.to_vec()));
-            match self.replies.get(&to) {
+            let table = if opening.get(4..8) == Some(&SMB1_MAGIC) {
+                &self.smb1
+            } else {
+                &self.replies
+            };
+            match table.get(&to) {
                 Some(reply) => Ok(reply.clone()),
                 None => Err(io::Error::new(io::ErrorKind::TimedOut, "nothing answered")),
             }
@@ -780,6 +933,36 @@ mod tests {
         nbss(&msg)
     }
 
+    /// An SMB1 `NEGOTIATE` response choosing the dialect at `index`, or
+    /// refusing them all with 0xFFFF.
+    ///
+    /// **Constructed from MS-CIFS §2.2.4.52.2 rather than captured.** The word
+    /// count is the seventeen a server sends when it has chosen `NT LM 0.12`;
+    /// only the first word is read here, and a refusal carries one word.
+    fn smb1_negotiate_response(index: u16) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(64);
+        msg.extend_from_slice(&SMB1_MAGIC);
+        msg.push(SMB_COM_NEGOTIATE);
+        msg.extend_from_slice(&0u32.to_le_bytes()); // Status
+        msg.push(0x98); // Flags: a reply
+        msg.extend_from_slice(&0x4001u16.to_le_bytes()); // Flags2
+        msg.extend_from_slice(&0u16.to_le_bytes()); // PIDHigh
+        msg.extend_from_slice(&[0u8; 8]); // SecurityFeatures
+        msg.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+        msg.extend_from_slice(&0xffffu16.to_le_bytes()); // TID
+        msg.extend_from_slice(&0u16.to_le_bytes()); // PIDLow
+        msg.extend_from_slice(&0u16.to_le_bytes()); // UID
+        msg.extend_from_slice(&0u16.to_le_bytes()); // MID
+
+        let words: u8 = if index == NO_DIALECT { 1 } else { 17 };
+        msg.push(words);
+        msg.extend_from_slice(&index.to_le_bytes());
+        msg.extend_from_slice(&vec![0u8; (words as usize - 1) * 2]);
+        msg.extend_from_slice(&0u16.to_le_bytes()); // ByteCount
+
+        nbss(&msg)
+    }
+
     /// The instant [`CLOCK`] names, as this machine would hold it.
     fn noon() -> SystemTime {
         std::time::UNIX_EPOCH + Duration::from_secs(CLOCK_UNIX)
@@ -834,6 +1017,7 @@ mod tests {
         assert_eq!(smb.guid, Some(GUID));
         assert_eq!(smb.clock, Some(noon()));
         assert_eq!(smb.uptime(), Some(Duration::from_secs(12 * 86_400)));
+        assert_eq!(smb.smb1, None, "nothing asked it about SMB1");
     }
 
     /// The unframed shape, which some devices answer with and which
@@ -943,6 +1127,123 @@ mod tests {
         assert_eq!(short.dialect, Some(0x0300));
         assert_eq!(short.clock, None);
         assert_eq!(short.started, None);
+    }
+
+    /// **The whole honesty of the SMB1 probe.** A client may offer `SMB 2.002`
+    /// at the end of an SMB1 dialect list, and then a machine with SMB1
+    /// removed answers - in SMB2. Reading that as "it speaks SMB1" is the lie
+    /// this list is written to make impossible.
+    #[test]
+    fn the_smb1_negotiate_offers_nothing_but_smb1() {
+        let msg = smb1_negotiate();
+        let text = String::from_utf8_lossy(&msg);
+        assert!(!text.contains("SMB 2"), "no SMB2 dialect may be offered");
+        assert!(text.contains("NT LM 0.12"));
+        assert!(text.contains("PC NETWORK PROGRAM 1.0"));
+
+        let length = u32::from_be_bytes([0, msg[1], msg[2], msg[3]]) as usize;
+        assert_eq!(length, msg.len() - 4);
+        assert_eq!(&msg[4..8], &SMB1_MAGIC);
+        assert_eq!(msg[4 + 4], SMB_COM_NEGOTIATE);
+        // A negotiate carries no words, and the byte count is the rest of it.
+        assert_eq!(msg[4 + 32], 0);
+        let bytes = u16::from_le_bytes([msg[4 + 33], msg[4 + 34]]) as usize;
+        assert_eq!(bytes, msg.len() - 4 - 35);
+        // And nothing about this machine goes out in it.
+        assert!(msg[4 + 14..4 + 22].iter().all(|b| *b == 0));
+    }
+
+    /// A chosen dialect is the evidence, and a refusal is the opposite of it.
+    #[test]
+    fn only_a_chosen_dialect_proves_smb1() {
+        assert_eq!(
+            smb1_dialect(&smb1_negotiate_response(5)),
+            Some("NT LM 0.12")
+        );
+        assert_eq!(
+            smb1_dialect(&smb1_negotiate_response(0)),
+            Some("PC NETWORK PROGRAM 1.0")
+        );
+        // 0xFFFF is the server saying "none of those", which is what a Samba
+        // built without SMB1 answers. It is a reply, and it is a reply saying
+        // the opposite of what a badge would claim.
+        assert_eq!(smb1_dialect(&smb1_negotiate_response(NO_DIALECT)), None);
+        // An index outside the list that was offered names no dialect.
+        assert_eq!(smb1_dialect(&smb1_negotiate_response(9)), None);
+        // And an SMB2 answer to the SMB1 question is not an SMB1 answer.
+        assert_eq!(
+            smb1_dialect(&smb2_negotiate_response(0x0302, CLOCK, STARTED, 0)),
+            None
+        );
+        assert_eq!(smb1_dialect(b""), None);
+    }
+
+    /// A server with SMB1 left on says so, and it is said as a fact rather
+    /// than as a grade: this module reports what answered and has no opinion
+    /// about it.
+    #[test]
+    fn a_server_that_speaks_smb1_says_so_on_its_own_row() {
+        let mut fake = Fake::default();
+        fake.replies.insert(
+            at("192.168.1.21", SMB_PORT),
+            smb2_negotiate_response(0x0302, CLOCK, 0, 0),
+        );
+        fake.smb1
+            .insert(at("192.168.1.21", SMB_PORT), smb1_negotiate_response(5));
+
+        let serves = one(
+            "192.168.1.21".parse().unwrap(),
+            &fake,
+            &Bucket::new(1_000_000),
+            everything(),
+        );
+        let smb = serves.smb.expect("a file server");
+        assert_eq!(smb.dialect_label(), Some("SMB 3.0.2"));
+        assert_eq!(smb.smb1, Some("NT LM 0.12"));
+        assert!(smb.stated(noon()).contains("answered an SMB1 negotiate"));
+
+        // Two connections to 445, and the second one asked a different
+        // question. One reply cannot be allowed to answer both.
+        let spoken = fake.spoken.lock().unwrap();
+        let to_smb: Vec<&Vec<u8>> = spoken
+            .iter()
+            .filter(|(to, _)| to.port() == SMB_PORT)
+            .map(|(_, opening)| opening)
+            .collect();
+        assert_eq!(to_smb.len(), 2);
+        assert_eq!(to_smb[0].get(4..8), Some(&SMB2_MAGIC[..]));
+        assert_eq!(to_smb[1].get(4..8), Some(&SMB1_MAGIC[..]));
+    }
+
+    /// An old enough NAS answers the SMB1 question and nothing else, and it is
+    /// a file server.
+    #[test]
+    fn a_server_that_answers_only_smb1_is_still_a_file_server() {
+        let mut fake = Fake::default();
+        fake.smb1
+            .insert(at("192.168.1.22", SMB_PORT), smb1_negotiate_response(5));
+        let serves = one(
+            "192.168.1.22".parse().unwrap(),
+            &fake,
+            &Bucket::new(1_000_000),
+            everything(),
+        );
+        let smb = serves.smb.expect("a file server");
+        assert_eq!(smb.dialect, None, "it never answered in SMB2");
+        assert_eq!(smb.smb1, Some("NT LM 0.12"));
+    }
+
+    /// The switch covers both openings, and with it off neither goes out.
+    #[test]
+    fn the_smb1_question_is_behind_the_switch_the_rest_is_behind() {
+        let fake = Fake::default();
+        one(
+            "192.168.1.23".parse().unwrap(),
+            &fake,
+            &Bucket::new(1_000_000),
+            Options::default(),
+        );
+        assert!(fake.spoken.lock().unwrap().is_empty());
     }
 
     #[test]
