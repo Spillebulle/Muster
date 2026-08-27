@@ -36,6 +36,7 @@ pub mod discover;
 pub mod dns;
 pub mod http;
 pub mod identify;
+pub mod igd;
 pub mod kind;
 pub mod link;
 pub mod listen;
