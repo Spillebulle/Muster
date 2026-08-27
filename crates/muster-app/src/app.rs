@@ -3402,6 +3402,44 @@ fn detail_window(ctx: &egui::Context, p: Palette, app: &mut App) {
                             other => other.label().to_string(),
                         };
                         fact_row(ui, p, "Made by", &vendor);
+                        // **Where the address came from, and it is two
+                        // different claims.** An ARP reply is written by the
+                        // far end's kernel and there is nothing in it a device
+                        // has an opinion about; every route this names is the
+                        // device writing its own address into a payload. A row
+                        // that does not say which is a row asking to be
+                        // trusted more than it has earned.
+                        match host.mac_said {
+                            Some(route) => {
+                                fact_row(ui, p, "Said over", route.label());
+                                ui.label(
+                                    RichText::new(route.reason())
+                                        .size(text::TINY)
+                                        .color(p.text_dim),
+                                );
+                            }
+                            None => fact_row(ui, p, "Learned by", "its answer to a request"),
+                        }
+                    }
+                    // Two routes disagreeing is information, so both are
+                    // shown: usually a device stating a second interface, and
+                    // occasionally something answering on another machine's
+                    // behalf.
+                    if named.disputed_mac() {
+                        let others: Vec<String> = named
+                            .said
+                            .iter()
+                            .filter(|c| Some(c.mac) != host.mac)
+                            .map(|c| format!("{} ({})", c.mac, c.route.label()))
+                            .collect();
+                        fact_row(ui, p, "Also said", &others.join(", "));
+                    }
+                    // The device's own identifier, which UPnP requires to
+                    // outlive a reboot. Kept because it is the most stable
+                    // thing a television ever says about itself; nothing here
+                    // reads meaning into it.
+                    if let Some(udn) = &named.udn {
+                        fact_row(ui, p, "Identifier", udn);
                     }
                     // The model the device named for itself, above the names other
                     // people gave it: it is the most specific thing on the row and it
@@ -4849,6 +4887,7 @@ mod tests {
         Found {
             address: address.parse().unwrap(),
             mac: None,
+            mac_said: None,
             evidence: vec![Evidence::Arp(MacAddr::new([0, 0, 0, 0, 0, 1]))],
             rtt: None,
         }

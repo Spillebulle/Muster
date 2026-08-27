@@ -591,6 +591,14 @@ fn device_row(
     let name = truncate(best.map(|n| n.value.as_str()).unwrap_or(""), W_NAME);
 
     let mut why: Vec<String> = host.evidence.iter().map(|e| e.reason()).collect();
+    // Where the hardware address came from, but only where the device *said*
+    // it. An address a stack answered needs no note: it is what the two ARP
+    // and neighbour reasons above already mean. One a device wrote into a
+    // payload is a weaker claim and the row says so rather than showing it
+    // beside the others as though they were the same thing.
+    if let Some(route) = host.mac_said {
+        why.push(format!("address said over {}", route.label()));
+    }
     if let Some(best) = best {
         why.push(format!("named by {}", best.source.label()));
     }
@@ -1034,6 +1042,7 @@ mod tests {
                 Found {
                     address: "192.168.0.1".parse().unwrap(),
                     mac: Some(mac),
+                    mac_said: None,
                     evidence: vec![Evidence::Arp(mac), Evidence::Ping],
                     rtt: Some(Duration::from_micros(300)),
                 },
@@ -1041,6 +1050,7 @@ mod tests {
                 Found {
                     address: "192.168.0.11".parse().unwrap(),
                     mac: Some(randomised),
+                    mac_said: None,
                     evidence: vec![Evidence::Arp(randomised)],
                     rtt: Some(Duration::from_millis(937)),
                 },
@@ -1048,6 +1058,7 @@ mod tests {
                 Found {
                     address: "10.0.0.254".parse().unwrap(),
                     mac: None,
+                    mac_said: None,
                     evidence: vec![Evidence::TcpRefused(443)],
                     rtt: None,
                 },
