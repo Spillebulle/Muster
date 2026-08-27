@@ -434,7 +434,12 @@ impl Identity {
 /// * **Case.** NetBIOS names are conventionally upper case and mDNS names are
 ///   not, so a NAS answering both is `TRUENAS` and `truenas.local` — which
 ///   compared literally is a dispute on nearly every machine that runs Samba.
-fn canonical(name: &str) -> String {
+///
+/// Public because the same normalisation decides a question one row cannot
+/// answer: [`crate::anomaly`] compares names *across* devices, and a second
+/// implementation of this would have two devices sharing `nas.local` and
+/// `NAS` read as two names on one network and one name on another.
+pub fn canonical(name: &str) -> String {
     name.trim_end_matches('.')
         .trim_end_matches(".local")
         .trim_end_matches(".lan")
