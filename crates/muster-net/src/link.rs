@@ -1185,6 +1185,7 @@ SERVER: TP-LINK/TP-LINK UPnP/1.1 MiniUPnPd/2.2.2
                 mac: None,
                 evidence: vec![Evidence::Ping],
                 rtt: None,
+                ttl: None,
             });
         }
         let mut names = vec![Identity::default(), Identity::default()];

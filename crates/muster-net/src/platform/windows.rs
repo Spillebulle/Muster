@@ -23,7 +23,7 @@
 //!   own first field. Reading the wrong arm is silent, so it goes through
 //!   [`sockaddr_ip`] once and nowhere else.
 
-use crate::discover::{Capabilities, Outcome, Transport};
+use crate::discover::{Capabilities, Echo, Outcome, Transport};
 use crate::mac::MacAddr;
 use crate::prefix::Prefix;
 use crate::sysinfo::{
@@ -39,8 +39,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     FreeMibTable, GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST,
     GetAdaptersAddresses, GetIpForwardTable2, GetIpNetTable2, ICMP_ECHO_REPLY,
-    IP_ADAPTER_ADDRESSES_LH, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, MIB_IPFORWARD_TABLE2,
-    MIB_IPNET_TABLE2, SendARP,
+    IP_ADAPTER_ADDRESSES_LH, IP_SUCCESS, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
+    MIB_IPFORWARD_TABLE2, MIB_IPNET_TABLE2, SendARP,
 };
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_INET,
@@ -113,7 +113,7 @@ impl Transport for Host {
         arp_result(rc, len, &mac)
     }
 
-    fn ping(&self, addr: IpAddr, timeout: Duration) -> io::Result<Option<Duration>> {
+    fn ping(&self, addr: IpAddr, timeout: Duration) -> io::Result<Option<Echo>> {
         let IpAddr::V4(v4) = addr else {
             // v6 echo goes through `Icmp6SendEcho2`, which takes sockaddrs and
             // a source address rather than a bare word. It is not written yet,
@@ -158,11 +158,13 @@ impl Transport for Host {
         let answered = if count == 0 {
             None
         } else {
-            // `IP_SUCCESS` is 0. A non-zero status is a reply *about* the
-            // probe — a router's "unreachable" — and not the host answering,
-            // so it is not evidence of a host.
+            // **Everything the reply carried, not only the clock.** The stack
+            // fills in an `IP_OPTION_INFORMATION` beside the round trip, and
+            // its `Ttl` is the one the reply arrived with: a free coarse
+            // fingerprint of a device that has already answered, for a probe
+            // that has already been paid for.
             let echo = unsafe { &*reply.as_ptr().cast::<ICMP_ECHO_REPLY>() };
-            (echo.Status == 0).then(|| Duration::from_millis(echo.RoundTripTime.into()))
+            echo_result(echo.Status, echo.RoundTripTime, echo.Options.Ttl)
         };
 
         unsafe { IcmpCloseHandle(handle) };
@@ -242,6 +244,30 @@ fn arp_result(rc: u32, len: u32, mac: &[u8; 8]) -> io::Result<Option<MacAddr>> {
              reads six"
         ))),
     }
+}
+
+/// Reads what `IcmpSendEcho` filled in, which is the second judgement in this
+/// file that is not a syscall and so is the second one with a test.
+///
+/// Two rules, and they are the same two the rest of the crate is held to:
+///
+/// * **Only `IP_SUCCESS` is the host answering.** A non-zero status is a reply
+///   *about* the probe — a router's time exceeded or unreachable — and it comes
+///   from the router rather than from the address asked. It is not evidence of
+///   a host, and its TTL is the router's rather than the device's, so nothing
+///   at all is taken from it.
+/// * **A zero TTL is a field that was never written**, not a packet that
+///   arrived with nothing left. A datagram whose TTL reached zero was discarded
+///   by the router that decremented it and is not here to be read, so the only
+///   way to see a zero is a stack that filled in less than it promised.
+///   Reporting it as a reading would put every such device in no band at all,
+///   which is the right answer arrived at for the wrong reason; saying the
+///   field was not read is the true one.
+fn echo_result(status: u32, round_trip_ms: u32, ttl: u8) -> Option<Echo> {
+    (status == IP_SUCCESS).then(|| Echo {
+        rtt: Duration::from_millis(round_trip_ms.into()),
+        ttl: (ttl > 0).then_some(ttl),
+    })
 }
 
 /// `IfType` values worth telling apart, from `ipifcons.h`. Written out rather
@@ -558,6 +584,50 @@ mod tests {
         assert_eq!(arp_result(NO_ERROR, 0, &[0u8; 8]).unwrap(), None);
         assert_eq!(arp_result(NO_ERROR, 6, &[0u8; 8]).unwrap(), None);
         assert!(arp_result(NO_ERROR, 8, &[1u8; 8]).is_err());
+    }
+
+    /// The reply structure as the IP Helper API fills it in, read from four
+    /// recorded replies: a Windows desktop, a Linux box, the gateway, and a
+    /// printer one router away.
+    #[test]
+    fn a_recorded_reply_carries_its_round_trip_and_its_stack() {
+        use crate::discover::Stack;
+
+        let band = |ttl| {
+            echo_result(IP_SUCCESS, 1, ttl)
+                .and_then(|echo| echo.ttl)
+                .and_then(Stack::of)
+        };
+
+        let desktop = echo_result(IP_SUCCESS, 1, 128).expect("it answered");
+        assert_eq!(desktop.rtt, Duration::from_millis(1));
+        assert_eq!(desktop.ttl, Some(128));
+
+        assert_eq!(band(128), Some(Stack::Windows));
+        assert_eq!(band(64), Some(Stack::Unix));
+        assert_eq!(band(255), Some(Stack::Embedded));
+        assert_eq!(band(63), Some(Stack::Unix), "one router away is the same");
+    }
+
+    /// A router talking about the probe is not the address answering, and
+    /// nothing is taken from it: not the round trip, and not the TTL, which is
+    /// the router's own.
+    #[test]
+    fn a_status_that_is_not_success_is_not_a_reply() {
+        // IP_DEST_HOST_UNREACHABLE, IP_REQ_TIMED_OUT and
+        // IP_TTL_EXPIRED_TRANSIT.
+        for status in [11003u32, 11010, 11013] {
+            assert_eq!(echo_result(status, 1, 64), None, "{status}");
+        }
+    }
+
+    /// A stack that filled in less than it promised leaves a zero there, and a
+    /// zero is not a TTL. The reply is still a reply.
+    #[test]
+    fn a_zero_ttl_is_a_field_that_was_not_written() {
+        let echo = echo_result(IP_SUCCESS, 2, 0).expect("it still answered");
+        assert_eq!(echo.rtt, Duration::from_millis(2));
+        assert_eq!(echo.ttl, None);
     }
 
     /// The state mapping is a pure function and is the one thing in this file

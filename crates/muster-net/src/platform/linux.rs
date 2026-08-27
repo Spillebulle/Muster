@@ -9,7 +9,7 @@
 //! is the part that cannot: opening files and walking a linked list from libc.
 //!
 //! The one thing here that will *take* the capability if it is offered is the
-//! echo, and it asks for it second: see [`Echo`].
+//! echo, and it asks for it second: see [`EchoSocket`].
 //!
 //! What is deliberately not here yet:
 //!
@@ -24,7 +24,7 @@
 //!   wrong one.
 
 use super::procfs;
-use crate::discover::{Capabilities, Outcome, Transport};
+use crate::discover::{Capabilities, Echo, Outcome, Transport};
 use crate::mac::MacAddr;
 use crate::prefix::Prefix;
 use crate::sysinfo::{IfAddr, IfFlags, Interface, LinkKind, Neighbour, Route, SystemProbe};
@@ -114,7 +114,7 @@ impl Transport for Host {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             arp: true,
-            icmp: Echo::open().is_ok(),
+            icmp: EchoSocket::open().is_ok(),
             tcp: true,
         }
     }
@@ -150,7 +150,7 @@ impl Transport for Host {
         }
     }
 
-    fn ping(&self, addr: IpAddr, timeout: Duration) -> io::Result<Option<Duration>> {
+    fn ping(&self, addr: IpAddr, timeout: Duration) -> io::Result<Option<Echo>> {
         let IpAddr::V4(v4) = addr else {
             // A v6 echo is a ping socket of its own (`AF_INET6`,
             // `IPPROTO_ICMPV6`) and a different header, and it is not written.
@@ -213,8 +213,8 @@ fn ping_socket() -> io::Result<OwnedFd> {
 
 /// Opens a raw ICMP socket, which needs `CAP_NET_RAW` or root.
 ///
-/// The second half of [`Echo`], and the reason this file no longer says that
-/// nothing in it wants the capability: on Debian, Ubuntu and Pop!_OS the ping
+/// The second half of [`EchoSocket`], and the reason this file no longer says
+/// that nothing in it wants the capability: on Debian, Ubuntu and Pop!_OS the ping
 /// socket is shut for everybody, and a user who runs Muster with `sudo` has
 /// every right to expect an echo out of it. Asked for second, so an
 /// unprivileged process never pays for a socket it cannot have.
@@ -231,21 +231,29 @@ fn raw_icmp_socket() -> io::Result<OwnedFd> {
 /// They are not the same socket wearing two names, and the difference is all in
 /// what comes *back*:
 ///
-/// * [`Echo::Ping`] is demultiplexed by the kernel, which rewrote the
+/// * [`EchoSocket::Ping`] is demultiplexed by the kernel, which rewrote the
 ///   identifier on the way out to one it owns and hands this socket the replies
 ///   that carry it. What arrives is already ours, and it arrives as an ICMP
 ///   message with no IP header on the front.
-/// * [`Echo::Raw`] is told nothing. **Every** ICMP packet the machine receives
-///   is copied to it — including the replies to other processes' pings and to
-///   the other threads of this one — and each arrives with its IP header
+/// * [`EchoSocket::Raw`] is told nothing. **Every** ICMP packet the machine
+///   receives is copied to it — including the replies to other processes' pings
+///   and to the other threads of this one — and each arrives with its IP header
 ///   attached. So the identifier and the sequence number are ours to choose and
-///   ours to check, and [`Echo::reply`] is where that check lives.
-enum Echo {
+///   ours to check, and [`EchoSocket::reply`] is where that check lives.
+///
+/// Which of the two also decides **how the TTL is read**, which is the other
+/// asymmetry and the reason this is not one socket with a flag on it. A raw
+/// socket is handed the IP header, so the TTL is a byte already in the buffer.
+/// A ping socket is handed the ICMP message with the header stripped off, so
+/// the kernel has to be asked for the TTL separately, with `IP_RECVTTL` and a
+/// control message beside the datagram. Neither is more privileged than the
+/// other; they are two shapes of the same reading.
+enum EchoSocket {
     Ping(OwnedFd),
     Raw(OwnedFd),
 }
 
-impl Echo {
+impl EchoSocket {
     /// A ping socket if this user may have one, a raw socket if this process
     /// has the privilege, and otherwise the ping socket's own error.
     ///
@@ -319,15 +327,15 @@ impl Drop for OwnedFd {
     }
 }
 
-/// One ICMP echo, over whichever socket [`Echo::open`] could get.
+/// One ICMP echo, over whichever socket [`EchoSocket::open`] could get.
 ///
 /// The header is filled in completely for both. A ping socket rewrites the
 /// identifier and recomputes the checksum, so neither has to be right going out
 /// — but a header that is only correct by the kernel's courtesy is one that
 /// breaks the day it is sent down a raw socket instead, and that day has now
 /// arrived.
-fn echo(addr: Ipv4Addr, timeout: Duration) -> io::Result<Option<Duration>> {
-    let sock = Echo::open()?;
+fn echo(addr: Ipv4Addr, timeout: Duration) -> io::Result<Option<Echo>> {
+    let sock = EchoSocket::open()?;
     let fd = sock.fd();
 
     let tv = libc::timeval {
@@ -342,6 +350,28 @@ fn echo(addr: Ipv4Addr, timeout: Duration) -> io::Result<Option<Duration>> {
             std::ptr::from_ref(&tv).cast(),
             size_of::<libc::timeval>() as libc::socklen_t,
         );
+    }
+
+    // **Ask for the TTL, on the socket that cannot see it.** A ping socket is
+    // handed the ICMP message with the IP header already stripped, so without
+    // this the byte is simply gone; with it the kernel puts the header's TTL in
+    // a control message beside the datagram. A raw socket needs nothing,
+    // because it is handed the header itself.
+    //
+    // Best effort, and deliberately not an error: a kernel that will not do
+    // this leaves the reply's TTL unread, which is a device with no stack
+    // claimed against it rather than a device that did not answer.
+    if matches!(sock, EchoSocket::Ping(_)) {
+        let on: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_RECVTTL,
+                std::ptr::from_ref(&on).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
     }
 
     // Type 8 (echo request), code 0, checksum, identifier, sequence, then the
@@ -375,10 +405,10 @@ fn echo(addr: Ipv4Addr, timeout: Duration) -> io::Result<Option<Duration>> {
     // sweep runs 254 of them at once: unfiltered, each socket would be given a
     // copy of every other worker's reply and have to step over 253 of them to
     // find its own. Connecting names the one peer this socket cares about and
-    // the kernel does the filtering. Best effort: [`Echo::reply`] checks the
-    // identifier and the sequence anyway, so a kernel that refuses this is
+    // the kernel does the filtering. Best effort: [`EchoSocket::reply`] checks
+    // the identifier and the sequence anyway, so a kernel that refuses this is
     // slower and not wrong.
-    if matches!(sock, Echo::Raw(_)) {
+    if matches!(sock, EchoSocket::Raw(_)) {
         unsafe {
             libc::connect(
                 fd,
@@ -408,20 +438,78 @@ fn echo(addr: Ipv4Addr, timeout: Duration) -> io::Result<Option<Duration>> {
     // Wide enough for a raw socket's reply, which carries the IP header, its
     // options and the 40 bytes above.
     let mut buf = [0u8; 256];
+    // A `[u64; 8]` rather than a `[u8; 64]` for the same reason the Windows
+    // adapter buffer is a `Vec<u64>`: the kernel writes `cmsghdr` structures in
+    // here and a byte array promises no alignment for one.
+    let mut control = [0u64; 8];
     let deadline = sent + timeout;
     loop {
-        let got = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &raw mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = size_of_val(&control) as _;
+
+        // `recvmsg` rather than `recv` because the TTL of a ping socket's reply
+        // arrives beside the datagram rather than in it. The datagram itself is
+        // read exactly as before.
+        let got = unsafe { libc::recvmsg(fd, &raw mut msg, 0) };
         if got < 0 {
             return Ok(None); // Timed out.
         }
         let got = got as usize;
-        if sock.reply(&buf[..got.min(buf.len())], id, seq).is_some() {
-            return Ok(Some(sent.elapsed()));
+        let datagram = &buf[..got.min(buf.len())];
+        if sock.reply(datagram, id, seq).is_some() {
+            // Two shapes, one reading: the control message where the kernel
+            // was asked for it, and the header itself where the socket was
+            // given one. Neither is a guess, and where neither answers the
+            // reply carries no TTL and claims no stack.
+            let ttl = match sock {
+                EchoSocket::Ping(_) => unsafe { control_ttl(&msg) },
+                EchoSocket::Raw(_) => super::datagram_ttl(datagram),
+            };
+            return Ok(Some(Echo {
+                rtt: sent.elapsed(),
+                ttl,
+            }));
         }
         if Instant::now() >= deadline {
             return Ok(None);
         }
     }
+}
+
+/// The TTL out of the control messages `recvmsg` filled in, where `IP_RECVTTL`
+/// put one there.
+///
+/// The kernel writes it as an `int` rather than as the byte it came off the
+/// wire as, so it is read as one and narrowed; a value that will not fit in a
+/// byte is not a TTL and is dropped rather than truncated into a plausible one.
+///
+/// # Safety
+/// `msg` was filled in by a `recvmsg` on a control buffer that is still alive.
+unsafe fn control_ttl(msg: &libc::msghdr) -> Option<u8> {
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(msg) };
+    while !header.is_null() {
+        let cmsg = unsafe { &*header };
+        if cmsg.cmsg_level == libc::IPPROTO_IP && cmsg.cmsg_type == libc::IP_TTL {
+            let mut value: libc::c_int = 0;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    libc::CMSG_DATA(header),
+                    std::ptr::from_mut(&mut value).cast::<u8>(),
+                    size_of::<libc::c_int>(),
+                );
+            }
+            return u8::try_from(value).ok();
+        }
+        header = unsafe { libc::CMSG_NXTHDR(msg, header) };
+    }
+    None
 }
 
 /// The identifier every echo from this process carries.
@@ -640,4 +728,96 @@ unsafe fn netmask_len(p: *const libc::sockaddr) -> Option<u8> {
         IpAddr::V4(a) => u32::from(a).count_ones() as u8,
         IpAddr::V6(a) => u128::from(a).count_ones() as u8,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discover::Stack;
+
+    /// A control buffer laid out the way the kernel lays one out for a ping
+    /// socket that asked for `IP_RECVTTL`: one `cmsghdr` at `IPPROTO_IP` /
+    /// `IP_TTL`, and an `int` behind it.
+    ///
+    /// Built rather than captured because a control message is a structure
+    /// with the platform's own padding in it, so the recording that means
+    /// anything is one made with the platform's own macros. What is being
+    /// tested is the walk over them, which is where a reader goes wrong.
+    ///
+    /// # Safety
+    /// The returned header borrows `control`, which the caller keeps alive.
+    unsafe fn recorded(
+        control: &mut [u64; 8],
+        level: libc::c_int,
+        kind: libc::c_int,
+        value: libc::c_int,
+    ) -> libc::msghdr {
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = size_of_val(control) as _;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&msg);
+            (*header).cmsg_level = level;
+            (*header).cmsg_type = kind;
+            (*header).cmsg_len = libc::CMSG_LEN(size_of::<libc::c_int>() as u32) as _;
+            std::ptr::copy_nonoverlapping(
+                std::ptr::from_ref(&value).cast::<u8>(),
+                libc::CMSG_DATA(header),
+                size_of::<libc::c_int>(),
+            );
+        }
+        // What the kernel leaves behind is what it wrote, not the room it was
+        // given, and a walk that trusted the room would read past the end.
+        msg.msg_controllen = unsafe { libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) } as _;
+        msg
+    }
+
+    /// The ping socket's shape: the TTL arrives beside the datagram, as an
+    /// `int`, and it names a stack exactly as the raw socket's header byte
+    /// does.
+    #[test]
+    fn a_ping_socket_reply_carries_its_ttl_in_a_control_message() {
+        for (ttl, stack) in [
+            (64, Stack::Unix),
+            (128, Stack::Windows),
+            (255, Stack::Embedded),
+        ] {
+            let mut control = [0u64; 8];
+            let msg = unsafe { recorded(&mut control, libc::IPPROTO_IP, libc::IP_TTL, ttl) };
+            let read = unsafe { control_ttl(&msg) };
+            assert_eq!(read, Some(ttl as u8), "TTL {ttl}");
+            assert_eq!(read.and_then(Stack::of), Some(stack));
+        }
+    }
+
+    /// And a kernel that sent something else, or nothing: no TTL was read, so
+    /// no stack is claimed. `IP_TOS` is what arrives instead when `IP_RECVTOS`
+    /// is on and `IP_RECVTTL` was refused.
+    #[test]
+    fn a_reply_with_no_ttl_beside_it_reads_nothing() {
+        let mut control = [0u64; 8];
+        let other = unsafe { recorded(&mut control, libc::IPPROTO_IP, libc::IP_TOS, 64) };
+        assert_eq!(unsafe { control_ttl(&other) }, None);
+
+        let mut empty: libc::msghdr = unsafe { std::mem::zeroed() };
+        empty.msg_control = std::ptr::null_mut();
+        empty.msg_controllen = 0;
+        assert_eq!(unsafe { control_ttl(&empty) }, None);
+    }
+
+    /// The raw socket's shape, read through the same crate-wide helper the
+    /// echo path uses, so the two sockets cannot disagree about what a TTL of
+    /// 64 means.
+    #[test]
+    fn a_raw_socket_reply_carries_its_ttl_in_the_header() {
+        let mut datagram = vec![0u8; 20];
+        datagram[0] = 0x45;
+        datagram[8] = 64;
+        datagram[9] = 1;
+        assert_eq!(super::super::datagram_ttl(&datagram), Some(64));
+        assert_eq!(
+            super::super::datagram_ttl(&datagram).and_then(Stack::of),
+            Some(Stack::Unix)
+        );
+    }
 }

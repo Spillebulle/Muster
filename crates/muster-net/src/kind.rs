@@ -32,6 +32,11 @@
 //!   is a network card, and a network card of that kind is in a computer. See
 //!   [`CHIPSETS`], which exists because the vendor rule above had ruled out the
 //!   one thing that could be said about most of the laptops on an office LAN.
+//! * The **stack** is the weakest of them and the cheapest to have: the TTL a
+//!   ping reply carried, rounded up to what the sender started it at. It is
+//!   last because it is a byte nothing chose to send rather than a device
+//!   saying anything, and only one of its three bands narrows a device to a
+//!   kind at all. See [`Clue::Stack`].
 //!
 //! A hostname is deliberately **not** a clue. `HP-Printer` is usually right and
 //! `daves-old-printer-pc` is a desktop; a name is written by whoever set the
@@ -53,7 +58,7 @@
 //! [`crate::discover`] and [`crate::identify`], so the whole module is a pure
 //! function over a scan and the tests are a table.
 
-use crate::discover::Found;
+use crate::discover::{Found, Stack};
 use crate::identify::Identity;
 use crate::mac::MacAddr;
 use crate::vendor::{self, Origin};
@@ -211,6 +216,34 @@ pub enum Clue {
     /// NetBIOS, no SSDP, no open port, and an mDNS name with no services
     /// behind it. That device was the commonest blank row on a real network.
     Llmnr,
+    /// The TTL its echo reply carried rounds up to an initial value only one
+    /// kind of stack starts at.
+    ///
+    /// **Weakest of the lot, and last on purpose.** Everything above it is
+    /// something a device *said*, in a protocol, about itself or its services.
+    /// This is a byte in a header that nothing chose to send, read at one
+    /// remove: see [`crate::discover::Stack`] for what the rounding does and
+    /// does not recover.
+    ///
+    /// Three things follow from how weak it is, and they are what keep it
+    /// honest:
+    ///
+    /// * **Only one of the three bands names a kind at all.** 64 is Linux, the
+    ///   BSDs, macOS, Android and iOS, which is every kind on the list and so
+    ///   is no kind; 255 is switches, printer controllers and Solaris, which is
+    ///   three kinds. Only 128 narrows anything, because a Windows stack on a
+    ///   network is a general purpose computer. The other two bands are still
+    ///   *shown* — a reader is entitled to the reading — and they name nothing.
+    /// * **Even 128 is not certain**, and the known wrong answer is worth
+    ///   writing down rather than rediscovering: an Xbox is Windows underneath,
+    ///   and a card terminal running Windows CE is a card terminal. Ranked last
+    ///   they lose to every service, model, port and vendor that fires, which
+    ///   is how both of those devices are named when they say anything at all.
+    /// * **It costs nothing.** The echo was sent, the reply was waited for, and
+    ///   the byte came back with it. This is the one piece of fingerprinting
+    ///   `CLAUDE.md` files under the privileged engine that is in fact
+    ///   available today, unprivileged, from a probe already paid for.
+    Stack,
 }
 
 impl Clue {
@@ -226,6 +259,10 @@ impl Clue {
             Self::Chipset => "the silicon in it only goes into this kind",
             Self::Workgroup => "it answers NetBIOS with a workgroup, as Windows machines do",
             Self::Llmnr => "it answers LLMNR, which only computers do",
+            // A stack, never a product: the difference between this sentence
+            // and "it is a Windows machine" is the standard this module is
+            // held to.
+            Self::Stack => "the TTL of its reply points at a stack only this kind runs",
         }
     }
 }
@@ -1003,6 +1040,14 @@ pub fn identify(found: &Found, identity: &Identity, vantage: Vantage) -> Option<
         }
     }
 
+    // Last, and only one of the three bands says anything. A Windows stack on
+    // a network is a general purpose computer; 64 is every kind there is and
+    // 255 is three of them, so neither names one. See [`Clue::Stack`], which
+    // is where the cost of ranking this at all is written down.
+    if found.stack() == Some(Stack::Windows) {
+        consider(Kind::Computer, Clue::Stack);
+    }
+
     best
 }
 
@@ -1025,6 +1070,7 @@ mod tests {
             mac: mac.map(MacAddr::new),
             evidence: ports.iter().map(|p| Evidence::TcpOpen(*p)).collect(),
             rtt: None,
+            ttl: None,
         }
     }
 
@@ -1209,6 +1255,71 @@ mod tests {
         .expect("a guess");
         assert_eq!(with_vendor.kind, Kind::Speaker, "the Sonos block");
         assert_eq!(with_vendor.clue, Clue::Vendor);
+    }
+
+    /// A device that answered a ping and nothing else, with a Windows TTL on
+    /// the reply. Nothing here was asked for: the echo was sent by the sweep,
+    /// the reply was waited for, and the byte came back with it.
+    #[test]
+    fn a_windows_ttl_is_the_last_thing_that_still_says_computer() {
+        let mut found = host(&[], None);
+        found.ttl = Some(128);
+
+        let guess = identify(&found, &Identity::default(), Vantage::default()).expect("a guess");
+        assert_eq!(guess.kind, Kind::Computer);
+        assert_eq!(guess.clue, Clue::Stack);
+        assert_eq!(
+            guess.clue.reason(),
+            "the TTL of its reply points at a stack only this kind runs",
+            "a stack, and never a product"
+        );
+    }
+
+    /// The other two bands name nothing, and that is the whole reason this
+    /// clue is safe to have. 64 is Linux, the BSDs, macOS, Android and iOS,
+    /// which is every kind on the list; 255 is switches, printers and Solaris,
+    /// which is three of them. A blank row is the answer.
+    #[test]
+    fn a_unix_or_embedded_ttl_names_no_kind_at_all() {
+        for ttl in [64, 63, 255, 254] {
+            let mut found = host(&[], None);
+            found.ttl = Some(ttl);
+            assert!(
+                identify(&found, &Identity::default(), Vantage::default()).is_none(),
+                "TTL {ttl} named something"
+            );
+        }
+        // And a TTL that fits no band names nothing either, for a different
+        // reason: nothing was recovered to name anything with.
+        let mut far = host(&[], None);
+        far.ttl = Some(100);
+        assert!(identify(&far, &Identity::default(), Vantage::default()).is_none());
+    }
+
+    /// Ranked last, so everything beats it — including the two clues that say
+    /// the same thing about the same device and say it with a protocol.
+    ///
+    /// The known wrong answers this placement is what protects: an Xbox is
+    /// Windows underneath and a card terminal can be Windows CE, and both of
+    /// them are named by anything else they say.
+    #[test]
+    fn anything_at_all_beats_a_windows_ttl() {
+        let mut found = host(&[9100], None);
+        found.ttl = Some(128);
+        let by_port = identify(&found, &Identity::default(), Vantage::default()).expect("a guess");
+        assert_eq!(by_port.kind, Kind::Printer);
+        assert_eq!(by_port.clue, Clue::Port);
+
+        // Even LLMNR, which is the weakest clue above it and agrees with it.
+        let mut bare = host(&[], None);
+        bare.ttl = Some(128);
+        let identity = Identity {
+            llmnr: true,
+            ..Default::default()
+        };
+        let guess = identify(&bare, &identity, Vantage::default()).expect("a guess");
+        assert_eq!(guess.kind, Kind::Computer);
+        assert_eq!(guess.clue, Clue::Llmnr);
     }
 
     /// The blank row in the middle of every scan: the machine somebody is
@@ -1530,6 +1641,11 @@ mod tests {
         assert!(Clue::Vendor < Clue::Chipset);
         assert!(Clue::Chipset < Clue::Workgroup);
         assert!(Clue::Workgroup < Clue::Llmnr);
+        assert!(Clue::Llmnr < Clue::Stack);
+        // The placement that matters most: a byte in a header loses to
+        // everything a device actually said, and to the port and the vendor
+        // besides.
+        assert!(Clue::Port < Clue::Stack);
     }
 
     /// Every needle is compared against a lower-cased string, so a needle with
@@ -1946,6 +2062,7 @@ mod tests {
             mac: None,
             evidence: vec![Evidence::Ping],
             rtt: None,
+            ttl: None,
         }
     }
 }

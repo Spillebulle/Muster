@@ -110,6 +110,131 @@ pub enum Outcome {
     NoAnswer,
 }
 
+/// What an echo reply carried.
+///
+/// **A round trip used to be the whole of it and the rest was thrown away.**
+/// Every reply arrives with a TTL in front of it and both platforms already had
+/// that byte in hand: Windows fills the field in on the reply structure it
+/// hands back, and a raw socket on Linux is given the IP header itself. Rounded
+/// up, it is a coarse class of network stack for every device that answered a
+/// ping — see [`Stack`] — which makes it the cheapest identification in this
+/// crate, because the probe it comes out of was paid for already.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Echo {
+    /// How long the reply took.
+    pub rtt: Duration,
+    /// The TTL the reply arrived with, where the transport could read one.
+    ///
+    /// [`None`] is not zero and is not a default: it is a transport that did
+    /// not surface the field. A stack inferred from a TTL nobody read would be
+    /// exactly the invention the rest of this module refuses to make.
+    pub ttl: Option<u8>,
+}
+
+impl Echo {
+    /// A reply timed but not read: the round trip, and no claim about a stack.
+    pub const fn timed(rtt: Duration) -> Self {
+        Self { rtt, ttl: None }
+    }
+}
+
+/// The class of network stack a reply's TTL points at.
+///
+/// A stack starts every packet at one of a few round numbers and each router on
+/// the way takes one off, so what arrives here is that initial value minus the
+/// hop count: a device on this wire answers with the number it started from,
+/// and the same device behind a router answers with one less. Rounding **up**
+/// to the nearest of 64, 128 and 255 is what recovers the number it started
+/// from, and that number is a property of the operating system rather than of
+/// the product. Linux, the BSDs, macOS, Android and iOS start at 64, Windows at
+/// 128, and the stacks in switches, printer controllers and Solaris at 255.
+///
+/// **It is a claim about a stack and never about a product.** "The reply's TTL
+/// suggests a Unix-like stack" is what a hop count supports; "this is a Linux
+/// machine" is not, and neither is anything at all about what the device is
+/// for. Half the phones, televisions, cameras and smart plugs on a network
+/// answer with 64, so the band says what they have in common and nothing more.
+/// That is also why only one of the three bands names a kind at all; see
+/// [`crate::kind::Clue::Stack`].
+///
+/// **A value that fits no band is left blank**, which is the other half of the
+/// same rule and the reason [`of`](Self::of) returns an [`Option`]. Rounding up
+/// on its own never fails, because every number from 1 to 255 is below one of
+/// the three, so a rule that only rounded would answer "Windows stack" for an
+/// observed 100 and "Unix-like" for an observed 33 — claims about a device
+/// thirty routers away rather than one on the wire being scanned. Only a value
+/// within [`MOST_HOPS`] of a band is read, and everything else is a blank. A
+/// blank is an answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Stack {
+    /// Started at 64: Linux, the BSDs, macOS, Android and iOS, and the great
+    /// many embedded devices built on Linux.
+    Unix,
+    /// Started at 128, which on any network worth scanning means Windows.
+    Windows,
+    /// Started at 255: the stacks in switches, routers, printer controllers and
+    /// Solaris.
+    Embedded,
+}
+
+/// How far a reply may have travelled and still be read.
+///
+/// The rounding is only sound while the hop count is small, and on the networks
+/// Muster scans it is: the default target is this machine's own link, where the
+/// count is nought, and a range somebody types is a network a couple of routers
+/// away. Sixteen is far more than that and still comfortably less than the
+/// distance between the bands, so a reply from anything this scanner can reach
+/// lands inside a window, and a value outside every window is a packet whose
+/// initial value cannot be recovered rather than one to guess at.
+pub const MOST_HOPS: u8 = 16;
+
+impl Stack {
+    /// The stack a TTL observed on a reply points at, if it points at one.
+    pub const fn of(observed: u8) -> Option<Self> {
+        if observed >= 255 - MOST_HOPS {
+            Some(Self::Embedded)
+        } else if observed <= 128 && observed >= 128 - MOST_HOPS {
+            Some(Self::Windows)
+        } else if observed <= 64 && observed >= 64 - MOST_HOPS {
+            Some(Self::Unix)
+        } else {
+            None
+        }
+    }
+
+    /// The number a packet from this stack starts at.
+    pub const fn initial(self) -> u8 {
+        match self {
+            Self::Unix => 64,
+            Self::Windows => 128,
+            Self::Embedded => 255,
+        }
+    }
+
+    /// What the interface calls it, in the words the evidence supports.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unix => "Unix-like stack",
+            Self::Windows => "Windows stack",
+            Self::Embedded => "embedded stack",
+        }
+    }
+
+    /// The sentence shown beside the claim, which says what was measured as
+    /// well as what it is taken to mean.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Unix => {
+                "the TTL of its reply rounds up to 64, where Linux, the BSDs, macOS, Android and iOS all start"
+            }
+            Self::Windows => "the TTL of its reply rounds up to 128, where Windows starts",
+            Self::Embedded => {
+                "the TTL of its reply rounds up to 255, where the stacks in switches, printers and other embedded gear start"
+            }
+        }
+    }
+}
+
 /// A protocol a device spoke to the link as a whole.
 ///
 /// **This is the other half of finding a device, and for a long time it was
@@ -224,6 +349,12 @@ pub struct Found {
     pub evidence: Vec<Evidence>,
     /// Round trip time, where something measured one.
     pub rtt: Option<Duration>,
+    /// The TTL an echo reply arrived with, where one was read.
+    ///
+    /// The observation rather than the conclusion, because the observation is
+    /// the fact: see [`Stack`] for what is and is not inferable from it, and
+    /// [`Found::stack`] for the inference.
+    pub ttl: Option<u8>,
 }
 
 impl Found {
@@ -239,6 +370,7 @@ impl Found {
             mac: None,
             evidence: vec![Evidence::Announced(protocol)],
             rtt: None,
+            ttl: None,
         }
     }
 
@@ -249,6 +381,7 @@ impl Found {
             mac: Some(mac),
             evidence: vec![Evidence::Neighbour],
             rtt: None,
+            ttl: None,
         }
     }
 
@@ -272,6 +405,16 @@ impl Found {
         if !self.evidence.contains(&evidence) {
             self.evidence.push(evidence);
         }
+    }
+
+    /// The class of stack this device's echo reply points at, if any.
+    ///
+    /// Blank for a device that was never pinged, for one whose reply carried no
+    /// TTL, and for one whose TTL fits no band. All three read the same way to
+    /// somebody looking at the row — nothing is known — and none of the three
+    /// is a reason to guess.
+    pub fn stack(&self) -> Option<Stack> {
+        self.ttl.and_then(Stack::of)
     }
 
     /// The open ports the sweep happened to notice while knocking. Not a port
@@ -303,7 +446,13 @@ pub trait Transport: Sync {
     fn arp(&self, addr: Ipv4Addr, timeout: Duration) -> io::Result<Option<MacAddr>>;
 
     /// Sends one ICMP echo. [`None`] means no reply.
-    fn ping(&self, addr: IpAddr, timeout: Duration) -> io::Result<Option<Duration>>;
+    ///
+    /// An [`Echo`] rather than a bare round trip, because the reply carries a
+    /// TTL as well and discarding it threw away the one piece of
+    /// fingerprinting this engine gets without a raw socket. A transport that
+    /// cannot read the TTL says so with [`Echo::timed`] rather than filling the
+    /// field in with something.
+    fn ping(&self, addr: IpAddr, timeout: Duration) -> io::Result<Option<Echo>>;
 
     /// Opens a TCP connection far enough to learn how it is answered, then
     /// drops it.
@@ -527,6 +676,9 @@ impl Sweep {
                 }
                 if existing.rtt.is_none() {
                     existing.rtt = host.rtt;
+                }
+                if existing.ttl.is_none() {
+                    existing.ttl = host.ttl;
                 }
                 false
             }
@@ -866,6 +1018,7 @@ fn probe_one<T: Transport>(
     let mut evidence = Vec::new();
     let mut mac = None;
     let mut rtt = None;
+    let mut ttl = None;
 
     // A labelled block rather than early returns, so that giving up part way
     // through still hands back whatever has already answered. A device found by
@@ -911,9 +1064,12 @@ fn probe_one<T: Transport>(
                 break 'probes;
             }
             match transport.ping(address, opts.ping_timeout) {
-                Ok(Some(t)) => {
+                Ok(Some(echo)) => {
                     evidence.push(Evidence::Ping);
-                    rtt = Some(t);
+                    rtt = Some(echo.rtt);
+                    // Kept whether or not it fits a band, because it is the
+                    // reading and the band is the reading's interpretation.
+                    ttl = echo.ttl;
                 }
                 // Silence, which proves nothing and needs no note.
                 Ok(None) => {}
@@ -961,6 +1117,7 @@ fn probe_one<T: Transport>(
         mac,
         evidence,
         rtt,
+        ttl,
     })
 }
 
@@ -978,6 +1135,11 @@ mod tests {
         caps: Capabilities,
         arp: BTreeMap<Ipv4Addr, MacAddr>,
         pings: Vec<IpAddr>,
+        /// The TTL a recorded reply came back with, for the addresses where
+        /// one was captured. An address in `pings` and not in here answered
+        /// without one, which is a real transport as well: a ping socket on a
+        /// kernel that will not hand the field over.
+        ttls: BTreeMap<IpAddr, u8>,
         /// address → port → outcome
         tcp: BTreeMap<IpAddr, BTreeMap<u16, Outcome>>,
         sent: Mutex<Vec<String>>,
@@ -1011,7 +1173,7 @@ mod tests {
             self.note(format!("arp {addr}"));
             Ok(self.arp.get(&addr).copied())
         }
-        fn ping(&self, addr: IpAddr, _: Duration) -> io::Result<Option<Duration>> {
+        fn ping(&self, addr: IpAddr, _: Duration) -> io::Result<Option<Echo>> {
             self.note(format!("ping {addr}"));
             // Both real platforms answer a v6 address this way, so the fake
             // does too: a fake that is kinder than the transport it stands in
@@ -1022,10 +1184,10 @@ mod tests {
                     "IPv6 echo is not implemented",
                 ));
             }
-            Ok(self
-                .pings
-                .contains(&addr)
-                .then_some(Duration::from_millis(3)))
+            Ok(self.pings.contains(&addr).then(|| Echo {
+                rtt: Duration::from_millis(3),
+                ttl: self.ttls.get(&addr).copied(),
+            }))
         }
         fn tcp(&self, addr: IpAddr, port: u16, _: Duration) -> Outcome {
             self.note(format!("tcp {addr}:{port}"));
@@ -1068,6 +1230,94 @@ mod tests {
         assert_eq!(s.found[0].evidence[0].reason(), "answered ARP");
         assert_eq!(s.probed, 254);
         assert!(s.is_complete());
+    }
+
+    /// The bands, against TTLs recorded on real replies.
+    ///
+    /// 64, 128 and 255 are the three devices answering from this wire; 63,
+    /// 127 and 254 are the same three answering from behind one router, which
+    /// is the case the rounding exists for and the one a rule written as
+    /// equality would get wrong on every network with a second subnet.
+    #[test]
+    fn a_reply_from_this_wire_and_one_from_behind_a_router_read_the_same() {
+        for observed in [64, 63, 60, 48] {
+            assert_eq!(Stack::of(observed), Some(Stack::Unix), "{observed}");
+        }
+        for observed in [128, 127, 120, 112] {
+            assert_eq!(Stack::of(observed), Some(Stack::Windows), "{observed}");
+        }
+        for observed in [255, 254, 250, 239] {
+            assert_eq!(Stack::of(observed), Some(Stack::Embedded), "{observed}");
+        }
+        assert_eq!(Stack::Unix.initial(), 64);
+        assert_eq!(Stack::Windows.initial(), 128);
+        assert_eq!(Stack::Embedded.initial(), 255);
+    }
+
+    /// And the half that keeps the claim honest: rounding up always succeeds,
+    /// so a rule that only rounded would answer for every byte from 1 to 255.
+    /// A value too far below a band is a packet whose initial value cannot be
+    /// recovered, and a blank is the answer.
+    #[test]
+    fn a_ttl_that_fits_no_band_is_a_blank_rather_than_the_nearest_guess() {
+        // 100 would be a Windows stack twenty-eight routers away, 33 a
+        // Unix-like one thirty-one away, and 200 something fifty-five away.
+        // Nothing a scan of a local network reaches is any of those.
+        for observed in [1, 33, 47, 65, 100, 111, 129, 200, 238] {
+            assert_eq!(Stack::of(observed), None, "{observed}");
+        }
+        // 32 is the one that matters most: it is also where a handful of old
+        // stacks start, so reading it as a distant 64 would be picking one of
+        // two answers with nothing to choose between them.
+        assert_eq!(Stack::of(32), None);
+    }
+
+    /// The point of the change: a ping already sends and already waits, and
+    /// what came back with it now reaches the device list.
+    #[test]
+    fn a_ping_carries_the_stack_it_answered_with() {
+        let mut fake = Fake::new();
+        fake.pings.push(ip("192.168.1.5"));
+        fake.ttls.insert(ip("192.168.1.5"), 128);
+        fake.pings.push(ip("192.168.1.6"));
+        fake.ttls.insert(ip("192.168.1.6"), 64);
+        // Answered, and the reply carried no TTL: a ping socket on a kernel
+        // that would not hand the field over.
+        fake.pings.push(ip("192.168.1.7"));
+
+        let s = run("192.168.1.0/28", &fake, Options::default());
+        let by = |a: &str| {
+            s.found
+                .iter()
+                .find(|f| f.address == ip(a))
+                .expect("it answered")
+        };
+        assert_eq!(by("192.168.1.5").ttl, Some(128));
+        assert_eq!(by("192.168.1.5").stack(), Some(Stack::Windows));
+        assert_eq!(by("192.168.1.6").stack(), Some(Stack::Unix));
+        assert_eq!(
+            by("192.168.1.7").stack(),
+            None,
+            "a reply with no TTL on it claims no stack"
+        );
+    }
+
+    /// A device found some other way has no stack, and must not borrow one.
+    /// The row is blank because nothing measured it, which is what
+    /// [`Found::was_probed`] already says about the round trip beside it.
+    #[test]
+    fn a_device_that_was_never_pinged_claims_no_stack() {
+        let mut fake = Fake::new();
+        fake.tcp
+            .insert(ip("192.168.1.3"), BTreeMap::from([(80, Outcome::Open)]));
+
+        let s = run("192.168.1.0/29", &fake, Options::default());
+        assert_eq!(s.found[0].ttl, None);
+        assert_eq!(s.found[0].stack(), None);
+        assert_eq!(
+            Found::announced(ip("192.168.1.9"), Protocol::Ssdp).stack(),
+            None
+        );
     }
 
     /// The rule this module exists for. A device that refuses is a device.
@@ -1158,6 +1408,7 @@ mod tests {
             mac: None,
             evidence: vec![Evidence::Ping],
             rtt: Some(Duration::from_millis(3)),
+            ttl: Some(64),
         });
 
         assert!(!sweep.admit(Found::announced(ip("192.168.1.9"), Protocol::Mdns)));
@@ -1169,9 +1420,10 @@ mod tests {
         // It answered a probe, so it is not one of the heard.
         assert!(sweep.found[0].was_probed());
         assert_eq!(sweep.heard(), 0);
-        // And the measurement it already had is not thrown away by an
+        // And the measurements it already had are not thrown away by an
         // announcement, which measures nothing.
         assert_eq!(sweep.found[0].rtt, Some(Duration::from_millis(3)));
+        assert_eq!(sweep.found[0].stack(), Some(Stack::Unix));
     }
 
     /// The neighbour table finds a device that answered nothing, and stays
@@ -1186,6 +1438,7 @@ mod tests {
             mac: Some(mac),
             evidence: vec![Evidence::Arp(mac)],
             rtt: None,
+            ttl: None,
         });
 
         assert!(!sweep.admit_neighbour(ip("192.168.1.9"), mac));
@@ -1349,8 +1602,8 @@ mod tests {
             fn arp(&self, _: Ipv4Addr, _: Duration) -> io::Result<Option<MacAddr>> {
                 Err(io::Error::other("the ARP mechanism is broken"))
             }
-            fn ping(&self, addr: IpAddr, _: Duration) -> io::Result<Option<Duration>> {
-                Ok((addr == ip("192.168.1.2")).then_some(Duration::from_millis(1)))
+            fn ping(&self, addr: IpAddr, _: Duration) -> io::Result<Option<Echo>> {
+                Ok((addr == ip("192.168.1.2")).then_some(Echo::timed(Duration::from_millis(1))))
             }
             fn tcp(&self, _: IpAddr, _: u16, _: Duration) -> Outcome {
                 Outcome::NoAnswer
@@ -1704,7 +1957,7 @@ mod tests {
                 self.probes.fetch_add(1, Ordering::SeqCst);
                 Ok(None)
             }
-            fn ping(&self, _: IpAddr, _: Duration) -> io::Result<Option<Duration>> {
+            fn ping(&self, _: IpAddr, _: Duration) -> io::Result<Option<Echo>> {
                 self.probes.fetch_add(1, Ordering::SeqCst);
                 // The user presses Stop while this one probe is in flight.
                 self.cancel.store(true, Ordering::SeqCst);
