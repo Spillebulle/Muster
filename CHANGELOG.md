@@ -61,6 +61,24 @@ Changed
   says its address, its name and its kind in words to a screen reader, which
   the icon column could not do at all when its only explanation was a tooltip.
 - **The device table's heading stays put** while the list scrolls under it.
+- **The Arch package now keeps itself up to date.** Installing it adds the
+  [Spillebulle archive](https://spillebulle.github.io/packages/) as a
+  `[spillebulle]` repository at the end of `/etc/pacman.conf`, after your
+  distribution's own, so on Arch, CachyOS, EndeavourOS and Manjaro
+  `sudo pacman -Syu` brings the next Muster with everything else, as apt and
+  dnf already did. When a new version is out, Muster says `pacman -Syu` on a
+  machine with the archive and still names the file on one without.
+  To leave it, delete the section and `/etc/pacman.d/spillebulle`, and create
+  `/etc/pacman.d/spillebulle.disabled` so the next upgrade does not put it back.
+
+Fixed
+
+- **The `.deb` could not be installed beside another application from the same
+  archive.** Both shipped the archive's key at the same path, and dpkg refuses
+  a second package that owns a file the first already does, even an identical
+  one. The key is now carried under Muster's own name and copied to
+  `/etc/apt/keyrings` on install, and a source written by an earlier Muster is
+  pointed at the new copy, so nothing has to be done by hand.
 
 ## 0.0.15
 

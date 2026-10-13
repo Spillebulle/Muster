@@ -44,23 +44,40 @@ notes and the checksums.
 | Windows, no installer | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.16/muster-0.0.16-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/muster/releases/download/v0.0.16/muster-0.0.16-aarch64-pc-windows-msvc.zip) |
 | Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.16/muster-0.0.16-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/muster/releases/download/v0.0.16/muster-0.0.16-aarch64-unknown-linux-gnu.tar.gz) |
 
-The `.deb` and `.rpm` add the [Spillebulle archive](https://spillebulle.github.io/packages/)
-as they install, so `apt upgrade` or your usual system update carries Muster along
-with everything else. Nothing to configure.
+The `.deb`, the `.rpm` and the Arch package add the
+[Spillebulle archive](https://spillebulle.github.io/packages/) as they install,
+so `apt upgrade`, `pacman -Syu` or your usual system update carries Muster along
+with everything else. That includes Arch, CachyOS, EndeavourOS and Manjaro: the
+Arch package adds a `[spillebulle]` repository to `/etc/pacman.conf`, after your
+distribution's own. Nothing to configure.
 
 To add the archive first and install from it, or on a machine that installed
-Muster before 0.0.9, on Debian, Ubuntu, Mint and Pop!_OS:
+Muster before 0.0.9 (0.0.16 on Arch), on Debian, Ubuntu, Mint and Pop!_OS:
 
 ```sh
+sudo mkdir -p /etc/apt/keyrings
 curl -fsSL https://spillebulle.github.io/packages/spillebulle-archive.asc \
-  | sudo gpg --dearmor -o /usr/share/keyrings/spillebulle-archive.gpg
+  | sudo gpg --dearmor -o /etc/apt/keyrings/spillebulle-archive.gpg
 sudo tee /etc/apt/sources.list.d/spillebulle.sources >/dev/null <<'EOF'
 Types: deb
 URIs: https://spillebulle.github.io/packages/deb/
 Suites: ./
-Signed-By: /usr/share/keyrings/spillebulle-archive.gpg
+Signed-By: /etc/apt/keyrings/spillebulle-archive.gpg
 EOF
 sudo apt update && sudo apt install muster
+```
+
+On Arch, CachyOS, EndeavourOS and Manjaro:
+
+```sh
+curl -fsSL https://spillebulle.github.io/packages/spillebulle-archive.asc -o /tmp/spillebulle-archive.asc
+sudo pacman-key --add /tmp/spillebulle-archive.asc
+sudo pacman-key --lsign-key 7A9EA69E033F3C3EF4F53EB4A72BC0FD5E061ADA
+printf '%s\n' 'SigLevel = Required DatabaseRequired' \
+  'Server = https://spillebulle.github.io/packages/arch/$arch' \
+  | sudo tee /etc/pacman.d/spillebulle >/dev/null
+printf '\n[spillebulle]\nInclude = /etc/pacman.d/spillebulle\n' | sudo tee -a /etc/pacman.conf >/dev/null
+sudo pacman -Syu muster-bin
 ```
 
 On Fedora, RHEL and openSUSE:

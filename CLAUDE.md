@@ -583,11 +583,22 @@ told every `.deb` user to run `sudo apt install --only-upgrade muster` and that
 command cannot ever have worked: the packages come from a release page, apt only
 consults archives it has been given, and a machine with none answers "already
 the newest version" in the voice of something that had checked. So the `.deb`
-carries the archive's public key in `/usr/share/keyrings` and writes
-`/etc/apt/sources.list.d/spillebulle.sources` from its `postinst`, the `.rpm`
-does the same with `/etc/yum.repos.d/spillebulle.repo`, and from then on the
-package manager keeps Muster current the way it keeps everything else current.
-Three rules come with it:
+carries the archive's public key as `/usr/share/muster/spillebulle-archive.gpg`,
+and its `postinst` copies it to `/etc/apt/keyrings` and writes
+`/etc/apt/sources.list.d/spillebulle.sources`; the `.rpm` does the same with
+`/etc/yum.repos.d/spillebulle.repo`; the Arch package's `muster.install` trusts
+the key with `pacman-key` and appends a `[spillebulle]` section to
+`/etc/pacman.conf`. From then on the package manager keeps Muster current the
+way it keeps everything else current. **The paths and the scripts are
+`../Packages/ENROLMENT.md`'s**, the same in every application, and are copied
+from there rather than re-derived. Four rules come with it:
+
+- **No file is shared between packages.** dpkg refuses to install a package
+  that ships a path another package already owns, even byte for byte the same
+  file. The `.deb` used to ship `/usr/share/keyrings/spillebulle-archive.gpg`,
+  which every application from the archive ships too, so the second one
+  installed on any machine failed. Each ships the key under its own name and
+  the scriptlet puts the shared copy in place, created and never overwritten.
 
 - **The source file is written by the scriptlet, never shipped in the package.**
   A file under `/etc` that dpkg owns is a conffile, and dpkg removes a conffile
