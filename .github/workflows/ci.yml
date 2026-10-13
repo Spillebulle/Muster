@@ -54,7 +54,8 @@ jobs:
 
       - name: Shell syntax
         run: |
-          for f in packaging/linux/build-packages.sh tools/*.sh; do
+          for f in packaging/linux/*.sh packaging/linux/muster.install \
+                   packaging/check.sh tools/*.sh; do
             bash -n "$f"
           done
 

@@ -136,6 +136,79 @@ for path in /etc/apt/sources.list.d/spillebulle.sources \
 done
 ok "the packages and the updater agree on where the archive is configured"
 
+# pacman has no drop-in directory for repositories, so on Arch the archive is a
+# section in `/etc/pacman.conf` that `muster.install` appends, and the updater
+# reads that file for the section by name. Same defect, same check: the file,
+# the section and the settings file the section includes.
+install_rs=crates/muster-app/src/update/install.rs
+scriptlet=packaging/linux/muster.install
+conf=$(tr -d '\r' < "$install_rs" | sed -n 's/^const PACMAN_CONF: &str = "\(.*\)";$/\1/p')
+section=$(tr -d '\r' < "$install_rs" | sed -n 's/^const PACMAN_SECTION: &str = "\(.*\)";$/\1/p')
+[ "$conf" = /etc/pacman.conf ] || fail "the updater reads '$conf' for the archive, not /etc/pacman.conf"
+[ "$section" = '[spillebulle]' ] || fail "the updater looks for the section '$section', not [spillebulle]"
+grep -qF ">> $conf" "$scriptlet" || fail "$scriptlet never appends to $conf, which is what the updater reads"
+grep -qF "\\n$section\\nInclude = %s\\n" "$scriptlet" || fail "$scriptlet does not append the section $section the updater looks for"
+grep -qF "grep -q '^\\[spillebulle\\]' $conf" "$scriptlet" || fail "$scriptlet does not check for $section before appending it, so every upgrade would add another"
+grep -qF 'local conf=/etc/pacman.d/spillebulle' "$scriptlet" || fail "$scriptlet does not write /etc/pacman.d/spillebulle"
+grep -qF 'Include = /etc/pacman.d/spillebulle' "$install_rs" || fail "the updater's tests do not include /etc/pacman.d/spillebulle the way the scriptlet does"
+grep -qF '$conf.disabled' "$scriptlet" || fail "$scriptlet ignores the .disabled marker"
+ok "the Arch scriptlet and the updater agree on $conf and $section"
+
+# Each package ships the key under Muster's own name and the scriptlet puts the
+# shared copy in place: dpkg refuses a second package that ships a path another
+# already owns, so a shared path in the `.deb` is a second application that
+# cannot be installed. The shipped path and the path the scriptlet reads from
+# have to be the same file.
+deb_key=/usr/share/muster/spillebulle-archive.gpg
+apt_keyring=/etc/apt/keyrings/spillebulle-archive.gpg
+grep -qF '"$deb/usr/share/muster/$ARCHIVE_KEYRING.gpg"' packaging/linux/build-packages.sh || \
+    fail "the .deb does not ship its key at $deb_key"
+grep -qF "install -m644 $deb_key \"\$keyring\"" packaging/linux/build-packages.sh || \
+    fail "the .deb's postinst does not copy $deb_key to the shared keyring"
+grep -qF "keyring=$apt_keyring" packaging/linux/build-packages.sh || \
+    fail "the .deb's postinst does not write the shared keyring at $apt_keyring"
+grep -qF 'Signed-By: $keyring' packaging/linux/build-packages.sh || \
+    fail "the source the .deb writes does not name the shared keyring"
+if grep -q '\$deb/usr/share/keyrings' packaging/linux/build-packages.sh; then
+    fail "the .deb ships a file in /usr/share/keyrings, which every application would own"
+fi
+grep -qF "$apt_keyring" README.md || fail "README.md's apt instructions do not use $apt_keyring"
+ok "the .deb ships its key as $deb_key and its postinst shares it at $apt_keyring"
+
+arch_key=/usr/share/muster/spillebulle-archive.asc
+grep -qF "\"\${pkgdir}$arch_key\"" packaging/linux/PKGBUILD || \
+    fail "the PKGBUILD does not ship the key at $arch_key"
+grep -qF "pacman-key --add $arch_key" "$scriptlet" || \
+    fail "$scriptlet does not hand $arch_key to pacman-key"
+grep -qF 'packaging/linux/spillebulle-archive.asc' packaging/linux/PKGBUILD || \
+    fail "the PKGBUILD does not take the key from the packaging/ the release tarball carries"
+ok "the Arch package ships $arch_key and its scriptlet trusts it"
+
+# All of the above is about what the files say. Whether the installed packages
+# do it is `check-enrolment.sh`, in a container per format, before publishing.
+for format in deb rpm arch; do
+    grep -q "format: $format, " .github/workflows/release.yml || \
+        fail "release.yml never installs the $format package to check that it enrols"
+done
+grep -qF 'packaging/linux/check-enrolment.sh' .github/workflows/release.yml || \
+    fail "release.yml never runs packaging/linux/check-enrolment.sh"
+grep -q 'needs: \[build, arch, flatpak, enrol\]' .github/workflows/release.yml || \
+    fail "release.yml publishes without waiting for the enrolment check"
+ok "release.yml installs all three packages and checks they enrol before publishing"
+
+# The fingerprint the scriptlet signs must be the key the packages carry, or
+# pacman-key signs nothing and every `pacman -Syu` fails on the archive.
+fpr=$(tr -d '\r' < "$scriptlet" | sed -n 's/^ *local fpr=\([0-9A-F]*\)$/\1/p')
+[ "$fpr" = 7A9EA69E033F3C3EF4F53EB4A72BC0FD5E061ADA ] || \
+    fail "$scriptlet signs '$fpr', not the archive's key"
+if command -v gpg >/dev/null 2>&1 && [ -f packaging/linux/spillebulle-archive.asc ]; then
+    shown=$(gpg --show-keys --with-colons packaging/linux/spillebulle-archive.asc 2>/dev/null \
+        | sed -n 's/^fpr:*\([0-9A-F]*\):*$/\1/p' | head -1)
+    [ "$shown" = "$fpr" ] || \
+        fail "packaging/linux/spillebulle-archive.asc is '$shown', not the key $scriptlet signs"
+    ok "the checked-in key is the one the scriptlet signs, $fpr"
+fi
+
 # Not a failure: the public key is checked in when the archive has one, and
 # until then the packages build exactly as they did before it existed. Said out
 # loud on every run, because a package that quietly stopped enrolling machines

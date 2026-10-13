@@ -291,10 +291,45 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  # --- enrolment ------------------------------------------------------------
+  #
+  # Each Linux package installed in a clean container of the distribution it is
+  # for, and the machine checked for what `../Packages/ENROLMENT.md` says it
+  # leaves behind: the keyring, the source, the section, the key trusted. A
+  # package that installs and enrols nothing looks identical on the release
+  # page to one that works, and the difference is every machine that installed
+  # it never being offered another Muster. `check-enrolment.sh` has the detail,
+  # including the second enrolling package the `.deb` half installs.
+  #
+  # Before `publish`, so a package that does not enrol is never released. On a
+  # manual run this is the rehearsal of it.
+  enrol:
+    name: enrol ${{ matrix.format }}
+    needs: [build, arch]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { format: deb,  image: 'debian:stable',    artifact: x86_64-unknown-linux-gnu, file: 'muster_*_amd64.deb' }
+          - { format: rpm,  image: 'fedora:latest',    artifact: x86_64-unknown-linux-gnu, file: 'muster-*-1.x86_64.rpm' }
+          - { format: arch, image: 'archlinux:latest', artifact: arch-package,             file: 'muster-bin-*-1-x86_64.pkg.tar.zst' }
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+
+      - name: Install and check
+        run: bash packaging/linux/check-enrolment.sh ${{ matrix.format }} dist/${{ matrix.file }}
+
   # --- publish ---------------------------------------------------------------
   publish:
     name: publish
-    needs: [build, arch, flatpak]
+    needs: [build, arch, flatpak, enrol]
     runs-on: ubuntu-latest
     # A manual run builds and packages but must not publish: there is no tag to
     # attach a release to, and inventing one would be a release nobody asked
