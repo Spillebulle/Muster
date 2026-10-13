@@ -60,7 +60,9 @@ check_deb() {
     export DEBIAN_FRONTEND=noninteractive
 
     apt-get update -q
-    apt-get install -y -q "$package"
+    # ca-certificates: the debian image has none, every installed system has
+    # them, and without them apt cannot reach the archive over HTTPS at all.
+    apt-get install -y -q ca-certificates "$package"
 
     [ -f "$shipped" ] || fail "the package did not ship $shipped"
     if dpkg -S /usr/share/keyrings/spillebulle-archive.gpg >/dev/null 2>&1; then
