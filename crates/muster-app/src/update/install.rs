@@ -88,7 +88,7 @@ impl Arch {
 
 /// The package manager that owns an installation.
 ///
-/// The two formats the house archive publishes carry a second fact with them:
+/// The three formats the house archive publishes carry a second fact with them:
 /// whether *this machine* has that archive configured. It is the difference
 /// between a package manager that can fetch a new Muster and one that cannot,
 /// and it changes the whole of what there is to say, so it is part of the
@@ -102,7 +102,9 @@ pub enum Manager {
     Rpm {
         archive: bool,
     },
-    Pacman,
+    Pacman {
+        archive: bool,
+    },
     /// A system path with no recognisable manager behind it. Named separately
     /// from "unknown installation" because the answer to the user is different:
     /// this one is certainly not ours to overwrite.
@@ -116,7 +118,7 @@ impl Manager {
             Self::Flatpak => "Flatpak",
             Self::Dpkg { .. } => "apt / dpkg",
             Self::Rpm { .. } => "dnf / zypper / rpm",
-            Self::Pacman => "pacman",
+            Self::Pacman { .. } => "pacman",
             Self::Unknown => "a package manager",
         }
     }
@@ -130,8 +132,9 @@ impl Manager {
     /// consults archives it has been given, and a machine with none answers
     /// "muster is already the newest version" however old it is. It sounds
     /// authoritative, which is what makes it the worst kind of wrong. The same
-    /// was true of `pacman -Syu muster`, for a package in no repository, and of
-    /// `flatpak update`, for a bundle with no remote.
+    /// is true of `pacman -Syu` on a machine without the archive, where the
+    /// package is in no repository pacman knows, and of `flatpak update`, for a
+    /// bundle with no remote.
     ///
     /// The rpm arms still print no command even with the archive configured,
     /// and for the original reason: Fedora, RHEL and openSUSE drive the same
@@ -177,15 +180,27 @@ impl Manager {
                 )
             }
 
-            // The Arch package is built for x86-64 only, and is in no
-            // repository: neither the official ones nor the AUR. So there is
-            // nothing for `pacman -Syu` to find, and the file is the answer.
-            (Self::Pacman, Some(Arch::X86_64)) => {
+            // The Arch package is built for x86-64 only, so the archive's
+            // repository has it for x86-64 only: on ARM the section can be
+            // there and still have nothing in it for this machine, and the
+            // sentence below is the honest answer.
+            (Self::Pacman { archive: true }, Some(Arch::X86_64)) => {
+                "This machine has the Spillebulle archive, so pacman already has \
+                 the new version. Update it with:\n\n    sudo pacman -Syu"
+                    .to_string()
+            }
+
+            // Not in the official repositories nor the AUR, and without the
+            // archive in no repository at all. So there is nothing for
+            // `pacman -Syu` to find, and the file is the answer.
+            (Self::Pacman { archive: false }, Some(Arch::X86_64)) => {
                 let file = format!("muster-bin-{version}-1-x86_64.pkg.tar.zst");
                 format!(
-                    "The Arch package is in no repository, so pacman has nothing to \
-                     upgrade from. Take {file} from the releases page and install it \
-                     over this one:\n\n    sudo pacman -U {file}"
+                    "This machine does not have the Spillebulle archive, so pacman \
+                     has nothing to upgrade from. Take {file} from the releases page \
+                     and install it over this one:\n\n    sudo pacman -U {file}\n\n\
+                     That package adds the archive, and pacman keeps Muster up to \
+                     date from then on."
                 )
             }
 
@@ -275,8 +290,8 @@ impl InstallKind {
 
 /// Everything [`detect`] is allowed to look at.
 ///
-/// A struct of injected readings rather than direct calls to `std::env` and
-/// `Path::exists`, so the answer for every platform can be tested on one
+/// A struct of injected readings rather than direct calls to `std::env`,
+/// `Path::exists` and `fs::read_to_string`, so the answer for every platform can be tested on one
 /// machine. The Linux and macOS branches below have never been *run*; they have
 /// only been tested, and this is what makes even that possible.
 pub struct Probe<'a> {
@@ -285,6 +300,11 @@ pub struct Probe<'a> {
     pub exe: Option<PathBuf>,
     pub env: &'a dyn Fn(&str) -> Option<String>,
     pub exists: &'a dyn Fn(&Path) -> bool,
+    /// A small text file's contents, or `None` where it cannot be read. Only
+    /// `/etc/pacman.conf` is ever asked for: pacman has no drop-in directory
+    /// for repositories, so whether the archive is there is a section in that
+    /// one file rather than a file of its own.
+    pub read: &'a dyn Fn(&Path) -> Option<String>,
 }
 
 impl Probe<'_> {
@@ -295,6 +315,7 @@ impl Probe<'_> {
             exe: std::env::current_exe().ok(),
             env: &|key| std::env::var(key).ok(),
             exists: &|path| path.exists(),
+            read: &|path| std::fs::read_to_string(path).ok(),
         }
     }
 }
@@ -388,11 +409,15 @@ fn linux_manager(probe: &Probe<'_>) -> Manager {
     let rpm = Manager::Rpm {
         archive: exists("/etc/yum.repos.d/spillebulle.repo"),
     };
+    // Read only on the branch that needs it: the other two are a path apiece.
+    let pacman = || Manager::Pacman {
+        archive: (probe.read)(Path::new(PACMAN_CONF)).is_some_and(|conf| pacman_archive(&conf)),
+    };
 
     if exists("/var/lib/dpkg/info/muster.list") {
         apt
     } else if exists("/var/lib/pacman/local") {
-        Manager::Pacman
+        pacman()
     } else if exists("/var/lib/rpm") || exists("/usr/lib/sysimage/rpm") {
         rpm
     } else if exists("/var/lib/dpkg/status") {
@@ -403,6 +428,22 @@ fn linux_manager(probe: &Probe<'_>) -> Manager {
     } else {
         Manager::Unknown
     }
+}
+
+/// pacman's one configuration file, where `muster.install` appends the archive.
+const PACMAN_CONF: &str = "/etc/pacman.conf";
+
+/// The section `muster.install` appends to [`PACMAN_CONF`]. Its name is the
+/// archive's database name, so it is published interface and cannot drift.
+const PACMAN_SECTION: &str = "[spillebulle]";
+
+/// Whether a `pacman.conf` has the archive's section.
+///
+/// pacman trims each line before reading it, so this does too; a section that
+/// has been commented out (`#[spillebulle]`) is switched off and is not the
+/// archive, which is the answer pacman itself would give.
+fn pacman_archive(conf: &str) -> bool {
+    conf.lines().any(|line| line.trim() == PACMAN_SECTION)
 }
 
 /// Whether a directory is inside a prefix the system owns.
@@ -486,6 +527,17 @@ mod tests {
         env: &'a HashMap<&str, &str>,
         present: &'a [&str],
     ) -> Probe<'a> {
+        probe_reading(os, exe, env, present, None)
+    }
+
+    /// The same, with a `/etc/pacman.conf` that says what `conf` says.
+    fn probe_reading<'a>(
+        os: Os,
+        exe: Option<&str>,
+        env: &'a HashMap<&str, &str>,
+        present: &'a [&str],
+        conf: Option<&'a str>,
+    ) -> Probe<'a> {
         Probe {
             os,
             exe: exe.map(PathBuf::from),
@@ -494,6 +546,10 @@ mod tests {
             })),
             exists: Box::leak(Box::new(move |path: &Path| {
                 present.iter().any(|p| Path::new(p) == path)
+            })),
+            read: Box::leak(Box::new(move |path: &Path| {
+                conf.filter(|_| path == Path::new(PACMAN_CONF))
+                    .map(str::to_string)
             })),
         }
     }
@@ -612,7 +668,71 @@ mod tests {
             &env,
             &["/var/lib/pacman/local"],
         );
-        assert_eq!(detect(&p), InstallKind::Managed(Manager::Pacman));
+        assert_eq!(
+            detect(&p),
+            InstallKind::Managed(Manager::Pacman { archive: false })
+        );
+    }
+
+    /// What `muster.install` leaves at the end of a stock `pacman.conf`.
+    const ENROLLED: &str = "[options]\nHoldPkg = pacman glibc\n\n\
+        [core]\nInclude = /etc/pacman.d/mirrorlist\n\n\
+        [spillebulle]\nInclude = /etc/pacman.d/spillebulle\n";
+
+    #[test]
+    fn the_arch_archive_is_the_section_the_scriptlet_appends() {
+        let env = no_env();
+        let arch = |conf| {
+            detect(&probe_reading(
+                Os::Linux,
+                Some("/usr/bin/muster"),
+                &env,
+                &["/var/lib/pacman/local"],
+                conf,
+            ))
+        };
+        assert_eq!(
+            arch(Some(ENROLLED)),
+            InstallKind::Managed(Manager::Pacman { archive: true })
+        );
+        // Indented is still the section, because pacman trims the line.
+        assert_eq!(
+            arch(Some("[core]\n  [spillebulle]  \nInclude = x\n")),
+            InstallKind::Managed(Manager::Pacman { archive: true })
+        );
+        // A stock file, a section commented out, the name inside another
+        // line, and a file that cannot be read are all "no archive": in each
+        // of them `pacman -Syu` would never look at it.
+        for conf in [
+            Some("[options]\n\n[core]\nInclude = /etc/pacman.d/mirrorlist\n"),
+            Some("#[spillebulle]\n#Include = /etc/pacman.d/spillebulle\n"),
+            Some("# see [spillebulle] in the README\n"),
+            None,
+        ] {
+            assert_eq!(
+                arch(conf),
+                InstallKind::Managed(Manager::Pacman { archive: false }),
+                "{conf:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_arch_archive_is_only_read_on_arch() {
+        // A Debian machine that happens to have a pacman.conf (Debian packages
+        // pacman, for building Arch images) has not got apt pointed anywhere.
+        let env = no_env();
+        let p = probe_reading(
+            Os::Linux,
+            Some("/usr/bin/muster"),
+            &env,
+            &["/var/lib/dpkg/info/muster.list"],
+            Some(ENROLLED),
+        );
+        assert_eq!(
+            detect(&p),
+            InstallKind::Managed(Manager::Dpkg { archive: false })
+        );
     }
 
     #[test]
@@ -726,7 +846,8 @@ mod tests {
             Manager::Dpkg { archive: false },
             Manager::Rpm { archive: true },
             Manager::Rpm { archive: false },
-            Manager::Pacman,
+            Manager::Pacman { archive: true },
+            Manager::Pacman { archive: false },
             Manager::Unknown,
         ]
     }
@@ -786,7 +907,9 @@ mod tests {
         for manager in every_manager() {
             let archived = matches!(
                 manager,
-                Manager::Dpkg { archive: true } | Manager::Rpm { archive: true },
+                Manager::Dpkg { archive: true }
+                    | Manager::Rpm { archive: true }
+                    | Manager::Pacman { archive: true },
             );
             if archived {
                 continue;
@@ -827,7 +950,7 @@ mod tests {
                 "muster-0.1.2-1.x86_64.rpm",
             ),
             (
-                Manager::Pacman,
+                Manager::Pacman { archive: false },
                 Arch::X86_64,
                 "muster-bin-0.1.2-1-x86_64.pkg.tar.zst",
             ),
@@ -859,13 +982,39 @@ mod tests {
     }
 
     #[test]
+    fn with_the_archive_pacman_is_told_to_do_the_upgrade() {
+        let message = InstallKind::Managed(Manager::Pacman { archive: true })
+            .cannot_update(&offered(), Some(Arch::X86_64))
+            .expect("a managed copy says why");
+        assert!(message.contains("sudo pacman -Syu"), "{message}");
+        // And no file name, because there is nothing to go and fetch.
+        assert!(!message.contains(".pkg.tar.zst"), "{message}");
+        assert!(!message.contains("pacman -U"), "{message}");
+    }
+
+    #[test]
+    fn without_the_archive_pacman_is_told_which_file_to_install() {
+        let message = InstallKind::Managed(Manager::Pacman { archive: false })
+            .cannot_update(&offered(), Some(Arch::X86_64))
+            .expect("a managed copy says why");
+        assert!(
+            message.contains("sudo pacman -U muster-bin-0.1.2-1-x86_64.pkg.tar.zst"),
+            "{message}",
+        );
+        assert!(!message.contains("-Syu"), "{message}");
+    }
+
+    #[test]
     fn an_architecture_with_no_package_gets_a_sentence_rather_than_a_made_up_name() {
         // A source build on riscv64, or the Arch package on ARM, which is not
         // built. Inventing a file name would send somebody looking for a file
         // that has never existed.
         for (manager, arch) in [
             (Manager::Dpkg { archive: false }, None),
-            (Manager::Pacman, Some(Arch::Aarch64)),
+            (Manager::Pacman { archive: false }, Some(Arch::Aarch64)),
+            // The archive's ARM repository is empty for the same reason, so a
+            // machine with the section is still not told to upgrade from it.
+            (Manager::Pacman { archive: true }, Some(Arch::Aarch64)),
             (Manager::Flatpak, Some(Arch::Aarch64)),
         ] {
             let message = InstallKind::Managed(manager)
